@@ -28,6 +28,7 @@ jobs:
             'Build.WinUI.ps1',
             'Libraries/tdjson/build.ps1',
             'scripts/ci/prepare-windows.ps1',
+            'scripts/ci/prepare-wallet-engine.ps1',
             'scripts/ci/preflight-windows.ps1',
             'scripts/ci/configure-vcpkg-sources.ps1',
             'scripts/ci/verify-windows-package.ps1',
@@ -44,6 +45,10 @@ jobs:
             }
             Write-Host "PASS PowerShell syntax: $path"
           }
+      - name: Validate wallet runtime exports
+        shell: pwsh
+        run: .\scripts\ci\prepare-wallet-engine.ps1
+
       - name: Parse Windows project and manifest
         shell: pwsh
         run: |

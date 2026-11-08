@@ -66,3 +66,9 @@ GitHub Actions 缓存已下载的源码归档，以及成功构建的 TDLib 与 
 ## TDLib 构建文件
 
 Windows 编译所需的 `Libraries/tdjson/td_api.tl` 与原生 `tdjson.dll` 来自相同的上游 TDLib 源码。`scripts/ci/prepare-tdlib-artifacts.ps1` 在编译前将上游协议文件复制到生成器预期的路径，并检查缓存恢复的 DLL、PDB 和依赖文件。每次构建前验证协议文件与上游源码的 SHA-256 一致，避免使用不完整或不同版本的缓存。
+
+## 钱包原生组件
+
+Windows x64 构建使用 [i582/wallet-engine](https://github.com/i582/wallet-engine) 的 `v0.0.7` 版本。其二进制文件以 MIT / Apache-2.0 双许可证发布。构建脚本 `scripts/ci/prepare-wallet-engine.ps1` 下载 Windows x64 发布包，对 ZIP 文件执行 SHA-256 校验，并检查导出的原生函数是否与仓库内的 UniFFI C# 接口一致。版本号和下载文件的 SHA-256 固定在脚本中。
+
+重新采用新的钱包组件版本时，应同步检查 C# 接口、原生函数和实际钱包操作。该组件涉及密钥与转账，正式使用前需要单独验证钱包创建、密钥保存和恢复、转账确认及异常处理。

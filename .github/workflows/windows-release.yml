@@ -173,6 +173,10 @@ jobs:
           $env:PATH = "$(Resolve-Path Libraries/tdjson/x64-windows);$env:PATH"
           dotnet run --no-build --project scripts/TdlibSmoke/TdlibSmoke.csproj --configuration Release
 
+      - name: Restore and verify TON wallet runtime
+        shell: pwsh
+        run: .\scripts\ci\prepare-wallet-engine.ps1
+
       - name: Build signed MSIXBundle
         shell: pwsh
         run: .\Build.WinUI.ps1 -Platform x64 -Configuration Release -Identity Bundle
