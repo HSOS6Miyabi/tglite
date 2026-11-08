@@ -72,6 +72,10 @@ jobs:
         shell: bash
         run: dotnet run --project scripts/SyntaxCheck/SyntaxCheck.csproj --configuration Release -- .
 
+      - name: Compile TDLib integration tests
+        shell: bash
+        run: dotnet build scripts/TdlibSmoke/TdlibSmoke.csproj --configuration Release --nologo
+
       - name: Publish source code
         if: env.IMPORTED == '1'
         shell: bash
