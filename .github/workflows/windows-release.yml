@@ -96,8 +96,13 @@ jobs:
         with:
           path: |
             Libraries/tdjson/x64-windows
+            Libraries/tdjson/td_api.tl
             vcpkg_installed/x64-windows
           key: tglite-native-windows-x64-${{ hashFiles('vcpkg.json', 'Libraries/tdjson/build.ps1', 'scripts/upstream-ref.txt') }}
+
+      - name: Restore TDLib schema and verify native files
+        shell: pwsh
+        run: .\scripts\ci\prepare-tdlib-artifacts.ps1
 
       - name: Configure verified GitHub source archive mirrors
         shell: pwsh
@@ -148,8 +153,13 @@ jobs:
         with:
           path: |
             Libraries/tdjson/x64-windows
+            Libraries/tdjson/td_api.tl
             vcpkg_installed/x64-windows
           key: tglite-native-windows-x64-${{ hashFiles('vcpkg.json', 'Libraries/tdjson/build.ps1', 'scripts/upstream-ref.txt') }}
+
+      - name: Verify TDLib generated schema and dependencies
+        shell: pwsh
+        run: .\scripts\ci\prepare-tdlib-artifacts.ps1
 
       - name: Verify TDLib native library and JSON API
         shell: pwsh

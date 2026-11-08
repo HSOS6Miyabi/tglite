@@ -61,3 +61,7 @@ Windows 工作流程使用官方 Telegram 测试服务器创建临时测试账�
 `scripts/ci/configure-vcpkg-sources.ps1` 为 GitHub 公开源码归档增加 `codeload.github.com` 下载地址。文件仍由 vcpkg 按项目指定的 SHA-512 校验值进行完整性检查。改动只应用于 GitHub Actions 的临时运行环境，不会修改仓库使用的 vcpkg 版本。
 
 GitHub Actions 缓存已下载的源码归档，以及成功构建的 TDLib 与 vcpkg 依赖。引入上游变更时，应同时检查 `vcpkg.json`、`Libraries/tdjson/build.ps1` 和归档下载脚本。Windows 构建脚本的语法检查见 `.github/workflows/windows-script-check.yml`。
+
+## TDLib 构建文件
+
+Windows 编译所需的 `Libraries/tdjson/td_api.tl` 与原生 `tdjson.dll` 来自相同的上游 TDLib 源码。`scripts/ci/prepare-tdlib-artifacts.ps1` 在编译前将上游协议文件复制到生成器预期的路径，并检查缓存恢复的 DLL、PDB 和依赖文件。每次构建前验证协议文件与上游源码的 SHA-256 一致，避免使用不完整或不同版本的缓存。
