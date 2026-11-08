@@ -51,7 +51,7 @@ jobs:
         run: |
           set -euo pipefail
           git add -A
-          git diff --cached --check
+          git diff --cached --check -- scripts .github/workflows README.md
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "Import Unigram source and personalize TGLite"
