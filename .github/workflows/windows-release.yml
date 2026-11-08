@@ -86,7 +86,9 @@ jobs:
         id: downloads-cache
         with:
           path: C:\vcpkg\downloads
-          key: tglite-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: tglite-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-${{ github.run_id }}
+          restore-keys: |
+            tglite-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-
 
       - name: Restore native dependencies
         id: native-cache
@@ -96,6 +98,10 @@ jobs:
             Libraries/tdjson/x64-windows
             vcpkg_installed/x64-windows
           key: tglite-native-windows-x64-${{ hashFiles('vcpkg.json', 'Libraries/tdjson/build.ps1', 'scripts/upstream-ref.txt') }}
+
+      - name: Configure verified GitHub source archive mirrors
+        shell: pwsh
+        run: .\scripts\ci\configure-vcpkg-sources.ps1
 
       - name: Install TDLib code-generation tools
         shell: pwsh
@@ -133,7 +139,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: C:\vcpkg\downloads
-          key: tglite-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: tglite-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-${{ github.run_id }}
 
       - name: Store native dependencies
         if: steps.native-cache.outputs.cache-hit != 'true'
