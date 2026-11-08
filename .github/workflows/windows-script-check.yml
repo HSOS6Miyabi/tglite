@@ -1,0 +1,55 @@
+name: Check Windows build scripts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Build.WinUI.ps1'
+      - 'Libraries/tdjson/build.ps1'
+      - 'scripts/ci/**'
+      - 'Telegram/Telegram.WinUI.csproj'
+      - '.github/workflows/windows-script-check.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell build and test scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $paths = @(
+            'Build.WinUI.ps1',
+            'Libraries/tdjson/build.ps1',
+            'scripts/ci/prepare-windows.ps1',
+            'scripts/ci/preflight-windows.ps1',
+            'scripts/ci/configure-vcpkg-sources.ps1',
+            'scripts/ci/verify-windows-package.ps1',
+            'scripts/ci/test-install.ps1'
+          )
+          foreach ($path in $paths) {
+            $tokens = $null
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $path).Path, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              foreach ($error in $errors) { Write-Error "$($path): $($error.Message)" }
+              throw "PowerShell syntax check failed for $path."
+            }
+            Write-Host "PASS PowerShell syntax: $path"
+          }
+      - name: Parse Windows project and manifest
+        shell: pwsh
+        run: |
+          [xml]$project = Get-Content -LiteralPath 'Telegram/Telegram.WinUI.csproj' -Raw
+          [xml]$manifest = Get-Content -LiteralPath 'Telegram/Package.appxmanifest' -Raw
+          if (-not $project.Project -or -not $manifest.Package) {
+            throw 'Project or app package manifest could not be loaded.'
+          }
+          Write-Host 'PASS Windows project and package XML'
