@@ -23,7 +23,7 @@
 | 个人资料 | 保留常规资料功能并关闭会员购买推广 | `Telegram/ViewModels/ProfileViewModel.cs`、`Telegram/Controls/Chats/ChatAccountInfoHeader.xaml.cs` |
 | 礼物 | 保留 Stars 礼物，去除 Premium 购买入口 | `Telegram/Views/Premium/Popups/GiftPopup.xaml.cs` |
 | 安装包 | 使用专属安装包名称以及用户提供的 PFX 证书 | `Telegram/Telegram.WinUI.csproj`、`Build.WinUI.ps1` |
-| 自动检查 | 检查修改结果、编译语法和 Windows 安装包签名 | `scripts/verify-lite.mjs`、`scripts/SyntaxCheck/`、`.github/workflows/windows-release.yml` |
+| 自动检查 | 检查修改结果、编译语法、签名证书与安装包身份、Windows 安装包签名 | `scripts/verify-lite.mjs`、`scripts/SyntaxCheck/`、`scripts/ci/preflight-windows.ps1`、`.github/workflows/windows-release.yml` |
 
 完整的源码修改以 `scripts/apply-lite.mjs` 为准。不能根据当前目录是否存在某项 Premium 代码，就推断它可以任意删除：例如 Stars 的交易记录会使用部分付费相关消息类型。
 

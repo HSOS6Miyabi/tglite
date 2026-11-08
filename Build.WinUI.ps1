@@ -85,7 +85,6 @@ if ($env:TGLITE_CERT_THUMBPRINT) {
     $common += @(
         '-p:PackageCertificateKeyFile=',
         "-p:PackageCertificateThumbprint=$env:TGLITE_CERT_THUMBPRINT",
-        "-p:TGLitePackagePublisher=$env:TGLITE_CERT_SUBJECT",
         '-p:WinUIPackageIdentity=HSOS6Miyabi.TGLite',
         '-p:WinUIPackageDisplayName=TGLite',
         "-p:WinUIPackageVersion=$env:TGLITE_PACKAGE_VERSION"

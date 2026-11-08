@@ -72,6 +72,19 @@ jobs:
         shell: pwsh
         run: .\scripts\ci\prepare-windows.ps1
 
+      - name: Validate package publisher and MSBuild settings
+        shell: pwsh
+        run: .\scripts\ci\preflight-windows.ps1
+
+      - name: Restore native dependencies
+        id: native-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            Libraries/tdjson/x64-windows
+            vcpkg_installed/x64-windows
+          key: tglite-native-windows-x64-${{ hashFiles('vcpkg.json', 'Libraries/tdjson/build.ps1', 'scripts/upstream-ref.txt') }}
+
       - name: Install TDLib code-generation tools
         shell: pwsh
         run: |
@@ -82,10 +95,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'GNU gperf is unavailable.' }
 
       - name: Build TDLib (Windows x64)
+        if: steps.native-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           Push-Location Libraries/tdjson
           try { .\build.ps1 -arch x64 -target windows } finally { Pop-Location }
+
+      - name: Store native dependencies
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            Libraries/tdjson/x64-windows
+            vcpkg_installed/x64-windows
+          key: tglite-native-windows-x64-${{ hashFiles('vcpkg.json', 'Libraries/tdjson/build.ps1', 'scripts/upstream-ref.txt') }}
 
       - name: Build signed MSIXBundle
         shell: pwsh

@@ -237,6 +237,7 @@
          alone would otherwise reuse the manifest the last build wrote. Bump the last part for a
          package that supersedes the one installed; the first three follow develop. -->
     <WinUIPackageVersion Condition="'$(WinUIPackageVersion)' == ''">13.0.0.0</WinUIPackageVersion>
+    <TGLitePackagePublisher Condition="'$(TGLitePackagePublisher)' == '' And '$(TGLITE_CERT_SUBJECT)' != ''">$(TGLITE_CERT_SUBJECT)</TGLitePackagePublisher>
     <!-- The assembly carries the same number, because unpackaged there is no package to ask:
          AppIdentity.Version falls back to the entry assembly's, and the two must not disagree. -->
     <Version>$(WinUIPackageVersion)</Version>
