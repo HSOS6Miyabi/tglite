@@ -262,6 +262,7 @@
 
     <XmlPoke XmlInputPath="$(WinUIAppxManifest)" Namespaces="$(WinUIManifestNamespaces)" Query="/f:Package/f:Identity/@Name" Value="$(WinUIPackageIdentity)" />
     <XmlPoke XmlInputPath="$(WinUIAppxManifest)" Namespaces="$(WinUIManifestNamespaces)" Query="/f:Package/f:Identity/@Version" Value="$(WinUIPackageVersion)" />
+    <XmlPoke XmlInputPath="$(WinUIAppxManifest)" Namespaces="$(WinUIManifestNamespaces)" Query="/f:Package/f:Identity/@Publisher" Value="$(TGLitePackagePublisher)" Condition="'$(TGLitePackagePublisher)' != ''" />
     <XmlPoke XmlInputPath="$(WinUIAppxManifest)" Namespaces="$(WinUIManifestNamespaces)" Query="/f:Package/f:Properties/f:DisplayName" Value="$(WinUIPackageDisplayName)" />
     <XmlPoke XmlInputPath="$(WinUIAppxManifest)" Namespaces="$(WinUIManifestNamespaces)" Query="/f:Package/f:Applications/f:Application/uap:VisualElements/@DisplayName" Value="$(WinUIPackageDisplayName)" />
 

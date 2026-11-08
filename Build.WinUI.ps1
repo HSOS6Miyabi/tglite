@@ -77,6 +77,21 @@ $solution = Join-Path $PSScriptRoot 'Telegram.WinUI.slnx'
 # The natives restore through packages.config, which -restore skips without this.
 $common = @("-p:Configuration=$Configuration", '-p:RestorePackagesConfig=true', '-nologo', '-verbosity:minimal')
 
+if ($env:TGLITE_CERT_THUMBPRINT) {
+    if (-not $env:TGLITE_CERT_SUBJECT -or -not $env:TGLITE_PACKAGE_VERSION) {
+        throw "The TGLite signing configuration is incomplete."
+    }
+
+    $common += @(
+        '-p:PackageCertificateKeyFile=',
+        "-p:PackageCertificateThumbprint=$env:TGLITE_CERT_THUMBPRINT",
+        "-p:TGLitePackagePublisher=$env:TGLITE_CERT_SUBJECT",
+        '-p:WinUIPackageIdentity=HSOS6Miyabi.TGLite',
+        '-p:WinUIPackageDisplayName=TGLite',
+        "-p:WinUIPackageVersion=$env:TGLITE_PACKAGE_VERSION"
+    )
+}
+
 function Invoke-MSBuild {
     param([string[]] $Arguments, [string] $Description)
 

@@ -57,3 +57,18 @@ namespace Telegram
 Telegram 对第三方客户端展示赞助消息有专门的 API 使用规则。自行申请的 API 凭据可能受到规则约束，请在使用前阅读 [Telegram API 使用条款](https://core.telegram.org/api/terms)。
 
 本仓库用于个人维护，不包含 Telegram API 私有凭据。
+
+## GitHub Actions 编译和 Release
+
+项目的 `.github/workflows/windows-release.yml` 在 Windows Server 2025 和 Visual Studio 2026 上构建 x64 WinUI MSIXBundle。请在 GitHub 仓库的 Settings → Secrets and variables → Actions 中设置：
+
+- `API_ID`：Telegram 应用 ID（数字）。
+- `API_HASH`：Telegram 应用 Hash。
+- `PFX`：PFX 文件的 Base64 编码文本，包含代码签名私钥。
+- `PFX_PASSWORD`：如果 PFX 受到密码保护，则提供证书密码。
+
+向 `main` 提交 Windows 源码或工作流程修改时会触发构建；也可以在 Actions 中手动启动。只有完成 Release 编译和安装包签名检查，才会自动创建 GitHub Release（预发布版本）。
+
+Release 包含 MSIXBundle、公开证书、SHA-256 文件及版本信息。在自己的 Windows 设备上安装自签名应用前，需要信任该公开证书。后续版本应继续使用相同的 PFX。
+
+维护说明参见 [docs/MAINTENANCE.md](docs/MAINTENANCE.md)。
