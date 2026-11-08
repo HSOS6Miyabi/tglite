@@ -1,0 +1,1163 @@
+﻿//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using Microsoft.Graphics.Canvas.Geometry;
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Text;
+using Telegram.Common;
+using Telegram.Common.Chats;
+using Telegram.Composition;
+using Telegram.Controls.Chats;
+using Telegram.Controls.Media;
+using Telegram.Converters;
+using Telegram.Native;
+using Telegram.Native.Controls;
+using Telegram.Navigation;
+using Telegram.Navigation.Services;
+using Telegram.Services;
+using Telegram.Td.Api;
+using Telegram.ViewModels;
+using Telegram.ViewModels.Delegates;
+using Telegram.Views;
+using Windows.Storage.Streams;
+using Windows.UI;
+using Windows.UI.Composition;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Documents;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Media;
+using Windows.UI.Xaml.Media.Imaging;
+using Windows.UI.Xaml.Navigation;
+using Windows.UI.Xaml.Shapes;
+
+namespace Telegram.Controls.Cells
+{
+    public sealed partial class ForumTopicCell : ControlEx, IForumTopicDelegate
+    {
+        private bool _selected;
+
+        private ForumTopic _topic;
+        private Chat _chat;
+
+        private int _thumbnailId;
+
+        private TopicListViewModel _viewModel;
+
+        private bool _draft;
+
+        private MessageTicksState _ticksState;
+        private long _ticksHash;
+        private bool _outgoing;
+
+        public ForumTopicCell()
+        {
+            DefaultStyleKey = typeof(ForumTopicCell);
+        }
+
+        protected override void OnLoaded()
+        {
+            _strokeBrush?.Register();
+            _selectionStrokeBrush?.Register();
+        }
+
+        protected override void OnUnloaded()
+        {
+            _strokeBrush?.Unregister();
+            _selectionStrokeBrush?.Unregister();
+        }
+
+        #region InitializeComponent
+
+        private IdentityIcon TypeIcon;
+        private TextBlock TitleLabel;
+        private TextBlock MutedIcon;
+        private TextBlock TimeLabel;
+        private Grid PreviewPanel;
+        private Border MinithumbnailPanel;
+        private ChatActionIndicator ChatActionIndicator;
+        private TextBlock TypingLabel;
+        private TextBlock PinnedIcon;
+        private Border UnreadMentionsBadge;
+        private BadgeControl UnreadBadge;
+        private Rectangle DropVisual;
+        private TextBlock UnreadMentionsLabel;
+        private Run FromLabel;
+        private Run DraftLabel;
+        private FormattedTextBlock BriefText;
+        private Span BriefLabel;
+        private ImageBrush Minithumbnail;
+        private Grid IconRoot;
+        private XamlPath IconPath;
+        private TextBlock IconText;
+
+        private bool _templateApplied;
+
+        protected override void OnApplyTemplate()
+        {
+            TypeIcon = GetTemplateChild(nameof(TypeIcon)) as IdentityIcon;
+            TitleLabel = GetTemplateChild(nameof(TitleLabel)) as TextBlock;
+            MutedIcon = GetTemplateChild(nameof(MutedIcon)) as TextBlock;
+            TimeLabel = GetTemplateChild(nameof(TimeLabel)) as TextBlock;
+            PreviewPanel = GetTemplateChild(nameof(PreviewPanel)) as Grid;
+            MinithumbnailPanel = GetTemplateChild(nameof(MinithumbnailPanel)) as Border;
+            ChatActionIndicator = GetTemplateChild(nameof(ChatActionIndicator)) as ChatActionIndicator;
+            TypingLabel = GetTemplateChild(nameof(TypingLabel)) as TextBlock;
+            PinnedIcon = GetTemplateChild(nameof(PinnedIcon)) as TextBlock;
+            UnreadMentionsBadge = GetTemplateChild(nameof(UnreadMentionsBadge)) as Border;
+            UnreadBadge = GetTemplateChild(nameof(UnreadBadge)) as BadgeControl;
+            DropVisual = GetTemplateChild(nameof(DropVisual)) as Rectangle;
+            UnreadMentionsLabel = GetTemplateChild(nameof(UnreadMentionsLabel)) as TextBlock;
+            FromLabel = GetTemplateChild(nameof(FromLabel)) as Run;
+            DraftLabel = GetTemplateChild(nameof(DraftLabel)) as Run;
+            BriefText = GetTemplateChild(nameof(BriefText)) as FormattedTextBlock;
+            BriefLabel = GetTemplateChild(nameof(BriefLabel)) as Span;
+            Minithumbnail = GetTemplateChild(nameof(Minithumbnail)) as ImageBrush;
+            IconRoot = GetTemplateChild(nameof(IconRoot)) as Grid;
+            IconPath = GetTemplateChild(nameof(IconPath)) as XamlPath;
+            IconText = GetTemplateChild(nameof(IconText)) as TextBlock;
+
+            _templateApplied = true;
+
+            if (_topic != null)
+            {
+                UpdateForumTopic(_viewModel, _topic);
+            }
+        }
+
+        #endregion
+
+        public string GetAutomationName()
+        {
+            if (_viewModel == null)
+            {
+                return null;
+            }
+
+            if (_topic != null && _chat != null)
+            {
+                return UpdateAutomation(_viewModel.ClientService, _topic, _chat, _topic.LastMessage);
+            }
+
+            return null;
+        }
+
+        private string UpdateAutomation(IClientService clientService, ForumTopic topic, Chat chat, Message message)
+        {
+            var builder = new StringBuilder();
+
+            {
+                builder.Append(topic.Info.Name);
+                builder.Append(", ");
+            }
+
+            if (topic.UnreadCount > 0)
+            {
+                builder.Append(Locale.Declension(Strings.R.NewMessages, topic.UnreadCount));
+                builder.Append(", ");
+            }
+
+            if (topic.UnreadMentionCount > 0)
+            {
+                builder.Append(Locale.Declension(Strings.R.AccDescrMentionCount, topic.UnreadMentionCount));
+                builder.Append(", ");
+            }
+
+            if (message == null)
+            {
+                //AutomationProperties.SetName(this, builder.ToString());
+                return builder.ToString();
+            }
+
+            //if (!message.IsOutgoing && message.SenderUserId != 0 && !message.IsService())
+            if (ChatCell.ShowFrom(clientService, null, message, out User fromUser, out Chat fromChat))
+            {
+                if (message.IsOutgoing)
+                {
+                    //if (!(chat.Type is ChatTypePrivate priv && priv.UserId == fromUser?.Id) && !message.IsChannelPost)
+                    {
+                        builder.Append(Strings.FromYou);
+                        builder.Append(": ");
+                    }
+                }
+                else if (fromUser != null)
+                {
+                    builder.Append(fromUser.FullName());
+                    builder.Append(": ");
+                }
+                else if (fromChat != null && fromChat.Id != chat.Id)
+                {
+                    builder.Append(fromChat.Title);
+                    builder.Append(": ");
+                }
+            }
+
+            builder.Append(Automation.GetSummary(clientService, message));
+
+            var date = Locale.FormatDateAudio(message.Date);
+            if (message.IsOutgoing)
+            {
+                builder.Append(string.Format(Strings.AccDescrSentDate, date));
+            }
+            else
+            {
+                builder.Append(string.Format(Strings.AccDescrReceivedDate, date));
+            }
+
+            //AutomationProperties.SetName(this, builder.ToString());
+            return builder.ToString();
+        }
+
+        #region Updates
+
+        public void UpdateForumTopicLastMessage(ForumTopic topic)
+        {
+            if (topic == null || _chat == null || !_templateApplied)
+            {
+                return;
+            }
+
+            var from = UpdateFromLabel(_chat, topic, out bool draft);
+
+            if (draft)
+            {
+                DraftLabel.Text = from;
+
+                if (!_draft)
+                {
+                    FromLabel.Text = string.Empty;
+                }
+            }
+            else
+            {
+                FromLabel.Text = from;
+
+                if (_draft)
+                {
+                    DraftLabel.Text = string.Empty;
+                }
+            }
+
+            _draft = draft;
+            UpdateMessageState(topic.LastReadOutboxMessageId, topic, topic.DraftMessage, topic.LastMessage, topic.LastMessage?.SendingState);
+            TimeLabel.Text = UpdateTimeLabel(topic);
+
+            UpdateBriefLabel(UpdateBriefLabel(topic, out MinithumbnailId thumbnail));
+            UpdateMinithumbnail(thumbnail);
+        }
+
+        public void UpdateForumTopicReadInbox(ForumTopic topic)
+        {
+            if (_viewModel == null || !_templateApplied)
+            {
+                return;
+            }
+
+            PinnedIcon.Visibility = topic.UnreadCount == 0 /*&& !topic.IsMarkedAsUnread*/ && topic.IsPinned ? Visibility.Visible : Visibility.Collapsed;
+
+            var unread = (topic.UnreadCount > 0 /*|| topic.IsMarkedAsUnread*/) ? topic.UnreadCount == 1 && topic.UnreadMentionCount == 1 && topic.LastMessage?.ContainsUnreadMention is true ? Visibility.Collapsed : Visibility.Visible : Visibility.Collapsed;
+            if (unread == Visibility.Visible)
+            {
+                UnreadBadge.Visibility = Visibility.Visible;
+                UnreadBadge.Text = topic.UnreadCount > 0 ? topic.UnreadCount.ToString() : string.Empty;
+            }
+            else
+            {
+                UnreadBadge.Visibility = Visibility.Collapsed;
+            }
+
+            //UpdateAutomation(_clientService, chat, chat.LastMessage);
+        }
+
+        public void UpdateForumTopicReadOutbox(ForumTopic topic)
+        {
+            if (_viewModel == null || !_templateApplied)
+            {
+                return;
+            }
+
+            UpdateMessageState(topic.LastReadOutboxMessageId, topic, topic.DraftMessage, topic.LastMessage, topic.LastMessage?.SendingState);
+        }
+
+        public void UpdateChatIsMarkedAsUnread(Chat chat)
+        {
+
+        }
+
+        public void UpdateForumTopicUnreadMentionCount(ForumTopic topic)
+        {
+            if (_viewModel == null || !_templateApplied)
+            {
+                return;
+            }
+
+            UpdateForumTopicReadInbox(topic);
+
+            var unread = topic.UnreadMentionCount > 0 || topic.UnreadReactionCount > 0 ? Visibility.Visible : Visibility.Collapsed;
+            if (unread == Visibility.Visible)
+            {
+                UnreadMentionsBadge.Visibility = Visibility.Visible;
+                UnreadMentionsLabel.Text = topic.UnreadMentionCount > 0 ? Icons.Mention16 : Icons.HeartFilled12;
+            }
+            else
+            {
+                UnreadMentionsBadge.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        public void UpdateForumTopicNotificationSettings(ForumTopic topic)
+        {
+            if (_viewModel == null || !_templateApplied)
+            {
+                return;
+            }
+
+            var muted = _viewModel.ClientService.Notifications.IsMuted(_chat, topic);
+            MutedIcon.Visibility = muted ? Visibility.Visible : Visibility.Collapsed;
+            UnreadBadge.IsUnmuted = !muted;
+        }
+
+        public void UpdateForumTopicInfo(ForumTopic topic)
+        {
+            if (!_templateApplied)
+            {
+                return;
+            }
+
+            UpdateForumTopicName(topic);
+            UpdateForumTopicIcon(topic);
+        }
+
+        public void UpdateForumTopicName(ForumTopic topic)
+        {
+            if (_viewModel == null || !_templateApplied)
+            {
+                return;
+            }
+
+            TitleLabel.Text = topic.Info.Name;
+        }
+
+        public static Color[] ServerSupportedColors = new Color[6]
+        {
+            Color.FromArgb(0xFF, 0x6F, 0xB9, 0xF0), // blue
+            Color.FromArgb(0xFF, 0xFF, 0xD6, 0x7E), // yellow
+            Color.FromArgb(0xFF, 0xCB, 0x86, 0xDB), // violet
+            Color.FromArgb(0xFF, 0x8E, 0xEE, 0x98), // green
+            Color.FromArgb(0xFF, 0xFF, 0x93, 0xB2), // rose
+            Color.FromArgb(0xFF, 0xFB, 0x6F, 0x5F), // orange
+        };
+
+        private static readonly Color[] _colorsTop = new Color[6]
+        {
+            Color.FromArgb(0xFF, 0x8A, 0xD3, 0xF9), // blue
+            Color.FromArgb(0xFF, 0xF7, 0xCE, 0x79), // yellow
+            Color.FromArgb(0xFF, 0x8C, 0xAF, 0xF9), // violet
+            Color.FromArgb(0xFF, 0xAC, 0xDC, 0x89), // green
+            Color.FromArgb(0xFF, 0xFF, 0xAF, 0xC7), // rose
+            Color.FromArgb(0xFF, 0xEF, 0x8E, 0x67), // orange
+        };
+
+        private static readonly Color[] _colors = new Color[6]
+        {
+            Color.FromArgb(0xFF, 0x51, 0x9D, 0xEA), // blue
+            Color.FromArgb(0xFF, 0xF2, 0xAC, 0x6A), // yellow
+            Color.FromArgb(0xFF, 0x65, 0x60, 0xF6), // violet
+            Color.FromArgb(0xFF, 0x75, 0xC8, 0x73), // green
+            Color.FromArgb(0xFF, 0xF2, 0x74, 0x9A), // rose
+            Color.FromArgb(0xFF, 0xEC, 0x5F, 0x6D), // orange
+        };
+
+        public static int FindIconColorIndex(int color)
+        {
+            static int Distance(Color a, Color b)
+            {
+                return Math.Abs(a.R - b.R) + Math.Abs(a.G - b.G) + Math.Abs(a.B - b.B);
+            }
+
+            var value = color.ToColor();
+
+            int distance = Distance(ServerSupportedColors[0], value);
+            var index = 0;
+
+            for (int i = 0; i < ServerSupportedColors.Length; i++)
+            {
+                int distanceLocal = Distance(ServerSupportedColors[i], value);
+                if (distanceLocal < distance)
+                {
+                    distance = distanceLocal;
+                    index = i;
+                }
+            }
+
+            return index;
+        }
+
+        public static LinearGradientBrush GetIconGradient(ForumTopicIcon icon)
+        {
+            var index = FindIconColorIndex(icon.Color);
+
+            var top = _colorsTop[index];
+            var bottom = _colors[index];
+
+            return new LinearGradientBrush(new GradientStopCollection
+            {
+                new GradientStop
+                {
+                    Color = top,
+                    Offset = 0
+                },
+                new GradientStop
+                {
+                    Color = bottom,
+                    Offset = 1
+                }
+            }, 90);
+        }
+
+        public void UpdateForumTopicIcon(ForumTopic topic)
+        {
+            if (_viewModel == null || !_templateApplied)
+            {
+                return;
+            }
+
+            if (topic.Info.IsGeneral || topic.Info.Icon.CustomEmojiId != 0)
+            {
+                TypeIcon.SetStatus(_viewModel.ClientService, topic.Info.Icon);
+                IconRoot.Visibility = Visibility.Collapsed;
+            }
+            else
+            {
+                TypeIcon.ClearStatus();
+                IconRoot.Visibility = Visibility.Visible;
+
+                var brush = GetIconGradient(topic.Info.Icon);
+
+                IconPath.Fill = brush;
+                IconPath.Stroke = new SolidColorBrush(brush.GradientStops[1].Color);
+                IconText.Text = InitialNameStringConverter.Convert(topic.Info.Name);
+            }
+        }
+
+        public void UpdateForumTopicActions(ForumTopic topic, IDictionary<MessageSender, ChatAction> actions)
+        {
+            if (_viewModel == null || !_templateApplied)
+            {
+                return;
+            }
+
+            if (actions != null && actions.Count > 0)
+            {
+                TypingLabel.Text = InputChatActionManager.GetTypingString(null, actions, _viewModel.ClientService, out ChatAction commonAction);
+                ChatActionIndicator.UpdateAction(commonAction);
+                ChatActionIndicator.Visibility = Visibility.Visible;
+                TypingLabel.Visibility = Visibility.Visible;
+                BriefText.Visibility = Visibility.Collapsed;
+            }
+            else
+            {
+                ChatActionIndicator.Visibility = Visibility.Collapsed;
+                ChatActionIndicator.UpdateAction(null);
+                TypingLabel.Visibility = Visibility.Collapsed;
+                BriefText.Visibility = Visibility.Visible;
+            }
+        }
+
+        public void UpdateForumTopic(TopicListViewModel viewModel, ForumTopic topic)
+        {
+            _viewModel = viewModel;
+            _topic = topic;
+            _chat = viewModel.ClientService.GetChat(topic.Info.ChatId);
+
+            if (!_templateApplied)
+            {
+                return;
+            }
+
+            UpdateForumTopicName(topic);
+            UpdateForumTopicIcon(topic);
+            //UpdateChatEmojiStatus(topic);
+
+            UpdateForumTopicLastMessage(topic);
+            //UpdateChatReadInbox(chat);
+            UpdateForumTopicUnreadMentionCount(topic);
+            UpdateForumTopicNotificationSettings(topic);
+            UpdateForumTopicActions(topic, _viewModel.ClientService.GetChatActions(topic.Info.ChatId, new MessageTopicForum(topic.Info.ForumTopicId)));
+        }
+
+        #endregion
+
+        private async void UpdateMinithumbnail(MinithumbnailId thumbnail)
+        {
+            if (thumbnail != null)
+            {
+                if (_thumbnailId == thumbnail.Id)
+                {
+                    return;
+                }
+
+                _thumbnailId = thumbnail.Id;
+
+                double ratioX = (double)16 / thumbnail.Width;
+                double ratioY = (double)16 / thumbnail.Height;
+                double ratio = Math.Max(ratioX, ratioY);
+
+                var width = (int)(thumbnail.Width * ratio);
+                var height = (int)(thumbnail.Height * ratio);
+
+                var bitmap = new BitmapImage
+                {
+                    DecodePixelWidth = width,
+                    DecodePixelHeight = height,
+                    DecodePixelType = DecodePixelType.Logical
+                };
+
+                Minithumbnail.ImageSource = bitmap;
+                MinithumbnailPanel.Visibility = Visibility.Visible;
+
+                MinithumbnailPanel.CornerRadius = new CornerRadius(thumbnail.IsVideoNote ? 9 : 2);
+
+                using (var stream = new InMemoryRandomAccessStream())
+                {
+                    try
+                    {
+                        Direct2DDevice.WriteBytes(thumbnail.Data, stream);
+                        await bitmap.SetSourceAsync(stream);
+                    }
+                    catch
+                    {
+                        // Throws when the data is not a valid encoded image,
+                        // not so frequent, but if it happens during ContainerContentChanging it crashes the app.
+                    }
+                }
+            }
+            else
+            {
+                _thumbnailId = 0;
+
+                MinithumbnailPanel.Visibility = Visibility.Collapsed;
+                Minithumbnail.ImageSource = null;
+            }
+        }
+
+        private void UpdateBriefLabel(FormattedText message)
+        {
+            BriefText.SetText(_viewModel.ClientService, message);
+            BriefText.SetQuery(string.Empty);
+        }
+
+
+        private FormattedText UpdateBriefLabel(ForumTopic topic, out MinithumbnailId thumbnail)
+        {
+            thumbnail = null;
+
+            var draft = topic.DraftMessage;
+            var topMessage = topic.LastMessage;
+
+            if (draft != null)
+            {
+                return draft.Content switch
+                {
+                    DraftMessageContentText draftText => draftText.Text,
+                    DraftMessageContentRichMessage draftRichMessage => draftRichMessage.Message.ToFormattedText(),
+                    _ => string.Empty.AsFormattedText()
+                };
+            }
+            else if (topMessage != null)
+            {
+                return ChatCell.UpdateBriefLabel(topMessage.Content, topMessage.IsOutgoing, false, out thumbnail);
+            }
+
+            return string.Empty.AsFormattedText();
+        }
+
+        private string UpdateFromLabel(Chat chat, ForumTopic topic, out bool draft)
+        {
+            if (topic.DraftMessage is not null)
+            {
+                draft = true;
+                return string.Format("{0}: \u200B​​​", Strings.Draft);
+            }
+
+            var message = topic.LastMessage;
+            if (message == null)
+            {
+                if (topic.LastReadOutboxMessageId != 0 || topic.LastReadInboxMessageId != 0)
+                {
+                    draft = false;
+                    return Strings.HistoryCleared;
+                }
+
+                draft = false;
+                return string.Empty;
+            }
+
+            draft = false;
+            return ChatCell.UpdateFromLabel(_viewModel.ClientService, chat, message);
+        }
+
+        public void UpdateMessageState(long maxId, ForumTopic topic, DraftMessage draft, Message message, MessageSendingState state)
+        {
+            if (draft != null || message == null || !_templateApplied)
+            {
+                UpdateMessageOutgoing(false);
+                UpdateTicks(false, MessageTicksState.None);
+
+                _ticksState = MessageTicksState.None;
+                _ticksHash = 0;
+                return;
+            }
+
+            var outgoing = (message.IsOutgoing && !message.IsChannelPost)/* || (message.IsSaved(_clientService.Options.MyId) && message.ForwardInfo?.Source is { IsOutgoing: true })*/;
+            if (outgoing)
+            {
+                //var maxId = message.LastReadOutboxMessageId;
+                var messageHash = message.ChatId ^ message.Id;
+
+                if (message.SendingState is MessageSendingStateFailed)
+                {
+                    UpdateMessageOutgoing(true);
+                    UpdateTicks(true, MessageTicksState.Failed);
+
+                    _ticksState = MessageTicksState.Failed;
+                    _ticksHash = messageHash;
+
+                    return; // Failed
+                }
+                else if (message.SendingState is MessageSendingStatePending)
+                {
+                    UpdateMessageOutgoing(true);
+                    UpdateTicks(true, MessageTicksState.Pending);
+
+                    _ticksState = MessageTicksState.Pending;
+                    _ticksHash = messageHash;
+
+                    return; // Pending
+                }
+                else if (message.Id <= maxId)
+                {
+                    UpdateMessageOutgoing(true);
+                    UpdateTicks(true, MessageTicksState.Read, _ticksState == MessageTicksState.Sent && _ticksHash == messageHash);
+
+                    _ticksState = MessageTicksState.Read;
+                    _ticksHash = messageHash;
+
+                    return; // Read
+                }
+
+                UpdateMessageOutgoing(true);
+                UpdateTicks(true, MessageTicksState.Sent, _ticksState == MessageTicksState.Pending && _ticksHash == messageHash);
+
+                _ticksState = MessageTicksState.Sent;
+                _ticksHash = messageHash;
+
+                return; // Unread
+            }
+
+            UpdateMessageOutgoing(false);
+            UpdateTicks(false, MessageTicksState.None);
+
+            _ticksState = MessageTicksState.None;
+            _ticksHash = 0;
+        }
+
+        private void UpdateMessageOutgoing(bool outgoing)
+        {
+            if (_templateApplied && _outgoing != outgoing)
+            {
+                _outgoing = outgoing;
+                TimeLabel.Padding = new Thickness(outgoing ? 22 : 0, 0, 0, 0);
+            }
+        }
+
+        private string UpdateTimeLabel(ForumTopic topic)
+        {
+            var lastMessage = topic.LastMessage;
+            if (lastMessage != null)
+            {
+                if (topic.Info.IsClosed)
+                {
+                    return Icons.LockClosedFilled12 + "\u00A0" + Formatter.DateExtended(lastMessage.Date);
+                }
+
+                return Formatter.DateExtended(lastMessage.Date);
+            }
+
+            return string.Empty;
+        }
+
+        public void ShowPreview(Point? position)
+        {
+            Logger.Info();
+
+            var tooltip = new MenuFlyoutContent();
+
+            var flyout = new MenuFlyout();
+            flyout.MenuFlyoutPresenterStyle = new Style(typeof(MenuFlyoutPresenter));
+            flyout.MenuFlyoutPresenterStyle.Setters.Add(new Setter(PaddingProperty, new Thickness(0)));
+
+            flyout.Items.Add(tooltip);
+
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var context = WindowContext.ForXamlRoot(this);
+            var service = context.GetNavigationService();
+
+            var grid = new Grid();
+            var chatView = new ChatView
+            {
+                FromPreview = true,
+                Width = 320,
+                Height = 360
+            };
+
+            var viewModel = service.Session.Resolve<DialogViewModel, IDialogDelegate>(chatView);
+            viewModel.NavigationService = service;
+            viewModel.Dispatcher = service.Dispatcher;
+            chatView.Activate(viewModel);
+            _ = viewModel.NavigatedToAsync(new ChatMessageTopic(chat.Id, new MessageTopicForum(_topic.Info.ForumTopicId)), NavigationMode.New, new NavigationState());
+
+            // Unloaded doesn't fire for a view hosted in a flyout, so the flyout's own Closed
+            // is what tears the preview down; Unloaded stays subscribed in case it does arrive
+            // first. Whichever comes first detaches both, so the teardown runs exactly once.
+            void handler(object sender, object e)
+            {
+                Logger.Info(sender == flyout ? "Closed" : "Unloaded");
+
+                flyout.Closed -= handler;
+                chatView.Unloaded -= handler;
+
+                chatView.ViewModel.NavigatedFrom(null, false);
+                chatView.Deactivate(true);
+            }
+
+            flyout.Closed += handler;
+            chatView.Unloaded += handler;
+
+            var background = new ChatBackgroundControl();
+            background.Update(_viewModel.ClientService, null);
+
+            grid.Children.Add(background);
+            grid.Children.Add(chatView);
+            grid.CornerRadius = new CornerRadius(8);
+
+            tooltip.Content = grid;
+            tooltip.Padding = new Thickness();
+            tooltip.MaxWidth = double.PositiveInfinity;
+
+            flyout.ShowAt(this, position ?? this.TransformToPointerPosition());
+        }
+
+        protected override void OnDragEnter(DragEventArgs e)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (_viewModel.ClientService.CanPostMessages(chat) && e.DataView.AvailableFormats.Count > 0)
+                {
+                    if (DropVisual == null)
+                    {
+                        FindName(nameof(DropVisual));
+                    }
+
+                    DropVisual.Visibility = Visibility.Visible;
+                    e.AcceptedOperation = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
+                }
+                else
+                {
+                    DropVisual?.Visibility = Visibility.Collapsed;
+
+                    e.AcceptedOperation = Windows.ApplicationModel.DataTransfer.DataPackageOperation.None;
+                }
+            }
+            catch
+            {
+                DropVisual?.Visibility = Visibility.Collapsed;
+            }
+
+            base.OnDragEnter(e);
+        }
+
+        protected override void OnDragLeave(DragEventArgs e)
+        {
+            DropVisual?.Visibility = Visibility.Collapsed;
+
+            base.OnDragLeave(e);
+        }
+
+        protected override void OnDrop(DragEventArgs e)
+        {
+            DropVisual?.Visibility = Visibility.Collapsed;
+
+            try
+            {
+                if (e.DataView.AvailableFormats.Count == 0)
+                {
+                    return;
+                }
+
+                var chat = _chat;
+                if (chat == null)
+                {
+                    return;
+                }
+
+                var service = WindowContext.GetNavigationService(this);
+                service?.NavigateToChat(chat, topic: _topic.ToId(), state: new NavigationState
+                {
+                    { "package", e.DataView }
+                });
+            }
+            catch { }
+
+            base.OnDrop(e);
+        }
+
+        #region SelectionStroke
+
+        private CompositionColorSource _selectionStrokeBrush;
+
+        public SolidColorBrush SelectionStroke
+        {
+            get => (SolidColorBrush)GetValue(SelectionStrokeProperty);
+            set => SetValue(SelectionStrokeProperty, value);
+        }
+
+        public static readonly DependencyProperty SelectionStrokeProperty =
+            DependencyProperty.Register("SelectionStroke", typeof(SolidColorBrush), typeof(ForumTopicCell), new PropertyMetadata(null, OnSelectionStrokeChanged));
+
+        private static void OnSelectionStrokeChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((ForumTopicCell)d).OnSelectionStrokeChanged(e.NewValue as SolidColorBrush, e.OldValue as SolidColorBrush);
+        }
+
+        private void OnSelectionStrokeChanged(SolidColorBrush newValue, SolidColorBrush oldValue)
+        {
+            _selectionStrokeBrush?.PropertyChanged(newValue, IsConnected);
+        }
+
+        #endregion
+
+        #region Tick Animation
+
+        private float _trimStart;
+
+        private CompositionGeometry _line1;
+        private CompositionShape _shape1;
+
+        private CompositionGeometry _line2;
+        private CompositionShape _shape2;
+
+        private CompositionShape _pending;
+        private CompositionShape _failed;
+
+        private ShapeVisual _container;
+
+        #region Stroke
+
+        private CompositionColorSource _strokeBrush;
+
+        public Brush Stroke
+        {
+            get => (Brush)GetValue(StrokeProperty);
+            set => SetValue(StrokeProperty, value);
+        }
+
+        public static readonly DependencyProperty StrokeProperty =
+            DependencyProperty.Register("Stroke", typeof(Brush), typeof(ForumTopicCell), new PropertyMetadata(null, OnStrokeChanged));
+
+        private static void OnStrokeChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((ForumTopicCell)d).OnStrokeChanged(e.NewValue as SolidColorBrush, e.OldValue as SolidColorBrush);
+        }
+
+        private void OnStrokeChanged(SolidColorBrush newValue, SolidColorBrush oldValue)
+        {
+            _strokeBrush?.PropertyChanged(newValue, IsConnected);
+        }
+
+        #endregion
+
+        private void InitializePending()
+        {
+            if (_container == null)
+            {
+                InitializeTicks();
+            }
+
+            var stroke = 1.33f;
+
+            static CompositionPath GetPending()
+            {
+                var stroke = 1.33f;
+                var radius = 5 - stroke / 2;
+
+                CanvasGeometry result;
+                using (var builder = new CanvasPathBuilder(null))
+                {
+                    builder.AddGeometry(CanvasGeometry.CreateEllipse(null, 13, 5, radius, radius));
+                    builder.BeginFigure(new Vector2(12.5f, 3f));
+                    builder.AddLine(new Vector2(12.5f, 5.5f));
+                    builder.AddLine(new Vector2(15f, 5.5f));
+                    builder.EndFigure(CanvasFigureLoop.Open);
+                    result = CanvasGeometry.CreatePath(builder);
+                }
+                return new CompositionPath(result);
+            }
+
+            var shape11 = BootStrapper.Current.Compositor.CreateSpriteShape(BootStrapper.Current.Compositor.CreatePathGeometry(GetPending()));
+            shape11.StrokeThickness = stroke;
+            shape11.StrokeBrush = _strokeBrush ??= new CompositionColorSource(Stroke, IsConnected);
+            shape11.IsStrokeNonScaling = true;
+            shape11.StrokeStartCap = CompositionStrokeCap.Round;
+            shape11.StrokeEndCap = CompositionStrokeCap.Round;
+            shape11.Offset = new Vector2(2, 1);
+
+            _pending = shape11;
+            _container.Shapes.Add(shape11);
+        }
+
+        private void InitializeFailed()
+        {
+            if (_container == null)
+            {
+                InitializeTicks();
+            }
+
+            var stroke = 1.33f;
+
+            static CompositionPath GetFailed()
+            {
+                var stroke = 1.33f;
+                var center = stroke / 2;
+
+                CanvasGeometry result;
+                using (var builder = new CanvasPathBuilder(null))
+                {
+                    builder.AddGeometry(CanvasGeometry.CreateRoundedRectangle(null, 4 + center, center, 11 - stroke, 11 - stroke, 2, 2));
+                    builder.BeginFigure(new Vector2(9.5f, 3f));
+                    builder.AddLine(new Vector2(9.5f, 5.5f + center));
+                    builder.EndFigure(CanvasFigureLoop.Open);
+                    builder.BeginFigure(new Vector2(9.5f, 7f + stroke));
+                    builder.AddLine(new Vector2(9.5f, 7f + stroke + 0.001f));
+                    builder.EndFigure(CanvasFigureLoop.Open);
+                    result = CanvasGeometry.CreatePath(builder);
+                }
+                return new CompositionPath(result);
+            }
+
+            var shape11 = BootStrapper.Current.Compositor.CreateSpriteShape(BootStrapper.Current.Compositor.CreatePathGeometry(GetFailed()));
+            shape11.StrokeThickness = stroke;
+            shape11.StrokeBrush = BootStrapper.Current.Compositor.CreateColorBrush(Colors.Red);
+            shape11.IsStrokeNonScaling = true;
+            shape11.StrokeStartCap = CompositionStrokeCap.Round;
+            shape11.StrokeEndCap = CompositionStrokeCap.Round;
+            shape11.Offset = new Vector2(2, 0);
+
+            _failed = shape11;
+            _container.Shapes.Add(shape11);
+        }
+
+        private void InitializeTicks()
+        {
+            var width = 18f;
+            var height = 10f;
+            var stroke = 1.33f;
+            var distance = 4;
+
+            var sqrt = MathF.Sqrt(2);
+
+            var cap = stroke / 2f;
+            var join = stroke / 2 * sqrt;
+
+            CompositionPath GetLine()
+            {
+                var right = width - distance;
+                var vertex = new Vector2(right - height + join, height - join);
+                var start = new Vector2(cap, vertex.Y - (vertex.X - cap));
+                var end = new Vector2(right - cap, cap);
+
+                var trimStart = Vector2.Distance(start, vertex);
+                var trimEnd = Vector2.Distance(vertex, end);
+
+                _trimStart = trimStart / (trimStart + trimEnd);
+
+                CanvasGeometry result;
+                using (var builder = new CanvasPathBuilder(null))
+                {
+                    builder.BeginFigure(start);
+                    builder.AddLine(vertex);
+                    builder.AddLine(end);
+                    builder.EndFigure(CanvasFigureLoop.Open);
+                    result = CanvasGeometry.CreatePath(builder);
+                }
+                return new CompositionPath(result);
+            }
+
+            var geometry = GetLine();
+            var line1 = BootStrapper.Current.Compositor.CreatePathGeometry(geometry);
+            var line2 = BootStrapper.Current.Compositor.CreatePathGeometry(geometry);
+
+            var shape1 = BootStrapper.Current.Compositor.CreateSpriteShape(line1);
+            shape1.StrokeThickness = stroke;
+            shape1.StrokeBrush = _strokeBrush ??= new CompositionColorSource(Stroke, IsConnected);
+            shape1.IsStrokeNonScaling = true;
+            shape1.StrokeStartCap = CompositionStrokeCap.Round;
+            shape1.StrokeEndCap = CompositionStrokeCap.Round;
+            shape1.StrokeLineJoin = CompositionStrokeLineJoin.Round;
+            shape1.CenterPoint = new Vector2(width, height / 2f);
+            shape1.Offset = new Vector2(2, 1);
+
+            var shape2 = BootStrapper.Current.Compositor.CreateSpriteShape(line2);
+            shape2.StrokeThickness = stroke;
+            shape2.StrokeBrush = _strokeBrush ??= new CompositionColorSource(Stroke, IsConnected);
+            shape2.IsStrokeNonScaling = true;
+            shape2.StrokeStartCap = CompositionStrokeCap.Round;
+            shape2.StrokeEndCap = CompositionStrokeCap.Round;
+            shape2.StrokeLineJoin = CompositionStrokeLineJoin.Round;
+            shape2.CenterPoint = new Vector2(width, height / 2f);
+            shape2.Offset = new Vector2(distance + 2, 1);
+
+            var container = BootStrapper.Current.Compositor.CreateShapeVisual();
+            container.Shapes.Add(shape2);
+            container.Shapes.Add(shape1);
+            container.Size = new Vector2(width + 2, height + 1);
+            container.AnchorPoint = new Vector2(0, 0);
+            container.Offset = new Vector3(-2, 3, 0);
+            container.RelativeOffsetAdjustment = new Vector3(0, 0, 0);
+
+            ElementCompositionPreview.SetElementChildVisual(TimeLabel, container);
+
+            _line1 = line1;
+            _shape1 = shape1;
+            _line2 = line2;
+            _shape2 = shape2;
+            _container = container;
+        }
+
+        private void UpdateTicks(bool outgoing, MessageTicksState state, bool animate = false)
+        {
+            void RemoveAdditionalVisuals(bool visible)
+            {
+                if (_pending != null && state != MessageTicksState.Pending)
+                {
+                    _container.Shapes.Remove(_pending);
+                    _pending = null;
+                }
+                else if (_failed != null && state != MessageTicksState.Failed)
+                {
+                    _container.Shapes.Remove(_failed);
+                    _failed = null;
+                }
+
+                _line1.TrimStart = visible ? 0 : 1;
+                _line2.TrimStart = visible ? 0 : 1;
+            }
+
+            if (state is not MessageTicksState.Sent and not MessageTicksState.Read)
+            {
+                if (outgoing)
+                {
+                    if (_pending == null && state == MessageTicksState.Pending)
+                    {
+                        InitializePending();
+                    }
+                    else if (_failed == null && state == MessageTicksState.Failed)
+                    {
+                        InitializeFailed();
+                    }
+                }
+
+                if (_container != null)
+                {
+                    RemoveAdditionalVisuals(false);
+                }
+            }
+            else
+            {
+                if (_container == null)
+                {
+                    InitializeTicks();
+                }
+
+                RemoveAdditionalVisuals(true);
+
+                if (animate)
+                {
+                    AnimateTicks(state == MessageTicksState.Read);
+                }
+                else
+                {
+                    _line1.TrimEnd = state == MessageTicksState.Read ? 1 : 0;
+                    _line2.TrimStart = state == MessageTicksState.Read ? _trimStart : 0;
+                }
+            }
+        }
+
+        private void AnimateTicks(bool read)
+        {
+            var duration = 250;
+
+            var linear = BootStrapper.Current.Compositor.CreateLinearEasingFunction();
+            var start = duration - _trimStart * duration;
+            var ended = 400f;
+
+            var scale = BootStrapper.Current.Compositor.CreateVector2KeyFrameAnimation();
+            scale.InsertKeyFrame(0, new Vector2(1));
+            scale.InsertKeyFrame(0.2f, new Vector2(1.1f));
+            scale.InsertKeyFrame(1, new Vector2(1));
+            scale.Duration = TimeSpan.FromMilliseconds(start + ended);
+
+            if (read)
+            {
+                var trimEnd = BootStrapper.Current.Compositor.CreateScalarKeyFrameAnimation();
+                trimEnd.InsertKeyFrame(0, 0);
+                trimEnd.InsertKeyFrame(start / (start + ended), _trimStart, linear);
+                trimEnd.InsertKeyFrame(1, 1);
+                trimEnd.Duration = TimeSpan.FromMilliseconds(start + ended);
+
+                var trimStart = BootStrapper.Current.Compositor.CreateScalarKeyFrameAnimation();
+                trimStart.InsertKeyFrame(0, 0);
+                trimStart.InsertKeyFrame(1, _trimStart, linear);
+                trimStart.Duration = TimeSpan.FromMilliseconds(start);
+
+                _line1.StartAnimation("TrimEnd", trimEnd);
+                _line2.StartAnimation("TrimStart", trimStart);
+                _shape1.StartAnimation("Scale", scale);
+            }
+            else
+            {
+                var trimEnd = BootStrapper.Current.Compositor.CreateScalarKeyFrameAnimation();
+                trimEnd.InsertKeyFrame(0, 0);
+                trimEnd.InsertKeyFrame(1, 1);
+                trimEnd.DelayBehavior = AnimationDelayBehavior.SetInitialValueBeforeDelay;
+                trimEnd.DelayTime = TimeSpan.FromMilliseconds(start);
+                trimEnd.Duration = TimeSpan.FromMilliseconds(ended);
+
+                _line1.TrimEnd = 0;
+                _line2.TrimStart = 0;
+
+                _line2.StartAnimation("TrimEnd", trimEnd);
+                _shape2.StartAnimation("Scale", scale);
+            }
+        }
+
+        #endregion
+    }
+}

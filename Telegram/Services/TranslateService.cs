@@ -1,0 +1,365 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Collections.Concurrent;
+using System.Globalization;
+using System.Threading.Tasks;
+using Telegram.Common;
+using Telegram.Native;
+using Telegram.Td;
+using Telegram.Td.Api;
+using Telegram.ViewModels;
+
+namespace Telegram.Services
+{
+    public interface ITranslateService : IService
+    {
+        bool CanTranslateText(string text, bool entireChat = false);
+        bool CanTranslateText(FormattedText text, bool entireChat = false);
+
+        bool CanTranslate(string language, bool entireChat);
+
+        Task<Object> TranslateAsync(long chatId, long messageId, string toLanguage, string tone);
+        Task<Object> TranslateAsync(string text, string toLanguage, string tone);
+        Task<Object> TranslateAsync(FormattedText text, string toLanguage, string tone);
+
+        bool Translate(MessageViewModel message, string toLanguage);
+        bool Summarize(MessageViewModel message, string toLanguage);
+    }
+
+    public partial class TranslateService : ServiceBase, ITranslateService, IHandle
+    {
+        private const string LANG_UND = "und";
+        private const string LANG_AUTO = "auto";
+        private const string LANG_LATN = "latn";
+
+        public TranslateService(IClientService clientService, ISettingsService settings, IEventAggregator aggregator)
+            : base(clientService, settings, aggregator)
+        {
+            aggregator.Subscribe<UpdateMessageContent>(this, Handle)
+                .Subscribe<UpdateDeleteMessages>(Handle);
+        }
+
+        private void Handle(UpdateMessageContent update)
+        {
+            if (_translations.TryRemove(new TranslatedKey(update.ChatId, update.MessageId), out _))
+            {
+                Aggregator.Publish(new UpdateMessageTranslatedText(update.ChatId, update.MessageId, null));
+            }
+
+            if (_summaries.TryRemove(new TranslatedKey(update.ChatId, update.MessageId), out _))
+            {
+                Aggregator.Publish(new UpdateMessageSummarizedText(update.ChatId, update.MessageId, null));
+            }
+        }
+
+        private void Handle(UpdateDeleteMessages update)
+        {
+            if (!update.FromCache)
+            {
+                return;
+            }
+
+            foreach (var messageId in update.MessageIds)
+            {
+                if (_translations.TryRemove(new TranslatedKey(update.ChatId, messageId), out _))
+                {
+                    Aggregator.Publish(new UpdateMessageTranslatedText(update.ChatId, messageId, null));
+                }
+
+                if (_summaries.TryRemove(new TranslatedKey(update.ChatId, messageId), out _))
+                {
+                    Aggregator.Publish(new UpdateMessageSummarizedText(update.ChatId, messageId, null));
+                }
+            }
+        }
+
+        public static string LanguageName(string locale)
+        {
+            return LanguageName(locale, out _);
+        }
+
+        public static string LanguageName(string locale, out bool rtl)
+        {
+            if (locale == null || locale.Equals(LANG_UND) || locale.Equals(LANG_AUTO))
+            {
+                rtl = false;
+                return null;
+            }
+
+            var split = locale.Split('-');
+            var latin = split.Length > 1 && string.Equals(split[1], LANG_LATN, StringComparison.OrdinalIgnoreCase);
+
+            var culture = new CultureInfo(split[0]);
+            rtl = culture.TextInfo.IsRightToLeft && !latin;
+
+            var displayName = LocaleService.Current.GetString("TranslateLanguage" + split[0].ToUpper());
+            if (displayName.Length > 0)
+            {
+                return displayName;
+            }
+
+            return culture.DisplayName;
+        }
+
+        public bool CanTranslateText(FormattedText text, bool entireChat = false)
+        {
+            if (text == null)
+            {
+                return false;
+            }
+
+            return CanTranslateText(text.Text, entireChat);
+        }
+
+        public bool CanTranslateText(string text, bool entireChat = false)
+        {
+            if (string.IsNullOrEmpty(text))
+            {
+                return false;
+            }
+
+            var language = LanguageIdentification.IdentifyLanguage(text);
+            return CanTranslate(language, entireChat);
+        }
+
+        public bool CanTranslate(string language, bool entireChat)
+        {
+            var allowed = entireChat
+                ? ClientService.TranslateMessages
+                : ClientService.TranslateChats;
+
+            if (string.IsNullOrEmpty(language) || !allowed)
+            {
+                return false;
+            }
+
+            var split = language.Split('-');
+            var exclude = Settings.Translate.DoNot;
+
+            if (entireChat)
+            {
+                exclude.Add(LANG_UND);
+            }
+
+            foreach (var item in exclude)
+            {
+                var args = item.Split('_');
+                if (string.Equals(args[0], split[0], StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public Task<Object> TranslateAsync(string text, string toLanguage, string tone)
+        {
+            return TranslateAsync(new FormattedText(text, null), toLanguage, tone);
+        }
+
+        public Task<Object> TranslateAsync(FormattedText text, string toLanguage, string tone)
+        {
+            return ClientService.SendAsync(new TranslateText(text, toLanguage, tone));
+        }
+
+        public Task<Object> TranslateAsync(long chatId, long messageId, string toLanguage, string tone)
+        {
+            return ClientService.SendAsync(new TranslateMessageText(chatId, messageId, toLanguage, tone));
+        }
+
+        private readonly ConcurrentDictionary<TranslatedKey, TranslatedMessage> _translations = new();
+        private readonly ConcurrentDictionary<TranslatedKey, TranslatedMessage> _summaries = new();
+
+        public bool Translate(MessageViewModel message, string toLanguage)
+        {
+            if (message.IsOutgoing || string.IsNullOrEmpty(message.Text?.Text))
+            {
+                return false;
+            }
+
+            var key = new TranslatedKey(message.ChatId, message.Id/*, toLanguage*/);
+
+            if (_translations.TryGetValue(key, out var value))
+            {
+                if (toLanguage == value.ToLanguage)
+                {
+                    if (value.Result != null)
+                    {
+                        message.TranslatedText = value.Result;
+                    }
+
+                    message.TranslatedText ??= new MessageTranslateResultPending();
+                    return false;
+                }
+            }
+
+            string text;
+            if (message.Content is MessageRichMessage richMessage)
+            {
+                text = richMessage.Message.ToPlainText();
+            }
+            else
+            {
+                text = message.Text.Text;
+            }
+
+            if (CanTranslateText(text, true))
+            {
+                message.TranslatedText = new MessageTranslateResultPending();
+
+                Function function = message.Content is MessageRichMessage
+                    ? new TranslateMessageRichMessage(message.ChatId, message.Id, toLanguage, string.Empty)
+                    : new TranslateMessageText(message.ChatId, message.Id, toLanguage, string.Empty);
+
+                _translations[key] = new TranslatedMessage(toLanguage, null);
+                ClientService.Send(function, handler =>
+                {
+                    MessageTranslateResult result;
+                    if (handler is FormattedText text)
+                    {
+                        if (string.IsNullOrWhiteSpace(text.Text))
+                        {
+                            result = new MessageTranslateResultError();
+                        }
+                        else
+                        {
+                            // Entities are lost!!!
+                            text = ClientEx.MergeEntities(text, ClientEx.GetTextEntities(text.Text));
+
+                            var styled = TextStyleRun.GetText(text);
+                            result = new MessageTranslateResultText(toLanguage, styled);
+                        }
+                    }
+                    else if (handler is RichMessage richMessage)
+                    {
+                        result = new MessageTranslateResultRichMessage(toLanguage, richMessage);
+                    }
+                    else
+                    {
+                        result = new MessageTranslateResultError();
+                    }
+
+                    _translations[key] = new TranslatedMessage(toLanguage, result);
+
+                    // Only dispatch the update if still pending
+                    if (message.TranslatedText is MessageTranslateResultPending)
+                    {
+                        message.TranslatedText = result;
+                        Aggregator.Publish(new UpdateMessageTranslatedText(message.ChatId, message.Id, result));
+                    }
+                });
+
+                return true;
+            }
+
+            message.TranslatedText = null;
+            return false;
+        }
+
+        public bool Summarize(MessageViewModel message, string toLanguage)
+        {
+            if (/*message.IsOutgoing ||*/ string.IsNullOrEmpty(message.Text?.Text))
+            {
+                return false;
+            }
+
+            var key = new TranslatedKey(message.ChatId, message.Id/*, toLanguage*/);
+
+            if (_summaries.TryGetValue(key, out var value))
+            {
+                if (toLanguage == value.ToLanguage)
+                {
+                    if (value.Result != null)
+                    {
+                        message.SummarizedText = value.Result;
+                    }
+
+                    message.SummarizedText ??= new MessageTranslateResultPending();
+                    return false;
+                }
+            }
+
+            if (message.CanSummarizeText)
+            {
+                message.SummarizedText = new MessageTranslateResultPending();
+
+                _summaries[key] = new TranslatedMessage(toLanguage, null);
+                ClientService.Send(new SummarizeMessage(message.ChatId, message.Id, toLanguage, string.Empty), handler =>
+                {
+                    MessageTranslateResult result;
+                    if (handler is FormattedText text)
+                    {
+                        if (string.IsNullOrWhiteSpace(text.Text))
+                        {
+                            result = new MessageTranslateResultError();
+                        }
+                        else
+                        {
+                            // Entities are lost!!!
+                            text = ClientEx.MergeEntities(text, ClientEx.GetTextEntities(text.Text));
+
+                            var styled = TextStyleRun.GetText(text);
+                            result = new MessageTranslateResultSummary(styled);
+                        }
+                    }
+                    else
+                    {
+                        result = new MessageTranslateResultError();
+                    }
+
+                    _summaries[key] = new TranslatedMessage(toLanguage, result);
+
+                    // Only dispatch the update if still pending
+                    if (message.SummarizedText is MessageTranslateResultPending)
+                    {
+                        message.SummarizedText = result;
+                        Aggregator.Publish(new UpdateMessageSummarizedText(message.ChatId, message.Id, result));
+                    }
+                });
+
+                return true;
+            }
+
+            message.SummarizedText = null;
+            return false;
+        }
+
+        readonly struct TranslatedKey
+        {
+            public TranslatedKey(long chatId, long messageId)
+            {
+                ChatId = chatId;
+                MessageId = messageId;
+            }
+
+            public readonly long ChatId;
+            public readonly long MessageId;
+
+            public bool Equals(TranslatedKey other) => ChatId == other.ChatId && MessageId == other.MessageId;
+            public override bool Equals(object obj) => obj is TranslatedKey other && ChatId == other.ChatId && MessageId == other.MessageId;
+            public override int GetHashCode() => HashCode.Combine(ChatId, MessageId);
+
+            public static bool operator ==(TranslatedKey left, TranslatedKey right) => left.ChatId == right.ChatId && left.MessageId == right.MessageId;
+            public static bool operator !=(TranslatedKey left, TranslatedKey right) => left.ChatId != right.ChatId || left.MessageId != right.MessageId;
+        }
+
+        readonly struct TranslatedMessage
+        {
+            public TranslatedMessage(string toLanguage, MessageTranslateResult result)
+            {
+                ToLanguage = toLanguage;
+                Result = result;
+            }
+
+            public readonly string ToLanguage;
+            public readonly MessageTranslateResult Result;
+        }
+    }
+}

@@ -1,0 +1,643 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using LinqToVisualTree;
+using System;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Telegram.Controls;
+using Telegram.Navigation;
+using Telegram.Services;
+using Windows.UI;
+using Windows.UI.Core;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Controls.Primitives;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Media;
+using Windows.UI.Xaml.Navigation;
+
+namespace Telegram.Common
+{
+    public static partial class Extensions
+    {
+        public static void Add(this ColumnDefinitionCollection columns, double pixels)
+        {
+            columns.Add(new ColumnDefinition { Width = new GridLength(pixels) });
+        }
+
+        public static void Add(this ColumnDefinitionCollection columns, double value, GridUnitType type)
+        {
+            columns.Add(new ColumnDefinition { Width = new GridLength(value, type) });
+        }
+
+        public static void Add(this RowDefinitionCollection rows, double pixels)
+        {
+            rows.Add(new RowDefinition { Height = new GridLength(pixels) });
+        }
+
+        public static void Add(this RowDefinitionCollection rows, double value, GridUnitType type)
+        {
+            rows.Add(new RowDefinition { Height = new GridLength(value, type) });
+        }
+
+        public static void SetToolTip(DependencyObject element, object value, [CallerMemberName] string member = "", [CallerFilePath] string filePath = "", [CallerLineNumber] int line = 0)
+        {
+            if (ApiInfo.IsStoreRelease || value == null)
+            {
+                ToolTipService.SetToolTip(element, value);
+            }
+            else
+            {
+                var tooltip = new ToolTip
+                {
+                    Content = value
+                };
+
+                tooltip.Opened += (s, args) =>
+                {
+                    Logger.Info("ToolTip opened", member, filePath, line);
+                };
+
+                ToolTipService.SetToolTip(element, tooltip);
+            }
+        }
+
+        // TODO: this is a duplicat of INavigationService.ShowPopupAsync, and it's needed by GamePage, GroupCallWindow and LiveStreamWindow.
+        // Must be removed at some point.
+        public static void ShowPopup(this UserControl frame, ISession session, ContentPopup popup, object parameter = null)
+        {
+            var viewModel = BootStrapper.Current.ViewModelForPage(popup, session);
+            if (viewModel != null)
+            {
+                viewModel.XamlRoot = frame.XamlRoot;
+
+                void OnClosed(ContentDialog sender, ContentDialogClosedEventArgs args)
+                {
+                    viewModel.NavigatedFrom(null, false);
+                    popup.OnNavigatedFrom();
+                    popup.Closed -= OnClosed;
+                }
+
+                popup.DataContext = viewModel;
+
+                _ = viewModel.NavigatedToAsync(parameter, NavigationMode.New, null);
+                popup.OnNavigatedTo(parameter);
+                popup.Closed += OnClosed;
+            }
+
+            _ = popup.ShowQueuedAsync(frame.XamlRoot);
+        }
+
+        // TODO: this is a duplicat of INavigationService.ShowPopupAsync, and it's needed by GamePage, GroupCallWindow and LiveStreamWindow.
+        // Must be removed at some point.
+        public static void ShowPopup(this UserControl frame, ISession session, ModalPopup popup, object parameter = null)
+        {
+            var viewModel = BootStrapper.Current.ViewModelForPage(popup, session);
+            if (viewModel != null)
+            {
+                viewModel.XamlRoot = frame.XamlRoot;
+
+                void OnClosed(ModalPopup sender, ModalPopupClosedEventArgs args)
+                {
+                    viewModel.NavigatedFrom(null, false);
+                    popup.OnNavigatedFrom();
+                    popup.Closed -= OnClosed;
+                }
+
+                popup.DataContext = viewModel;
+
+                _ = viewModel.NavigatedToAsync(parameter, NavigationMode.New, null);
+                popup.OnNavigatedTo(parameter);
+                popup.Closed += OnClosed;
+            }
+
+            _ = popup.ShowQueuedAsync(frame.XamlRoot);
+        }
+
+        public static void AddCubicBezier(this PathFigure figure, Point controlPoint1, Point controlPoint2, Point endPoint)
+        {
+            figure.Segments.Add(new BezierSegment
+            {
+                Point1 = controlPoint1,
+                Point2 = controlPoint2,
+                Point3 = endPoint
+            });
+        }
+
+        public static void AddLine(this PathFigure figure, double x, double y)
+        {
+            figure.Segments.Add(new LineSegment
+            {
+                Point = new Point(x, y),
+            });
+        }
+
+        // Only ItemsStackPanel and ItemsWrapGrid track a realized range; any other panel has no
+        // cache indices to walk, and the caller has nothing to do.
+        private static bool TryGetCacheRange(this ListViewBase listView, out int firstCacheIndex, out int lastCacheIndex)
+        {
+            if (listView.ItemsPanelRoot is ItemsStackPanel stack)
+            {
+                firstCacheIndex = stack.FirstCacheIndex;
+                lastCacheIndex = stack.LastCacheIndex;
+                return true;
+            }
+            else if (listView.ItemsPanelRoot is ItemsWrapGrid wrap)
+            {
+                firstCacheIndex = wrap.FirstCacheIndex;
+                lastCacheIndex = wrap.LastCacheIndex;
+                return true;
+            }
+
+            firstCacheIndex = 0;
+            lastCacheIndex = -1;
+            return false;
+        }
+
+        public static void ForEach<TContent, TValue>(this ListViewBase listView, Action<TContent, TValue> handler) where TContent : class where TValue : class
+        {
+            if (!listView.TryGetCacheRange(out var firstCacheIndex, out var lastCacheIndex))
+            {
+                return;
+            }
+
+            for (int i = firstCacheIndex; i <= lastCacheIndex; i++)
+            {
+                var container = listView.ContainerFromIndex(i) as SelectorItem;
+                var content = container?.ContentTemplateRoot as TContent;
+
+                if (content == null)
+                {
+                    continue;
+                }
+
+                var item = listView.ItemFromContainer(container) as TValue;
+                if (item == null)
+                {
+                    continue;
+                }
+
+                handler(content, item);
+            }
+        }
+
+        public static void ForEach<T>(this ListViewBase listView, Action<SelectorItem, T> handler) where T : class
+        {
+            if (!listView.TryGetCacheRange(out var firstCacheIndex, out var lastCacheIndex))
+            {
+                return;
+            }
+
+            for (int i = firstCacheIndex; i <= lastCacheIndex; i++)
+            {
+                var container = listView.ContainerFromIndex(i) as SelectorItem;
+                if (container == null)
+                {
+                    continue;
+                }
+
+                var item = listView.ItemFromContainer(container) as T;
+                if (item == null)
+                {
+                    continue;
+                }
+
+                handler(container, item);
+            }
+        }
+
+        public static void ForEach(this ListViewBase listView, Action<SelectorItem> handler)
+        {
+            if (!listView.TryGetCacheRange(out var firstCacheIndex, out var lastCacheIndex))
+            {
+                return;
+            }
+
+            for (int i = firstCacheIndex; i <= lastCacheIndex; i++)
+            {
+                var container = listView.ContainerFromIndex(i) as SelectorItem;
+                if (container == null)
+                {
+                    continue;
+                }
+
+                handler(container);
+            }
+        }
+
+        public static void RegisterColorChangedCallback(this Brush brush, DependencyPropertyChangedCallback callback, ref long token)
+        {
+            if (brush is SolidColorBrush solidColorBrush && token == 0)
+            {
+                token = solidColorBrush.RegisterPropertyChangedCallback(SolidColorBrush.ColorProperty, callback);
+            }
+        }
+
+        public static void UnregisterColorChangedCallback(this Brush brush, ref long token)
+        {
+            if (brush is SolidColorBrush solidColorBrush && token != 0)
+            {
+                solidColorBrush.UnregisterPropertyChangedCallback(SolidColorBrush.ColorProperty, token);
+                token = 0;
+            }
+        }
+
+        public static void RegisterPropertyChangedCallback(this DependencyObject obj, DependencyProperty property, DependencyPropertyChangedCallback callback, ref long token)
+        {
+            if (obj is not null && token == 0)
+            {
+                token = obj.RegisterPropertyChangedCallback(property, callback);
+            }
+        }
+
+        public static void UnregisterPropertyChangedCallback(this DependencyObject obj, DependencyProperty property, ref long token)
+        {
+            if (obj is not null && token != 0)
+            {
+                obj.UnregisterPropertyChangedCallback(property, token);
+                token = 0;
+            }
+        }
+
+        public static void CreateInsetClip(this UIElement element)
+        {
+            var visual = ElementComposition.GetElementVisual(element);
+            visual.Clip = visual.Compositor.CreateInsetClip();
+        }
+
+        public static void CreateInsetClip(this UIElement element, float leftInset, float topInset, float rightInset, float bottomInset)
+        {
+            var visual = ElementComposition.GetElementVisual(element);
+            visual.Clip = visual.Compositor.CreateInsetClip(leftInset, topInset, rightInset, bottomInset);
+        }
+
+        public static Color ToColor(this int color, bool alpha = false)
+        {
+            byte a;
+            if (alpha)
+            {
+                a = (byte)((color & 0xff000000) >> 24);
+            }
+            else
+            {
+                a = 255;
+            }
+
+            byte r = (byte)((color & 0x00ff0000) >> 16);
+            byte g = (byte)((color & 0x0000ff00) >> 8);
+            byte b = (byte)(color & 0x000000ff);
+
+            return Color.FromArgb(a, r, g, b);
+        }
+
+        public static Color ToColor(this int color, double alpha)
+        {
+            byte a = (byte)(alpha * 255);
+            byte r = (byte)((color & 0x00ff0000) >> 16);
+            byte g = (byte)((color & 0x0000ff00) >> 8);
+            byte b = (byte)(color & 0x000000ff);
+
+            return Color.FromArgb(a, r, g, b);
+        }
+
+        public static int ToValue(this Color color, bool alpha = false)
+        {
+            if (alpha)
+            {
+                return (color.A << 24) + (color.R << 16) + (color.G << 8) + color.B;
+            }
+
+            return (color.R << 16) + (color.G << 8) + color.B;
+        }
+
+        public static Brush WithOpacity(this Brush brush, double opacity)
+        {
+            if (brush is SolidColorBrush solid)
+            {
+                return new SolidColorBrush(solid.Color) { Opacity = opacity };
+            }
+
+            return brush;
+        }
+
+        /// <summary>
+        /// Hands a popup's content the window's message brushes. Popups live under the PopupRoot,
+        /// a sibling of the window's content, so their lookup reaches Application without ever
+        /// passing through it - the chat override has to be forwarded rather than inherited.
+        /// </summary>
+        public static void ApplyChatTheme(this FrameworkElement element, XamlRoot xamlRoot)
+        {
+            if (WindowContext.TryGetForXamlRoot(xamlRoot, out var window))
+            {
+                element.Resources.MergedDictionaries.Add(window.Incoming.CreateDictionary());
+            }
+        }
+
+        public static bool HasThreadAccess(this DependencyObject element)
+        {
+#if WINUI3
+            // DependencyObject.Dispatcher is still on the type in WinUI 3 and is always null.
+            // DispatcherQueue is the one that answers, and it sits right beside it.
+            return element.DispatcherQueue.HasThreadAccess;
+#else
+            return element.Dispatcher.HasThreadAccess;
+#endif
+        }
+
+        public static void BeginOnUIThread(this DependencyObject element, Action action)
+        {
+            try
+            {
+#if WINUI3
+                if (element.DispatcherQueue.HasThreadAccess)
+                {
+                    action();
+                }
+                else
+                {
+                    element.DispatcherQueue.TryEnqueue(() =>
+                    {
+                        try
+                        {
+                            action();
+                        }
+                        catch
+                        {
+                            // Most likely Excep_InvalidComObject_NoRCW_Wrapper, so we can just ignore it
+                        }
+                    });
+                }
+#else
+                if (element.Dispatcher.HasThreadAccess)
+                {
+                    action();
+                }
+                else
+                {
+                    _ = element.Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+                    {
+                        try
+                        {
+                            action();
+                        }
+                        catch
+                        {
+                            // Most likely Excep_InvalidComObject_NoRCW_Wrapper, so we can just ignore it
+                        }
+                    });
+                }
+#endif
+            }
+            catch
+            {
+                // Most likely Excep_InvalidComObject_NoRCW_Wrapper, so we can just ignore it
+            }
+        }
+
+#if WINUI3
+        /// <summary>
+        /// ProtectedCursor is protected, so only the element itself may assign it - and every
+        /// caller here is a control setting its own. Rather than adding the same three lines to
+        /// five unrelated bases (Control, ContentControl, Panel, FormattedTextBlockBase), the
+        /// setter is bound by name: an UnsafeAccessor is resolved at compile time, works under
+        /// NativeAOT, and set_ProtectedCursor is what the projection calls it.
+        /// </summary>
+        [UnsafeAccessor(UnsafeAccessorKind.Method, Name = "set_ProtectedCursor")]
+        private static extern void SetProtectedCursor(UIElement element, Microsoft.UI.Input.InputCursor value);
+
+        [UnsafeAccessor(UnsafeAccessorKind.Method, Name = "get_ProtectedCursor")]
+        private static extern Microsoft.UI.Input.InputCursor GetProtectedCursor(UIElement element);
+
+        /// <summary>
+        /// Gives <paramref name="element"/> the cursor the pointer shows over
+        /// <paramref name="source"/>, one of its descendants: the first one stated on the way up,
+        /// the walk the framework makes. For an element taking pointer capture - a captured
+        /// pointer shows the cursor of the element holding it, and that walk starts there.
+        /// </summary>
+        public static void TakePointerCursorFrom(this UIElement element, object source)
+        {
+            var node = source as DependencyObject;
+
+            while (node != null && node != element)
+            {
+                if (node is UIElement child && GetProtectedCursor(child) is { } cursor)
+                {
+                    SetProtectedCursor(element, cursor);
+                    return;
+                }
+
+                node = VisualTreeHelper.GetParent(node);
+            }
+        }
+#endif
+
+        /// <summary>
+        /// The cursor while the pointer is over this element. UWP has one cursor per window and
+        /// ignores the element - which is why the call sites reset it to Arrow on the way out, and
+        /// why they have to keep doing so here: an element that says Arrow is not the same as one
+        /// that says nothing, but it looks the same and the two hosts then behave alike.
+        /// </summary>
+        public static void SetPointerCursor(this UIElement element, PointerCursorType cursor)
+        {
+#if WINUI3
+            SetProtectedCursor(element, WindowContext.GetInputCursor(cursor));
+#else
+            WindowContext.SetPointerCursor(cursor);
+#endif
+        }
+
+        /// <summary>
+        /// Runs the action on a later turn of the dispatcher, never inline - which is the whole
+        /// point, and what <see cref="BeginOnUIThread"/> deliberately does not promise: a caller
+        /// here is already on the UI thread and is asking to get off the current stack, out of a
+        /// nested dispatch or an event the framework is still inside.
+        ///
+        /// Low is the priority XAML's own activation work runs above, so it is what a caller uses
+        /// to run after the framework has finished rather than merely after this frame.
+        /// </summary>
+        public static void PostOnUIThread(this DependencyObject element, Action action, bool low = false)
+        {
+#if WINUI3
+            element.DispatcherQueue.TryEnqueue(
+                low ? Microsoft.UI.Dispatching.DispatcherQueuePriority.Low : Microsoft.UI.Dispatching.DispatcherQueuePriority.Normal,
+                () =>
+                {
+                    try
+                    {
+                        action();
+                    }
+                    catch
+                    {
+                        // Most likely Excep_InvalidComObject_NoRCW_Wrapper, so we can just ignore it
+                    }
+                });
+#else
+            _ = element.Dispatcher.RunAsync(low ? CoreDispatcherPriority.Low : CoreDispatcherPriority.Normal, () =>
+            {
+                try
+                {
+                    action();
+                }
+                catch
+                {
+                    // Most likely Excep_InvalidComObject_NoRCW_Wrapper, so we can just ignore it
+                }
+            });
+#endif
+        }
+
+        public static T GetChild<T>(this XamlRoot parentContainer)
+        {
+            if (parentContainer.TryGetContent(out UIElement child))
+            {
+                if (child is T cast)
+                {
+                    return cast;
+                }
+
+                return child.Descendants<T>().FirstOrDefault();
+            }
+
+            return default;
+        }
+
+        public static T GetChild<T>(this DependencyObject parentContainer)
+        {
+            return parentContainer.Descendants<T>().FirstOrDefault();
+        }
+
+        public static T GetChild<T>(this DependencyObject parentContainer, Func<T, bool> predicate)
+        {
+            return parentContainer.Descendants<T>().FirstOrDefault(predicate);
+        }
+
+        public static T GetLastChild<T>(this DependencyObject parentContainer)
+        {
+            return parentContainer.Descendants<T>(true).FirstOrDefault();
+        }
+
+        public static T GetLastChild<T>(this DependencyObject parentContainer, Func<T, bool> predicate)
+        {
+            return parentContainer.Descendants<T>(true).FirstOrDefault(predicate);
+        }
+
+        public static T GetChildOrSelf<T>(this DependencyObject parentContainer)
+        {
+            if (parentContainer is T child)
+            {
+                return child;
+            }
+
+            return parentContainer.Descendants<T>().FirstOrDefault();
+        }
+
+        public static T GetChildOrSelf<T>(this DependencyObject parentContainer, Func<T, bool> predicate)
+        {
+            if (parentContainer is T child)
+            {
+                return child;
+            }
+
+            return parentContainer.Descendants<T>().FirstOrDefault(predicate);
+        }
+
+        public static T GetParent<T>(this DependencyObject childContainer)
+        {
+            return childContainer.Ancestors<T>().FirstOrDefault();
+        }
+
+        public static T GetParent<T>(this DependencyObject childContainer, Func<T, bool> predicate)
+        {
+            return childContainer.Ancestors<T>().FirstOrDefault(predicate);
+        }
+
+        public static T GetParentOrSelf<T>(this DependencyObject childContainer)
+        {
+            if (childContainer is T parent)
+            {
+                return parent;
+            }
+
+            return childContainer.Ancestors<T>().FirstOrDefault();
+        }
+
+        public static T GetParentOrSelf<T>(this DependencyObject childContainer, Func<T, bool> predicate)
+        {
+            if (childContainer is T parent)
+            {
+                return parent;
+            }
+
+            return childContainer.Ancestors<T>().FirstOrDefault(predicate);
+        }
+
+        public static Task UpdateLayoutAsync(this FrameworkElement element)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+            void layoutUpdated(object s1, object e1)
+            {
+                element.LayoutUpdated -= layoutUpdated;
+                tcs.TrySetResult(true);
+            }
+
+            element.LayoutUpdated += layoutUpdated;
+            return tcs.Task;
+        }
+
+        public static Task UpdateLayoutAsync(this FrameworkElement element, CancellationToken token)
+        {
+            if (token.IsCancellationRequested)
+            {
+                return Task.CompletedTask;
+            }
+
+            var tcs = new TaskCompletionSource<bool>();
+            // layoutUpdated below captures registration, and converting a local function to a
+            // delegate requires everything it captures to be definitely assigned - which it is
+            // not inside the very expression that assigns it.
+            CancellationTokenRegistration registration = default;
+            registration = token.Register(() =>
+            {
+                element.LayoutUpdated -= layoutUpdated;
+                tcs.TrySetResult(false);
+            });
+
+            void layoutUpdated(object s1, object e1)
+            {
+                element.LayoutUpdated -= layoutUpdated;
+                tcs.TrySetResult(true);
+
+                registration.Dispose();
+            }
+
+            element.LayoutUpdated += layoutUpdated;
+            return tcs.Task;
+        }
+
+        public static Task DispatchAsync(this FrameworkElement element)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+
+#if WINUI3
+            element.DispatcherQueue.TryEnqueue(() =>
+            {
+                tcs.TrySetResult(true);
+            });
+#else
+            _ = element.Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+            {
+                tcs.TrySetResult(true);
+            });
+#endif
+
+            return tcs.Task;
+        }
+    }
+}

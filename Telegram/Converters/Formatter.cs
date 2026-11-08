@@ -1,0 +1,988 @@
+﻿//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Globalization;
+using System.Numerics;
+using Telegram.Common;
+using Telegram.Native;
+using Telegram.Services;
+using Telegram.Td.Api;
+
+namespace Telegram.Converters
+{
+    public static class Formatter
+    {
+        //public static IList<string> Languages { get; }
+
+        //static Formatter()
+        //{
+        //    var culture = NativeUtils.GetCurrentCulture();
+        //    var languages = GlobalizationPreferences.Languages.ToList();
+
+        //    if (Windows.Globalization.Language.IsWellFormed(culture) && !languages.Contains(culture))
+        //    {
+        //        languages.Insert(0, culture);
+        //    }
+
+        //    Languages = languages;
+        //}
+
+        /// <summary>Nanotons per TON: the amount is an exact integer of these.</summary>
+        private const int TonDecimals = 9;
+
+        private static readonly BigInteger OneTon = BigInteger.Pow(10, TonDecimals);
+
+        /// <summary>
+        /// A gram amount as a wallet summarises it - a balance, a row of history: two decimals,
+        /// truncated. Under a hundredth those would read as nothing, so there it is one significant
+        /// digit, rounded: 0.000444 is "0.0004".
+        /// </summary>
+        /// <param name="padWhole">
+        /// Whether a whole amount still shows ".00": a list row lines up with the rows around it, a
+        /// balance on its own does not need to.
+        /// </param>
+        public static (string Integer, string Fraction) GramSummary(BigInteger nanograms, bool padWhole = false)
+        {
+            var (integer, _) = SplitAmount(nanograms, TonDecimals, 0);
+            var separator = LocaleService.Current.CurrentCulture.NumberFormat.NumberDecimalSeparator;
+
+            var units = BigInteger.Abs(nanograms);
+            var rest = units % OneTon;
+
+            if (rest.IsZero && !padWhole)
+            {
+                return (integer, string.Empty);
+            }
+
+            var hundredth = OneTon / 100;
+            if (!units.IsZero && units < hundredth)
+            {
+                var position = 3;
+                var step = hundredth / 10;
+
+                while (units < step)
+                {
+                    position++;
+                    step /= 10;
+                }
+
+                var digit = (int)(units / step);
+                if ((units % step) * 2 >= step)
+                {
+                    digit++;
+                }
+
+                if (digit == 10)
+                {
+                    digit = 1;
+                    position--;
+                }
+
+                return (integer, separator + new string('0', position - 1) + (char)('0' + digit));
+            }
+
+            var cents = (int)(rest / hundredth);
+            return (integer, separator + cents.ToString("00", CultureInfo.InvariantCulture));
+        }
+
+        /// <summary>
+        /// A gram amount to the last nanogram that is not zero: what a fee, a transfer or a request
+        /// is exactly, where a rounded figure would be a different amount.
+        /// </summary>
+        public static (string Integer, string Fraction) GramExact(BigInteger nanograms)
+        {
+            return SplitAmount(nanograms, TonDecimals, TonDecimals);
+        }
+
+        /// <summary>
+        /// The two halves as one string, for everywhere that is not drawing them at two sizes.
+        /// </summary>
+        public static string Join(this (string Integer, string Fraction) amount)
+        {
+            return amount.Integer + amount.Fraction;
+        }
+
+        /// <summary>
+        /// An exact amount of grams with its unit, pluralised: "1 Gram", "2 Grams", "1.5 Grams".
+        /// </summary>
+        public static string Grams(BigInteger nanograms, bool capital = false)
+        {
+            return Grams(GramExact(nanograms), nanograms, capital);
+        }
+
+        /// <summary>
+        /// The same, for a caller that already split the amount - a card drawing the two halves at
+        /// two sizes still needs one unit for the whole of it.
+        /// </summary>
+        /// <remarks>
+        /// The unit agrees with the amount **as written**, not with the nanograms behind it: an
+        /// amount shown to two decimals as "1.00" is plural, and one that rounds down to "1" is
+        /// singular, because the unit is read next to the digits and has to match them.
+        /// </remarks>
+        public static string Grams((string Integer, string Fraction) amount, BigInteger nanograms, bool capital = false)
+        {
+            var whole = BigInteger.Abs(nanograms) / OneTon;
+
+            return string.Format(
+                Locale.Plural(capital ? Strings.R.GramCapital : Strings.R.Grams, (long)BigInteger.Min(whole, long.MaxValue), amount.Fraction.Length > 0),
+                amount.Join());
+        }
+
+        /// <summary>
+        /// Splits an amount into the part before the decimal separator and the part
+        /// from the separator onwards, both in the app's language — "1,344" + ".02"
+        /// in en, "1.344" + ",02" in it. Kept apart so the two can be drawn at
+        /// different sizes, which is the only reason to want them separately.
+        ///
+        /// The split is done on the exact integer the amount is made of, never on a
+        /// double: 0.1 is not a double, and a balance must not drift in its last
+        /// digits on the way to the screen.
+        /// </summary>
+        /// <param name="units">The amount, in whatever the smallest unit is.</param>
+        /// <param name="exponent">
+        /// How many of those units make one — 9 for nanotons and nanostars, 2 for
+        /// most currencies.
+        /// </param>
+        /// <param name="decimals">
+        /// The most fractional digits to show. Trailing zeros are dropped, and a
+        /// whole amount comes back with no fraction at all: "1", not "1.00", and
+        /// "0.1", not "0.10".
+        /// </param>
+        /// <param name="trim">
+        /// Whether those trailing zeros come off. Money keeps them - "5.50" is what
+        /// an amount of money looks like - and everything else does not.
+        /// </param>
+        public static (string Integer, string Fraction) SplitAmount(BigInteger units, int exponent, int decimals, bool trim = true)
+        {
+            var culture = LocaleService.Current.CurrentCulture;
+            var format = culture.NumberFormat;
+
+            var negative = units.Sign < 0;
+
+            if (negative)
+            {
+                units = -units;
+            }
+
+            exponent = Math.Max(exponent, 0);
+
+            var whole = BigInteger.DivRem(units, BigInteger.Pow(10, exponent), out var rest);
+
+            var integer = whole.ToString("N0", culture);
+            if (negative)
+            {
+                // The sign is applied here rather than left to "N0", which would
+                // otherwise use the culture's negative pattern — parentheses in a
+                // few of them, which reads as an accounting figure, not a balance.
+                integer = format.NegativeSign + integer;
+            }
+
+            decimals = Math.Min(Math.Max(decimals, 0), exponent);
+            if (decimals == 0)
+            {
+                return (integer, string.Empty);
+            }
+
+            // Truncated, not rounded. Rounding up would show a balance the user does
+            // not have, and they would find out when a transfer of it fails.
+            var digits = rest.ToString(CultureInfo.InvariantCulture)
+                .PadLeft(exponent, '0')
+                .Substring(0, decimals);
+
+            if (trim)
+            {
+                digits = digits.TrimEnd('0');
+            }
+
+            return digits.Length > 0
+                ? (integer, format.NumberDecimalSeparator + digits)
+                : (integer, string.Empty);
+        }
+
+        /// <summary>
+        /// A star amount as the one exact integer of nanostars it is. TDLib splits
+        /// it in two, and both halves carry the same sign.
+        /// </summary>
+        public static BigInteger Nanostars(StarAmount amount)
+        {
+            return new BigInteger(amount.StarCount) * 1_000_000_000 + amount.NanostarCount;
+        }
+
+        /// <summary>
+        /// How many of a currency's smallest units make one of it — 2 for dollars, 0
+        /// for yen. The counterpart of <see cref="GetAmountFraction"/>, for the exact
+        /// path: a fraction is a double and an exponent is not.
+        /// </summary>
+        public static int GetAmountExponent(string currency)
+        {
+            return (int)Math.Round(Math.Log10(GetAmountFraction(currency)));
+        }
+
+        public static string UtcTimeOffset(int value)
+        {
+            if (value == 0)
+            {
+                return "UTC";
+            }
+
+            var span = TimeSpan.FromSeconds(value);
+            if (span > TimeSpan.Zero)
+            {
+                return string.Format("UTC+{0:hh\\:mm}", span);
+            }
+
+            return string.Format("UTC-{0:hh\\:mm}", span);
+        }
+
+        public static string DayGrouping(DateTime date)
+        {
+            var now = DateTime.Now;
+
+            var difference = Math.Abs(date.Month - now.Month + 12 * (date.Year - now.Year));
+            if (difference >= 12)
+            {
+                return Date(date, Strings.chatFullDate);
+            }
+            else if (date.Date == now.Date)
+            {
+                return Strings.MessageScheduleToday;
+            }
+
+            return Date(date, Strings.chatDate);
+        }
+
+        public static string PremiumDuration(int days)
+        {
+            if (days >= 30)
+            {
+                return Locale.Declension(Strings.R.Gift2Months, days / 30);
+            }
+
+            return Locale.Declension(Strings.R.Days, days);
+        }
+
+        public static string Distance(float distance, bool away = true)
+        {
+            var useImperialSystemType = false;
+
+            switch (AppSettings.DistanceUnits)
+            {
+                case DistanceUnits.Automatic:
+                    var culture = NativeUtils.GetCurrentCulture();
+                    var info = new RegionInfo(culture);
+                    useImperialSystemType = !info.IsMetric;
+                    break;
+                case DistanceUnits.Kilometers:
+                    useImperialSystemType = false;
+                    break;
+                case DistanceUnits.Miles:
+                    useImperialSystemType = true;
+                    break;
+            }
+
+            if (useImperialSystemType)
+            {
+                distance *= 3.28084f;
+                if (distance < 1000)
+                {
+                    return string.Format(away ? Strings.FootsAway : Strings.FootsShort, string.Format("{0}", (int)Math.Max(1, distance)));
+                }
+                else
+                {
+                    string arg;
+                    if (distance % 5280 == 0)
+                    {
+                        arg = string.Format("{0}", (int)(distance / 5280));
+                    }
+                    else
+                    {
+                        arg = string.Format("{0:0.00}", distance / 5280.0f);
+                    }
+
+                    return string.Format(away ? Strings.MilesAway : Strings.MilesShort, arg);
+                }
+            }
+            else
+            {
+                if (distance < 1000)
+                {
+                    return string.Format(away ? Strings.MetersAway2 : Strings.MetersShort, string.Format("{0}", (int)Math.Max(1, distance)));
+                }
+                else
+                {
+                    string arg;
+                    if (distance % 1000 == 0)
+                    {
+                        arg = string.Format("{0}", (int)(distance / 1000));
+                    }
+                    else
+                    {
+                        arg = string.Format("{0:0.00}", distance / 1000.0f);
+                    }
+
+                    return string.Format(away ? Strings.KMetersAway2 : Strings.KMetersShort, arg);
+                }
+            }
+        }
+
+        public static string PhoneNumber(string number)
+        {
+            if (number == null)
+            {
+                return null;
+            }
+
+            return Common.PhoneNumber.Format(number);
+        }
+
+        public static string BannedUntil(int date)
+        {
+            return DateAt(date);
+
+            //try
+            //{
+            //    date *= 1000;
+            //    var rightNow = System.DateTime.Now;
+            //    var year = rightNow.Year;
+            //    var banned = Converter.DateTime(date);
+            //    int dateYear = banned.Year;
+
+            //    if (year == dateYear)
+            //    {
+            //        //formatterBannedUntil = createFormatter(locale, is24HourFormat ? getStringInternal("formatterBannedUntil24H", R.string.formatterBannedUntil24H) : getStringInternal("formatterBannedUntil12H", R.string.formatterBannedUntil12H), is24HourFormat ? "MMM dd yyyy, HH:mm" : "MMM dd yyyy, h:mm a");
+            //        //formatterBannedUntilThisYear = createFormatter(locale, is24HourFormat ? getStringInternal("formatterBannedUntilThisYear24H", R.string.formatterBannedUntilThisYear24H) : getStringInternal("formatterBannedUntilThisYear12H", R.string.formatterBannedUntilThisYear12H), is24HourFormat ? "MMM dd, HH:mm" : "MMM dd, h:mm a");
+
+            //        return getInstance().formatterBannedUntilThisYear.format(new Date(date));
+            //    }
+            //    else
+            //    {
+            //        return getInstance().formatterBannedUntil.format(new Date(date));
+            //    }
+            //}
+            //catch (Exception e)
+            //{
+            //    //FileLog.e(e);
+            //}
+
+            //return "LOC_ERR";
+        }
+
+        public static string FormatAmount(long amount, string currency)
+        {
+            return Locale.FormatCurrency(amount, currency);
+        }
+
+        /// <summary>
+        /// An amount in its currency, with enough decimals to be worth reading.
+        /// </summary>
+        /// <remarks>
+        /// Below the currency's smallest unit the usual path cannot carry the value at all - a
+        /// thousandth of a cent is not a number of cents, and <see cref="AmountBack"/> truncates it
+        /// to none - so anything smaller is formatted from the value itself, with as many decimals
+        /// as it takes to reach two significant digits.
+        ///
+        /// For wallet amounts, where a fee of a few hundred thousand nanograms is worth a fraction
+        /// of a cent and is still worth showing.
+        /// </remarks>
+        public static string FormatAmountExact(BigInteger units, int exponent, string currency)
+        {
+            var precision = GetAmountExponent(currency);
+
+            // As deep as it takes to reach the first digit that is not a zero, and no deeper: the
+            // currency's own precision says nothing about an amount below its smallest unit, and
+            // everything past that first digit is the rate's noise rather than the amount's.
+            //
+            // Measured by dividing rather than by scaling up, so an amount too large for a double
+            // is counted the same way as one too small for a cent.
+            var digits = precision;
+
+            if (!units.IsZero)
+            {
+                var value = BigInteger.Abs(units);
+
+                while (digits < MaxAmountDecimals && value * BigInteger.Pow(10, digits) < BigInteger.Pow(10, exponent))
+                {
+                    digits++;
+                }
+            }
+
+            // Written out in the app's own language, like every other number beside it. The
+            // formatter speaks the region's, and the two disagree often enough to be read as two
+            // amounts in one line.
+            var (integer, fraction) = SplitAmount(Rescale(units, exponent, digits), digits, digits, digits > precision);
+
+            var formatter = Locale.GetCurrencyFormatter(currency);
+            var number = integer + fraction;
+
+            return formatter != null ? formatter.Format(number) : number;
+        }
+
+        /// <summary>How deep a converted amount is ever written.</summary>
+        private const int MaxAmountDecimals = 8;
+
+        /// <summary>
+        /// The same amount counted in a different unit, truncated rather than rounded when the new
+        /// one is coarser - money is never rounded up on the way to a screen.
+        /// </summary>
+        public static BigInteger Rescale(BigInteger units, int from, int to)
+        {
+            if (to == from)
+            {
+                return units;
+            }
+
+            return to > from
+                ? units * BigInteger.Pow(10, to - from)
+                : units / BigInteger.Pow(10, from - to);
+        }
+
+        public static double Amount(long amount, string currency)
+        {
+            return amount / GetAmountFraction(currency);
+        }
+
+        public static long AmountBack(double amount, string currency)
+        {
+            return (long)(amount * GetAmountFraction(currency));
+        }
+
+        public static double GetAmountFraction(string currency)
+        {
+            if (currency == null)
+            {
+                return 1;
+            }
+
+            switch (currency.ToUpper())
+            {
+                case "CLF":
+                    return 10000.0d;
+                case "BHD":
+                case "IQD":
+                case "JOD":
+                case "KWD":
+                case "LYD":
+                case "OMR":
+                case "TND":
+                    return 1000.0d;
+                case "BIF":
+                case "BYR":
+                case "CLP":
+                case "CVE":
+                case "DJF":
+                case "GNF":
+                case "ISK":
+                case "JPY":
+                case "KMF":
+                case "KRW":
+                case "MGA":
+                case "PYG":
+                case "RWF":
+                case "UGX":
+                case "UYI":
+                case "VND":
+                case "VUV":
+                case "XAF":
+                case "XOF":
+                case "XPF":
+                case "XTR":
+                    return 1.0d;
+                case "MRO":
+                    return 10.0d;
+                case "TON":
+                    return Constants.ToncoinMin;
+                default:
+                    return 100.0d;
+            }
+        }
+
+        public static string ShippingOption(ShippingOption option, string currency)
+        {
+            var amount = 0L;
+            foreach (var price in option.PriceParts)
+            {
+                amount += price.Amount;
+            }
+
+            return $"{option.Title} - {FormatAmount(amount, currency)}";
+        }
+
+        public static string ReadDate(int value)
+        {
+            var dateTime = ToLocalTime(value);
+
+            if (dateTime.Date == DateTime.Now.Date)
+            {
+                return string.Format(Strings.PmReadTodayAt, Time(dateTime));
+            }
+            else if (dateTime.Date == DateTime.Now.Date.AddDays(-1))
+            {
+                return string.Format(Strings.PmReadYesterdayAt, Time(dateTime));
+            }
+
+            return string.Format(Strings.PmReadDateTimeAt, Date(dateTime), Time(dateTime));
+        }
+
+        public static string EditDate(int value)
+        {
+            var dateTime = ToLocalTime(value);
+
+            if (dateTime.Date == DateTime.Now.Date)
+            {
+                return string.Format(Strings.PmEditedTodayAt, Time(dateTime));
+            }
+            else if (dateTime.Date == DateTime.Now.Date.AddDays(-1))
+            {
+                return string.Format(Strings.PmEditedYesterdayAt, Time(dateTime));
+            }
+
+            return string.Format(Strings.PmEditedDateTimeAt, Date(dateTime), Time(dateTime));
+        }
+
+        public static string CompletedDate(int value)
+        {
+            var dateTime = ToLocalTime(value);
+
+            if (dateTime.Date == DateTime.Now.Date)
+            {
+                return string.Format(Strings.TodoCompletedTodayAt, Time(dateTime));
+            }
+            else if (dateTime.Date == DateTime.Now.Date.AddDays(-1))
+            {
+                return string.Format(Strings.TodoCompletedYesterdayAt, Time(dateTime));
+            }
+
+            return string.Format(Strings.TodoCompletedDateTimeAt, Date(dateTime), Time(dateTime));
+        }
+
+        public static string ForwardDate(int value)
+        {
+            var dateTime = ToLocalTime(value);
+
+            if (dateTime.Date == DateTime.Now.Date)
+            {
+                return string.Format(Strings.PmFwdOriginalTodayAt, Time(dateTime));
+            }
+            else if (dateTime.Date == DateTime.Now.Date.AddDays(-1))
+            {
+                return string.Format(Strings.PmFwdOriginalYesterdayAt, Time(dateTime));
+            }
+
+            return string.Format(Strings.PmFwdOriginalDateTimeAt, Date(dateTime), Time(dateTime));
+        }
+
+        public static string SentDate(int value)
+        {
+            var dateTime = ToLocalTime(value);
+
+            if (dateTime.Date == DateTime.Now.Date)
+            {
+                return string.Format(Strings.LiveStoryMessageSentTodayAt, Time(dateTime));
+            }
+            else if (dateTime.Date == DateTime.Now.Date.AddDays(-1))
+            {
+                return string.Format(Strings.LiveStoryMessageSentYesterdayAt, Time(dateTime));
+            }
+
+            return string.Format(Strings.LiveStoryMessageSentDateTimeAt, Date(dateTime), Time(dateTime));
+        }
+
+        public static string DateExtended(int value)
+        {
+            var dateTime = ToLocalTime(value);
+
+            if (dateTime.Date == DateTime.Now.Date)
+            {
+                return Time(dateTime);
+            }
+            else if (dateTime.Date.AddDays(6) >= DateTime.Now.Date)
+            {
+                return Date(value, Strings.formatterWeek);
+            }
+            else if (dateTime.Date.Year == DateTime.Now.Year)
+            {
+                return Date(value, Strings.formatterMonth);
+            }
+
+            return Date(value, Strings.formatterYear);
+        }
+
+        public static string Duration(int value)
+        {
+            var duration = TimeSpan.FromSeconds(value);
+            if (duration.TotalHours >= 1)
+            {
+                return duration.ToString("h\\:mm\\:ss");
+            }
+            else
+            {
+                return duration.ToString("mm\\:ss");
+            }
+        }
+
+        public static string Time(int value)
+        {
+            // "۰۱:۵۹ ق.ظ"
+            return NativeUtils.FormatTime(value);
+        }
+
+        public static string Time(DateTime value)
+        {
+            return NativeUtils.FormatTime(value);
+        }
+
+        public static string Date(int value)
+        {
+            return NativeUtils.FormatDate(value, "DATE_SHORTDATE");
+        }
+
+        public static string Date(int value, string format)
+        {
+            return NativeUtils.FormatDate(value, format);
+        }
+
+        public static string Date(DateTime value)
+        {
+            return NativeUtils.FormatDate(value, "DATE_SHORTDATE");
+        }
+
+        public static string Date(DateTime value, string format)
+        {
+            return NativeUtils.FormatDate(value, format);
+        }
+
+        public static DateTime ToLocalTime(long value)
+        {
+            // From UTC0 UnixTime to local DateTime
+
+            var dtDateTime = new DateTime(1970, 1, 1, 0, 0, 0, 0);
+            DateTime.SpecifyKind(dtDateTime, DateTimeKind.Utc);
+
+            dtDateTime = dtDateTime.AddSeconds(value).ToLocalTime();
+            return dtDateTime;
+        }
+
+        public static string LongDateAt(int value)
+        {
+            return string.Format(Strings.formatDateAtTime, Date(value, "DATE_LONGDATE"), Time(value));
+        }
+
+        public static string DateAt(int value)
+        {
+            return string.Format(Strings.formatDateAtTime, Date(value), Time(value));
+        }
+
+        public static string DateAt(DateTime value)
+        {
+            return string.Format(Strings.formatDateAtTime, Date(value), Time(value));
+        }
+
+        public static string InAgo(long value)
+        {
+            var now = DateTime.Now.ToUnixTimeSeconds();
+            if (now > value)
+            {
+                return RelativeDateAgo(now - value);
+            }
+
+            return RelativeDateIn(value - now);
+        }
+
+        public static string Relative(TextEntityTypeDateTime dateTime)
+        {
+            if (dateTime.FormattingType is DateTimeFormattingTypeAbsolute absolute)
+            {
+                var time = absolute.TimePrecision switch
+                {
+                    DateTimePartPrecisionLong => "HH:mm:ss",
+                    DateTimePartPrecisionShort => "HH:mm",
+                    _ => null
+                };
+
+                var date = absolute.DatePrecision switch
+                {
+                    DateTimePartPrecisionLong => "dd MMMM yyyy",
+                    DateTimePartPrecisionShort => "dd.MM.yyyy",
+                    _ => null
+                };
+
+                if (date != null)
+                {
+                    date = absolute.ShowDayOfWeek
+                        ? NativeUtils.FormatDate(dateTime.UnixTime, "dddd") + ", " + NativeUtils.FormatDate(dateTime.UnixTime, date)
+                        : NativeUtils.FormatDate(dateTime.UnixTime, date);
+                }
+
+                if (time != null && date != null)
+                {
+                    return string.Format(Strings.formatDateAtTime, date, NativeUtils.FormatTime(dateTime.UnixTime));
+                }
+                else if (time != null)
+                {
+                    return NativeUtils.FormatTime(dateTime.UnixTime);
+                }
+                else if (date != null)
+                {
+                    return date;
+                }
+                else if (absolute.ShowDayOfWeek)
+                {
+                    return NativeUtils.FormatDate(dateTime.UnixTime, "dddd");
+                }
+
+                return string.Empty;
+            }
+            else if (dateTime.FormattingType is DateTimeFormattingTypeRelative)
+            {
+                return InAgo(dateTime.UnixTime);
+            }
+
+            return string.Empty;
+        }
+
+        public static string RelativeDate(long value)
+        {
+            long j2 = value / 60;
+            long j3 = j2 / 60;
+            long j4 = j3 / 24;
+            long j5 = j4 / 30;
+            long j6 = j4 / 365;
+            return j6 >= 1
+                ? j6 == 1
+                ? Strings.YearAgo
+                : Locale.Declension(Strings.R.YearsAgo, (int)j6)
+                : j5 >= 1
+                ? j5 == 1
+                ? Strings.MonthAgo
+                : Locale.Declension(Strings.R.MonthsAgo, (int)j5)
+                : j4 >= 1
+                ? j4 == 1
+                ? Strings.DayAgo
+                : Locale.Declension(Strings.R.DaysAgo, (int)j4)
+                : j3 >= 1
+                ? j3 == 1
+                ? Strings.HourAgo
+                : Locale.Declension(Strings.R.HoursAgo, (int)j3)
+                : j2 >= 1
+                ? j2 == 1
+                ? Strings.MinuteAgo
+                : Locale.Declension(Strings.R.MinutesAgo, (int)j2)
+                : Strings.LessMinuteAgo;
+        }
+
+        public static string RelativeDateAgo(long value)
+        {
+            long j2 = value / 60;
+            long j3 = j2 / 60;
+            long j4 = j3 / 24;
+            long j5 = j4 / 30;
+            long j6 = j4 / 365;
+            return j6 >= 1
+                ? j6 == 1
+                ? Strings.YearAgo
+                : Locale.Declension(Strings.R.YearsAgo, (int)j6)
+                : j5 >= 1
+                ? j5 == 1
+                ? Strings.MonthAgo
+                : Locale.Declension(Strings.R.MonthsAgo, (int)j5)
+                : j4 >= 1
+                ? j4 == 1
+                ? Strings.DayAgo
+                : Locale.Declension(Strings.R.DaysAgo, (int)j4)
+                : j3 >= 1
+                ? j3 == 1
+                ? Strings.HourAgo
+                : Locale.Declension(Strings.R.HoursAgo, (int)j3)
+                : j2 >= 1
+                ? j2 == 1
+                ? Strings.MinuteAgo
+                : Locale.Declension(Strings.R.MinutesAgo, (int)j2)
+                : Locale.Declension(Strings.R.SecondsAgo, value);
+        }
+
+        public static string RelativeDateIn(long value)
+        {
+            long j2 = value / 60;
+            long j3 = j2 / 60;
+            long j4 = j3 / 24;
+            long j5 = j4 / 30;
+            long j6 = j4 / 365;
+            return j6 >= 1
+                ? j6 == 1
+                ? Strings.InYear
+                : Locale.Declension(Strings.R.InYears, (int)j6)
+                : j5 >= 1
+                ? j5 == 1
+                ? Strings.InMonth
+                : Locale.Declension(Strings.R.InMonths, (int)j5)
+                : j4 >= 1
+                ? j4 == 1
+                ? Strings.InDay
+                : Locale.Declension(Strings.R.InDays, (int)j4)
+                : j3 >= 1
+                ? j3 == 1
+                ? Strings.InHour
+                : Locale.Declension(Strings.R.InHours, (int)j3)
+                : j2 >= 1
+                ? j2 == 1
+                ? Strings.InMinute
+                : Locale.Declension(Strings.R.InMinutes, (int)j2)
+                : Locale.Declension(Strings.R.InSeconds, value);
+        }
+
+        public static string ShortRating(double size, bool forceDecimal)
+        {
+            var number = (long)size;
+            if (number >= 1000 * 1000)
+            {
+                var K = string.Empty;
+                var lastDec = 0L;
+
+                while (number / 1000 > 0)
+                {
+                    K += "K";
+                    lastDec = (number % 1000) / 100;
+                    number /= 1000;
+                }
+
+                if (lastDec != 0 || forceDecimal)
+                {
+                    if (K.Length >= 2)
+                    {
+                        return string.Format("{0}.{1}M", number, lastDec);
+                    }
+                    else
+                    {
+                        return string.Format("{0}.{1}{2}", number, lastDec, K);
+                    }
+                }
+
+                if (K.Length >= 2)
+                {
+                    return string.Format("{0}M", number);
+                }
+                else
+                {
+                    return string.Format("{0}{1}", number, K);
+                }
+            }
+
+            return size.ToString("N0");
+        }
+
+        public static string Percent(double percent)
+        {
+            return (percent * 100).ToString("0.##") + "%";
+        }
+
+        public static string ShortDuration(int time)
+        {
+            int minutes = time / 60;
+            int hours = time / 3600;
+
+            if (hours > 0)
+            {
+                return Locale.Declension(Strings.R.ShortHoursAgo, hours) + " " + Locale.Declension(Strings.R.ShortMinutesAgo, minutes % 60);
+            }
+
+            return Locale.Declension(Strings.R.ShortMinutesAgo, minutes);
+        }
+
+        public static string ShortNumber(long number)
+        {
+            return ShortNumber(number, false);
+        }
+
+        public static string ShortNumber(long number, bool round)
+        {
+            var K = string.Empty;
+            var lastDec = 0L;
+
+            while (number / 1000 > 0)
+            {
+                K += "K";
+                lastDec = (number % 1000) / 100;
+                number /= 1000;
+            }
+
+            if (lastDec != 0 && K.Length > 0 && !round)
+            {
+                if (K.Length == 2)
+                {
+                    return string.Format("{0}.{1}M", number, lastDec);
+                }
+                else
+                {
+                    return string.Format("{0}.{1}{2}", number, lastDec, K);
+                }
+            }
+
+            if (K.Length == 2)
+            {
+                return string.Format("{0}M", number);
+            }
+            else
+            {
+                return string.Format("{0}{1}", number, K);
+            }
+        }
+
+        public static string Birthdate(Birthdate birthdate)
+        {
+            if (birthdate == null)
+            {
+                return string.Empty;
+            }
+
+            string formatted;
+            try
+            {
+                // We sanitize the date by adding months and days to 01/01/year.
+                // This prevents fails when the received date is something like 31/11/2024 or 29/02/2025.
+                static DateTime CreateDate(int year, int month, int day)
+                {
+                    var date = new DateTime(year, 1, 1, 12, 0, 0, DateTimeKind.Local);
+                    date = date.AddMonths(month - 1);
+                    date = date.AddDays(day - 1);
+
+                    return date;
+                }
+
+                DateTime date;
+                string format;
+
+                // GetDateFormatEx doesn't support dates earlier than 01/01/1601
+                if (birthdate.Year < 1601)
+                {
+                    // Must use a leap year because users can set 29/02 as their birthdate.
+                    date = CreateDate(2024, birthdate.Month, birthdate.Day);
+                    format = Strings.formatterMonth;
+                }
+                else
+                {
+                    date = CreateDate(birthdate.Year, birthdate.Month, birthdate.Day);
+                    format = Strings.formatterBoostExpired;
+                }
+
+                formatted = NativeUtils.FormatDate(date.Year, date.Month, date.Day, format);
+            }
+            catch
+            {
+                formatted = null;
+            }
+
+            // The string is going to be empty if GetDateFormatEx fails.
+            if (string.IsNullOrEmpty(formatted))
+            {
+                formatted = string.Format("{0}/{1}/{2}", birthdate.Day, birthdate.Month, birthdate.Year);
+            }
+
+            return formatted;
+        }
+    }
+}

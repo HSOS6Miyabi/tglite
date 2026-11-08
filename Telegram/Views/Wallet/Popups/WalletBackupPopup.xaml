@@ -1,0 +1,54 @@
+﻿<local:WalletPopup x:Class="Telegram.Views.Wallet.Popups.WalletBackupPopup"
+                     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                     xmlns:local="using:Telegram.Views.Wallet.Popups"
+                     xmlns:controls="using:Telegram.Controls"
+                     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+                     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                     mc:Ignorable="d"
+                     IsDismissButtonVisible="True"
+                     Padding="0,24">
+
+    <!-- The popup does not scroll its own content, so the panel keeps the scroll viewer it had
+         as a page: three rows fit, and the footers under them are what make it tall. -->
+    <ScrollViewer x:Name="ScrollingHost"
+                  VerticalScrollBarVisibility="Auto"
+                  VerticalScrollMode="Auto">
+        <StackPanel>
+            <controls:HeaderedControl Header="{CustomResource WalletRecoveryPhraseLearnTitle}"
+                                      Footer="{CustomResource WalletRecoveryPhraseTransferInfo}">
+                <controls:SettingsButton Click="{x:Bind ViewModel.ShowRecoveryPhrase}"
+                                         Content="{CustomResource WalletRecoveryPhraseLearnButton}" />
+            </controls:HeaderedControl>
+
+            <!-- One of the two buttons at a time: the footer changes tense with it, because the
+                 same description reads as a promise or as a fact depending on which way it goes. -->
+            <controls:HeaderedControl x:Name="BackupRoot"
+                                      Header="{CustomResource WalletEncryptedBackup}">
+                <controls:SettingsButton x:Name="DisableBackupButton"
+                                         Click="{x:Bind ViewModel.DisableBackup}"
+                                         Content="{CustomResource WalletDisableBackup}"
+                                         Foreground="{ThemeResource DangerButtonForeground}" />
+                <controls:SettingsButton x:Name="EnableBackupButton"
+                                         Click="{x:Bind ViewModel.EnableBackup}"
+                                         Content="{CustomResource WalletEnableBackup}" />
+            </controls:HeaderedControl>
+
+            <controls:HeaderedControl>
+                <controls:SettingsButton Click="{x:Bind ViewModel.DeleteWallet}"
+                                         Content="{CustomResource WalletDeleteWallet}"
+                                         Foreground="{ThemeResource DangerButtonForeground}" />
+            </controls:HeaderedControl>
+
+            <!-- Filled in code: each row needs the address broken into groups that alternate
+                 colour, which no template can do from a single string. -->
+            <controls:HeaderedControl x:Name="ArchiveRoot"
+                                      Header="{CustomResource WalletPreviousWallets}"
+                                      Footer="{CustomResource WalletPreviousWalletsInfo}"
+                                      Visibility="Collapsed">
+                <StackPanel x:Name="ArchivePanel" />
+            </controls:HeaderedControl>
+
+        </StackPanel>
+    </ScrollViewer>
+</local:WalletPopup>

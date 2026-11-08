@@ -1,0 +1,21 @@
+namespace Telegram.Native
+{
+    struct ChatBackgroundSymbol
+    {
+        Windows.Foundation.Numerics.Vector2 Offset;
+        Windows.Foundation.Numerics.Vector2 Size;
+        Single RotationAngle;
+    };
+
+    [default_interface]
+    runtimeclass ChatBackgroundPattern : Windows.Foundation.IClosable
+    {
+        ChatBackgroundPattern(UIComposition.ICompositionSurface surface);
+
+        UIComposition.ICompositionSurface Surface{ get; };
+        Windows.Foundation.Numerics.Vector2 RenderSize{ get; };
+        Windows.Foundation.Numerics.Vector2 RenderPhysicalSize{ get; };
+        Windows.Foundation.Numerics.Vector2 NaturalSize{ get; };
+        Windows.Foundation.Collections.IVector<ChatBackgroundSymbol> Symbols{ get; };
+    };
+}

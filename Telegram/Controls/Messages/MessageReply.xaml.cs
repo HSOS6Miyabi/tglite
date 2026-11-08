@@ -1,0 +1,555 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Numerics;
+using System.Text;
+using Telegram.Services;
+using Telegram.Streams;
+using Telegram.Td.Api;
+using Telegram.ViewModels;
+using Windows.Foundation;
+using Windows.UI;
+using Windows.UI.Composition;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Automation.Peers;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Documents;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Media;
+using Windows.UI.Xaml.Shapes;
+
+namespace Telegram.Controls.Messages
+{
+    public partial class MessageReplyPattern : Control
+    {
+        private static readonly Vector4[] _clones = new[]
+        {
+            new Vector4(9, 5, 20, 0.1f),
+            new Vector4(41, 12, 19, 0.2f),
+            new Vector4(64, 0, 13, 0.2f),
+            new Vector4(77, 18, 15, 0.3f),
+            new Vector4(103, 7, 19, 0.4f),
+            new Vector4(23, 33, 13, 0.2f),
+            new Vector4(58, 37, 19, 0.3f),
+            new Vector4(99, 34, 15, 0.4f),
+        };
+
+        private SpriteVisual _modelVisual;
+        private AnimatedImage ModelAnimated;
+
+        private bool _templateApplied;
+
+        public MessageReplyPattern()
+        {
+            DefaultStyleKey = typeof(MessageReplyPattern);
+        }
+
+        protected override void OnApplyTemplate()
+        {
+            // TODO: Name
+            var animated = GetTemplateChild("Animated") as AnimatedImage;
+            var layoutRoot = GetTemplateChild("LayoutRoot") as Border;
+
+            var hasModel = Model != null;
+            if (hasModel)
+            {
+                ModelAnimated = GetTemplateChild(nameof(ModelAnimated)) as AnimatedImage;
+            }
+
+            var visual = ElementComposition.GetElementVisual(animated);
+            var compositor = visual.Compositor;
+
+            // Create a VisualSurface positioned at the same location as this control and feed that
+            // through the color effect.
+            var surfaceBrush = compositor.CreateSurfaceBrush();
+            var surface = compositor.CreateVisualSurface();
+
+            // Select the source visual and the offset/size of this control in that element's space.
+            surface.SourceVisual = visual;
+            surface.SourceOffset = new Vector2(0, 0);
+            surface.SourceSize = new Vector2(21, 21);
+            surfaceBrush.HorizontalAlignmentRatio = 0.5f;
+            surfaceBrush.VerticalAlignmentRatio = 0.5f;
+            surfaceBrush.Surface = surface;
+            surfaceBrush.Stretch = CompositionStretch.Fill;
+            surfaceBrush.BitmapInterpolationMode = CompositionBitmapInterpolationMode.NearestNeighbor;
+            surfaceBrush.SnapToPixels = true;
+
+            var container = compositor.CreateContainerVisual();
+            container.Size = new Vector2(122);
+
+            for (int i = 1; i < _clones.Length; i++)
+            {
+                Vector4 clone = _clones[i];
+
+                var redirect = compositor.CreateSpriteVisual();
+                redirect.Size = new Vector2(clone.Z);
+                redirect.Offset = new Vector3(clone.X, clone.Y, 0);
+                redirect.Opacity = clone.W;
+                redirect.Brush = surfaceBrush;
+
+                container.Children.InsertAtTop(redirect);
+
+                if (i == 4)
+                {
+                    _modelVisual = redirect;
+                    _modelVisual.IsVisible = !hasModel;
+                }
+            }
+
+            ElementCompositionPreview.SetElementChildVisual(layoutRoot, container);
+
+            _templateApplied = true;
+        }
+
+        #region Source
+
+        public AnimatedImageSource Source
+        {
+            get { return (AnimatedImageSource)GetValue(SourceProperty); }
+            set { SetValue(SourceProperty, value); }
+        }
+
+        public static readonly DependencyProperty SourceProperty =
+            DependencyProperty.Register("Source", typeof(AnimatedImageSource), typeof(MessageReplyPattern), new PropertyMetadata(null));
+
+        #endregion
+
+        #region Model
+
+        public AnimatedImageSource Model
+        {
+            get { return (AnimatedImageSource)GetValue(ModelProperty); }
+            set { SetValue(ModelProperty, value); }
+        }
+
+        public static readonly DependencyProperty ModelProperty =
+            DependencyProperty.Register("Model", typeof(AnimatedImageSource), typeof(MessageReplyPattern), new PropertyMetadata(null, OnModelChanged));
+
+        private static void OnModelChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((MessageReplyPattern)d).OnModelChanged(e.NewValue as AnimatedImageSource);
+        }
+
+        private void OnModelChanged(AnimatedImageSource newValue)
+        {
+            _modelVisual?.IsVisible = newValue == null;
+
+            if (newValue != null && _templateApplied && ModelAnimated == null)
+            {
+                ModelAnimated = GetTemplateChild(nameof(ModelAnimated)) as AnimatedImage;
+            }
+        }
+
+        #endregion
+    }
+
+    public sealed partial class MessageReply : MessageReferenceBase
+    {
+        public MessageReply()
+        {
+            DefaultStyleKey = typeof(MessageReply);
+        }
+
+        protected override AutomationPeer OnCreateAutomationPeer()
+        {
+            return new MessageReplyAutomationPeer(this);
+        }
+
+        public string GetNameCore()
+        {
+            var builder = new StringBuilder();
+
+            if (TitleLabel != null)
+            {
+                builder.Append(TitleLabel.Text);
+                builder.Append(": ");
+            }
+
+            if (ServiceLabel != null)
+            {
+                builder.Append(ServiceLabel.Text);
+            }
+
+            if (MessageLabel != null)
+            {
+                foreach (var entity in MessageLabel.Inlines)
+                {
+                    if (entity is Run run)
+                    {
+                        builder.Append(run.Text);
+                    }
+                }
+            }
+
+            return builder.ToString();
+        }
+
+        #region HeaderBrush
+
+        public Brush HeaderBrush
+        {
+            get { return (Brush)GetValue(HeaderBrushProperty); }
+            set { SetValue(HeaderBrushProperty, value); }
+        }
+
+        public static readonly DependencyProperty HeaderBrushProperty =
+            DependencyProperty.Register("HeaderBrush", typeof(Brush), typeof(MessageReply), new PropertyMetadata(null, OnHeaderBrushChanged));
+
+        private static void OnHeaderBrushChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((MessageReply)d).TitleLabel?.Foreground = e.NewValue as Brush;
+        }
+
+        #endregion
+
+        #region SubtleBrush
+
+        public Brush SubtleBrush
+        {
+            get { return (Brush)GetValue(SubtleBrushProperty); }
+            set { SetValue(SubtleBrushProperty, value); }
+        }
+
+        public static readonly DependencyProperty SubtleBrushProperty =
+            DependencyProperty.Register("SubtleBrush", typeof(Brush), typeof(MessageReply), new PropertyMetadata(null, OnSubtleBrushChanged));
+
+        private static void OnSubtleBrushChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((MessageReply)d).ServiceLabel?.Foreground = e.NewValue as Brush;
+        }
+
+        #endregion
+
+        #region InitializeComponent
+
+        private Grid LayoutRoot;
+        private Rectangle BackgroundOverlay;
+        private FormattedTextBlock Label;
+        private TextBlock TitleLabel;
+        private Run ServiceLabel;
+        private Span MessageLabel;
+
+        // Lazy loaded
+        private DashPath AccentDash;
+        private MessageReplyPattern Pattern;
+        private TextBlock Quote;
+        private Border ThumbRoot;
+        private Border ThumbEllipse;
+        private ImageBrush ThumbImage;
+
+        protected override void OnApplyTemplate()
+        {
+            LayoutRoot = GetTemplateChild(nameof(LayoutRoot)) as Grid;
+            BackgroundOverlay = GetTemplateChild(nameof(BackgroundOverlay)) as Rectangle;
+            Label = GetTemplateChild(nameof(Label)) as FormattedTextBlock;
+            TitleLabel = GetTemplateChild(nameof(TitleLabel)) as TextBlock;
+            ServiceLabel = GetTemplateChild(nameof(ServiceLabel)) as Run;
+            MessageLabel = GetTemplateChild(nameof(MessageLabel)) as Span;
+
+            TitleLabel.Foreground = HeaderBrush;
+            ServiceLabel.Foreground = SubtleBrush;
+
+            BackgroundOverlay.Margin = new Thickness(0, 0, -Padding.Right, 0);
+
+            _templateApplied = true;
+
+            if (_messageReply != null)
+            {
+                UpdateMessageReply(_messageReply);
+            }
+            else if (_message != null)
+            {
+                UpdateMessage(_message, _loading, _title);
+            }
+            else if (_composerHeader != null)
+            {
+                UpdateComposerHeader(_composerHeader);
+            }
+        }
+
+        #endregion
+
+        private bool _light;
+        private NameColor _accent;
+
+        private bool _quote;
+
+        #region Overrides
+
+        private static readonly CornerRadius _defaultRadius = new(2);
+
+        protected override void HideThumbnail()
+        {
+            _thumbnailController?.Recycle();
+
+            ThumbRoot?.Visibility = Visibility.Collapsed;
+        }
+
+        protected override ImageBrush ShowThumbnail(CornerRadius radius = default)
+        {
+            if (ThumbRoot == null)
+            {
+                ThumbRoot = GetTemplateChild(nameof(ThumbRoot)) as Border;
+                ThumbEllipse = GetTemplateChild(nameof(ThumbEllipse)) as Border;
+                ThumbImage = GetTemplateChild(nameof(ThumbImage)) as ImageBrush;
+            }
+
+            ThumbRoot.Visibility = Visibility.Visible;
+            ThumbRoot.CornerRadius =
+                ThumbEllipse.CornerRadius = radius == default ? _defaultRadius : radius;
+
+            return ThumbImage;
+        }
+
+        protected override void SetText(IClientService clientService, MessageViewModel message, bool outgoing, MessageSender messageSender, string title, string service, FormattedText text, bool quote, bool white)
+        {
+            if (TitleLabel == null)
+            {
+                return;
+            }
+
+            TitleLabel.Text = title ?? string.Empty;
+            ServiceLabel.Text = service ?? string.Empty;
+
+            var textz = message?.TranslatedText switch
+            {
+                MessageTranslateResultText translated => message.Delegate.IsTranslating
+                    ? translated.Text
+                    : message.Text,
+                _ => message?.Text
+            };
+
+            if (!string.IsNullOrEmpty(text?.Text ?? textz?.Text) && !string.IsNullOrEmpty(service))
+            {
+                ServiceLabel.Text += ", ";
+            }
+
+            if (_quote != quote)
+            {
+                Label.MaxLines = quote ? 5 : 1;
+            }
+
+            _quote = quote;
+
+            if (quote)
+            {
+                Quote ??= GetTemplateChild(nameof(Quote)) as TextBlock;
+                Quote.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                Quote?.Visibility = Visibility.Collapsed;
+            }
+
+            var (accent, giftColors, customEmojiId) = clientService?.GetMessageSender(messageSender) switch
+            {
+                User user => (outgoing ? null : clientService.GetAccentColor(user.AccentColorId), outgoing ? null : user.UpgradedGiftColors, user.BackgroundCustomEmojiId),
+                Chat chat => (outgoing ? null : clientService.GetAccentColor(chat.AccentColorId), outgoing ? null : chat.UpgradedGiftColors, chat.BackgroundCustomEmojiId),
+                _ => (null, null, 0)
+            };
+
+            if (white && !_light)
+            {
+                Foreground =
+                    Background =
+                    SubtleBrush =
+                    HeaderBrush =
+                    BorderBrush = new SolidColorBrush(Colors.White);
+
+                SetStripes(default, default);
+
+                Margin = new Thickness(-8, -2, -8, -4);
+            }
+            else if ((_accent != accent || _light) && !white)
+            {
+                ClearValue(ForegroundProperty);
+                ClearValue(SubtleBrushProperty);
+
+                if (giftColors != null)
+                {
+                    var colors = giftColors.ForTheme(ActualTheme, out var accentColor);
+                    Background =
+                        HeaderBrush = new SolidColorBrush(accentColor);
+
+                    BorderBrush = new SolidColorBrush(colors[0]);
+
+                    SetStripes(colors.Count > 1 ? colors[1] : default, colors.Count > 2 ? colors[2] : default);
+                }
+                else if (accent != null)
+                {
+                    var colors = accent.ForTheme(ActualTheme);
+                    Background =
+                        HeaderBrush =
+                        BorderBrush = new SolidColorBrush(colors[0]);
+
+                    SetStripes(colors.Count > 1 ? colors[1] : default, colors.Count > 2 ? colors[2] : default);
+                }
+                else
+                {
+                    ClearValue(BackgroundProperty);
+                    ClearValue(HeaderBrushProperty);
+                    ClearValue(BorderBrushProperty);
+
+                    SetStripes(default, default);
+                }
+
+                Margin = new Thickness(0, 4, 0, 4);
+            }
+
+            if (giftColors != null)
+            {
+                SetPattern(clientService, giftColors.SymbolCustomEmojiId, giftColors.ModelCustomEmojiId);
+            }
+            else
+            {
+                SetPattern(clientService, customEmojiId, 0);
+            }
+
+            _accent = white ? null : accent;
+            _light = white;
+
+            if (text != null)
+            {
+                Label.SetText(clientService, text);
+            }
+            else
+            {
+                Label.SetText(clientService, textz);
+            }
+
+            Label.SetQuery(string.Empty);
+        }
+
+        private void SetStripes(Color stripe1, Color stripe2)
+        {
+            if (AccentDash == null)
+            {
+                if (!_templateApplied || (stripe1 == default && stripe2 == default))
+                {
+                    return;
+                }
+
+                AccentDash = GetTemplateChild(nameof(AccentDash)) as DashPath;
+            }
+
+            AccentDash.Stripe1 = stripe1;
+            AccentDash.Stripe2 = stripe2;
+        }
+
+        private void SetPattern(IClientService clientService, long source, long model)
+        {
+            if (Pattern == null)
+            {
+                if (!_templateApplied || (source == 0 && model == 0))
+                {
+                    return;
+                }
+
+                Pattern = GetTemplateChild(nameof(Pattern)) as MessageReplyPattern;
+            }
+
+            Pattern.Source = source != 0 ? new CustomEmojiFileSource(clientService, source) : null;
+            Pattern.Model = model != 0 ? new CustomEmojiFileSource(clientService, model) : null;
+        }
+
+        #endregion
+
+        private const double MinContentWidth = 144;
+
+        private double _availableWidth = double.PositiveInfinity;
+        private double _formattedWidth;
+        private double _arrangedWidth;
+
+        private double FormatWidth(double width)
+        {
+            return Math.Min(Math.Max(width, MinContentWidth), _availableWidth);
+        }
+
+        protected override Size MeasureOverride(Size availableSize)
+        {
+            // A quote is the one case allowed to widen the bubble, and its height depends on the
+            // width it is measured at, so it is measured at the width it will be given.
+            if (_quote)
+            {
+                _formattedWidth = availableSize.Width;
+                return base.MeasureOverride(availableSize);
+            }
+
+            _availableWidth = availableSize.Width;
+            _formattedWidth = FormatWidth(_arrangedWidth);
+
+            var size = base.MeasureOverride(new Size(_formattedWidth, availableSize.Height));
+            return new Size(Math.Min(MinContentWidth, availableSize.Width), size.Height);
+        }
+
+        protected override Size ArrangeOverride(Size finalSize)
+        {
+            // Against what the next measure would format at, not against finalSize: a bubble
+            // wider than the constraint we were measured with would change nothing, and asking
+            // for a pass that changes nothing never stops asking.
+            if (!_quote && FormatWidth(finalSize.Width) != _formattedWidth)
+            {
+                _arrangedWidth = finalSize.Width;
+                InvalidateMeasure();
+            }
+
+            return base.ArrangeOverride(finalSize);
+        }
+
+        public void UpdateMockup(IClientService clientService, long customEmojiId, int color, UpgradedGiftColors upgradedGift)
+        {
+            if (upgradedGift != null)
+            {
+                SetPattern(clientService, upgradedGift.SymbolCustomEmojiId, upgradedGift.ModelCustomEmojiId);
+            }
+            else
+            {
+                SetPattern(clientService, customEmojiId, 0);
+            }
+
+            if (upgradedGift != null)
+            {
+                var colors = upgradedGift.ForTheme(ActualTheme, out var accentColor);
+                Background =
+                    HeaderBrush = new SolidColorBrush(accentColor);
+
+                BorderBrush = new SolidColorBrush(colors[0]);
+
+                SetStripes(colors.Count > 1 ? colors[1] : default, colors.Count > 2 ? colors[2] : default);
+            }
+            else
+            {
+                var accent = clientService.GetAccentColor(color);
+                var colors = accent.ForTheme(ActualTheme);
+
+                Background =
+                    HeaderBrush =
+                    BorderBrush = new SolidColorBrush(colors[0]);
+
+                SetStripes(colors.Count > 1 ? colors[1] : default, colors.Count > 2 ? colors[2] : default);
+            }
+        }
+    }
+
+    public partial class MessageReplyAutomationPeer : HyperlinkButtonAutomationPeer
+    {
+        private readonly MessageReply _owner;
+
+        public MessageReplyAutomationPeer(MessageReply owner)
+            : base(owner)
+        {
+            _owner = owner;
+        }
+
+        protected override string GetNameCore()
+        {
+            return _owner.GetNameCore();
+        }
+    }
+}

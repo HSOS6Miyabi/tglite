@@ -1,0 +1,944 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Telegram.Common;
+using Telegram.Controls.Media;
+using Telegram.Native;
+using Telegram.Navigation.Services;
+using Telegram.Services;
+using Telegram.Services.Keyboard;
+using Telegram.Views.Host;
+using Windows.ApplicationModel.Core;
+using Windows.Foundation;
+using Windows.Security.Credentials.UI;
+using Windows.UI;
+using Windows.UI.Composition;
+using Windows.UI.Core;
+using Windows.UI.Core.Preview;
+using Windows.UI.ViewManagement;
+using Windows.UI.WindowManagement;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+#if NET9_0_OR_GREATER
+using WinRT;
+#endif
+
+namespace Telegram.Navigation
+{
+    /// <summary>
+    /// The UWP half of <see cref="WindowContext"/>: everything that names a <c>Window</c>,
+    /// a <c>CoreWindow</c> or an <c>ApplicationView</c>. WindowContext.WinUI.cs supplies the
+    /// same members from a WinUI 3 <c>Window</c> instead, so the two never meet in one build and
+    /// nothing here needs an interface or a preprocessor branch.
+    /// </summary>
+    public partial class WindowContext
+    {
+        private readonly Window _window;
+
+        private bool _consolidated;
+
+        public CoreWindow CoreWindow => _window.CoreWindow;
+
+        private string _persistedId;
+        public string PersistedId
+        {
+            get => _persistedId;
+            set => ApplicationView.GetForCurrentView().PersistedStateId = _persistedId = value;
+        }
+
+        public WindowContext(Window window)
+        {
+            _window = window;
+            _current = this;
+
+            if (AppSettings.Diagnostics.DisableXamlGcCollect)
+            {
+                GarbageCollectionMonitor.StartMonitoring(window.CoreWindow);
+            }
+
+            //Current = this;
+            Dispatcher = DispatcherContext.Current;
+            Id = ApplicationView.GetApplicationViewIdForWindow(window.CoreWindow);
+            //Bounds = window.Bounds;
+
+            var scaling = AppSettings.Appearance.Scaling;
+            if (scaling is >= 100 and <= 250 && !AppSettings.Appearance.UseDefaultScaling)
+            {
+                NativeUtils.OverrideScaleForCurrentView(scaling);
+            }
+
+            var coreView = CoreApplication.GetCurrentView();
+            if (coreView.IsMain)
+            {
+                Main = this;
+                IsInMainView = true;
+            }
+            else if (coreView.IsHosted)
+            {
+                IsInHostView = true;
+            }
+
+            lock (_allLock)
+            {
+                All.Add(this);
+            }
+
+            _inputListener = new InputListener(this);
+
+            // IsActive used to read the CoreWindow live, so it must not start out wrong for a view
+            // that is already active by the time its context is made.
+            _activationMode = GetActivationMode(window.CoreWindow);
+
+            window.Activated += OnActivated;
+            window.VisibilityChanged += OnVisibilityChanged;
+            window.SizeChanged += OnSizeChanged;
+            window.Closed += OnClosed;
+            window.CoreWindow.ResizeStarted += OnResizeStarted;
+            window.CoreWindow.ResizeCompleted += OnResizeCompleted;
+
+#if NET9_0_OR_GREATER || true
+            window.CoreWindow.DispatcherQueue.ShutdownStarting += OnShutdownStarting;
+#endif
+            window.CoreWindow.DispatcherQueue.ShutdownCompleted += OnShutdownCompleted;
+
+            #region Legacy code
+
+            ApplicationView.GetForCurrentView().SetPreferredMinSize(new Size(320, 500));
+            SystemNavigationManager.GetForCurrentView().AppViewBackButtonVisibility = AppViewBackButtonVisibility.Collapsed;
+
+            UpdateTitleBar();
+
+            #endregion
+
+            if (LifetimeService.Current.Passcode.IsLockscreenRequired)
+            {
+                Lock(true);
+            }
+
+            ApplicationView.GetForCurrentView().VisibleBoundsChanged += OnVisibleBoundsChanged;
+            ApplicationView.GetForCurrentView().Consolidated += OnConsolidated;
+
+            // Not for the main view, which never closes this way, and not for a hosted one: the
+            // control's whole job is to raise Released when the reference count reaches zero at
+            // consolidation, and a hosted view is never consolidated - the host takes it down
+            // through HostedViewClosing instead, see AttachCloseRequested.
+            if (!IsInMainView && !IsInHostView)
+            {
+                AttachLifetime(new ViewLifetimeControl(window));
+            }
+
+            var coreTitleBar = CoreApplication.GetCurrentView().TitleBar;
+            coreTitleBar.IsVisibleChanged += OnTitleBarChanged;
+            coreTitleBar.LayoutMetricsChanged += OnTitleBarChanged;
+
+            // WARNING: this is used by Xbox (and some Windows users)
+            SystemNavigationManager.GetForCurrentView().BackRequested += OnBackRequested;
+        }
+
+        public bool IsInHostView { get; }
+
+        public long Handle
+        {
+            get
+            {
+                var window = _window.CoreWindow;
+                var interop = (ICoreWindowInterop)(object)window;
+#if NET9_0_OR_GREATER
+                var hWnd = interop.get_WindowHandle();
+#else
+                var hWnd = interop.WindowHandle;
+#endif
+
+                return hWnd.ToInt64();
+            }
+        }
+
+        public bool IsVisible => _window.Visible;
+
+        public void Activate()
+        {
+            _window.Activate();
+        }
+
+        public IAsyncOperation<UserConsentVerificationResult> RequestUserConsentAsync(string message)
+        {
+            return UserConsentVerifier.RequestVerificationAsync(message);
+        }
+
+        private void OnVisibleBoundsChanged(ApplicationView sender, object args)
+        {
+            VisibleBoundsChanged?.Invoke(this, args);
+        }
+
+        partial void AttachCloseRequested()
+        {
+            if (!IsInHostView)
+            {
+                SystemNavigationManagerPreview.GetForCurrentView().CloseRequested += OnCloseRequested;
+            }
+            else
+            {
+                // A hosted view is never consolidated and closes directly, so this is the only
+                // notice its teardown gets - it is not the system's close request the branch above
+                // forwards, it is the whole shutdown path. The handler detaches itself when it
+                // fires, and DetachCloseRequested deliberately leaves it alone: removing it early
+                // would leave a share window with nothing to tear it down.
+                //
+                // Attached here rather than from the constructor because the add throws there.
+                // Unexplained: the view already reports IsHosted by then, so it is not that.
+                CoreApplication.GetCurrentView().HostedViewClosing += OnHostedViewClosing;
+            }
+        }
+
+        private Task _hostedViewDrain;
+        private Deferral _hostedViewDeferral;
+
+        private void OnHostedViewClosing(CoreApplicationView sender, HostedViewClosingEventArgs args)
+        {
+            sender.HostedViewClosing -= OnHostedViewClosing;
+            Consolidate(ApplicationView.GetForCurrentView());
+
+            // We steal the same logic from shutdown starting
+            _hostedViewDeferral = args.GetDeferral();
+
+            if (!sender.DispatcherQueue.TryEnqueue(Windows.System.DispatcherQueuePriority.Low, OnHostedViewClosingDrain))
+            {
+                Logger.Info("queue refused, releasing inline");
+                OnHostedViewClosingDrain();
+            }
+        }
+
+        private void OnHostedViewClosingDrain()
+        {
+            _window.Content = new Border();
+
+#if NET9_0_OR_GREATER || true
+            ReleaseNative();
+            ReleaseRoots();
+
+            _hostedViewDrain = Task.Run(Drain);
+
+            Task.WhenAny(_hostedViewDrain, Task.Delay(ShutdownDrainTimeout))
+                .ContinueWith(OnHostedViewClosingDrained, _hostedViewDeferral, TaskScheduler.Default);
+        }
+
+        private void OnHostedViewClosingDrained(Task task, object state)
+        {
+            Logger.Info(_hostedViewDrain.IsCompleted ? "drained" : $"timed out after {ShutdownDrainTimeout.TotalMilliseconds}ms");
+
+            (state as Deferral)?.Complete();
+#else
+            ReleaseRoots();
+#endif
+        }
+
+        // No hosted branch on purpose: HostedViewClosing is that view's only teardown signal and
+        // outlives every CloseRequested subscriber, so it is detached by the handler itself and
+        // by nothing else. See AttachCloseRequested.
+        partial void DetachCloseRequested()
+        {
+            if (!IsInHostView)
+            {
+                SystemNavigationManagerPreview.GetForCurrentView().CloseRequested -= OnCloseRequested;
+            }
+        }
+
+        /// <summary>
+        /// The system's own request. Raised and returned rather than awaited: the system honours
+        /// the deferrals its args hand out, so there is nothing here to wait for.
+        /// </summary>
+        private void OnCloseRequested(object sender, SystemNavigationCloseRequestedPreviewEventArgs args)
+        {
+            RaiseCloseRequested(new WindowCloseRequestedEventArgs(args));
+        }
+
+        public void Close()
+        {
+            _ = ConsolidateAsync();
+        }
+
+        public async Task ConsolidateAsync()
+        {
+            if (_consolidated)
+            {
+                return;
+            }
+
+            _consolidated = true;
+
+            var sender = ApplicationView.GetForCurrentView();
+            if (await sender.TryConsolidateAsync())
+            {
+                return;
+            }
+
+            OnConsolidated(sender, null);
+        }
+
+        private void OnConsolidated(ApplicationView sender, ApplicationViewConsolidatedEventArgs args)
+        {
+            Consolidate(sender);
+        }
+
+        private void Consolidate(ApplicationView sender)
+        {
+            if (IsInMainView)
+            {
+                return;
+            }
+
+            // Only what consolidation actually means: the user can no longer reach this view, so
+            // the ApplicationView events and the input listener have nothing left to report, and
+            // the title bar has to be cleared while the view is still valid. Everything else -
+            // Detach, the native releases, the collect and the close - waits for OnViewReleased,
+            // because the tree here is still alive and its Unloaded cascade has not run.
+            _consolidated = true;
+            _inputListener.Release();
+            sender.VisibleBoundsChanged -= OnVisibleBoundsChanged;
+            sender.Consolidated -= OnConsolidated;
+
+            var coreTitleBar = CoreApplication.GetCurrentView().TitleBar;
+            coreTitleBar.IsVisibleChanged -= OnTitleBarChanged;
+            coreTitleBar.LayoutMetricsChanged -= OnTitleBarChanged;
+
+            ClearTitleBar(sender);
+
+            RaiseClosed();
+
+            // Last, and from here rather than from a second Consolidated handler inside the
+            // control: the count reaching zero is what schedules the release, and it must not
+            // do so before the work above has run.
+            _lifetime?.StopViewInUse();
+        }
+
+        private void OnClosed(object sender, CoreWindowEventArgs e)
+        {
+            Detach();
+
+            _window.Activated -= OnActivated;
+            _window.VisibilityChanged -= OnVisibilityChanged;
+            _window.SizeChanged -= OnSizeChanged;
+            _window.Closed -= OnClosed;
+            _window.CoreWindow.ResizeStarted -= OnResizeStarted;
+            _window.CoreWindow.ResizeCompleted -= OnResizeCompleted;
+
+            SystemNavigationManager.GetForCurrentView().BackRequested -= OnBackRequested;
+        }
+
+        private static WindowActivationMode GetActivationMode(CoreWindow window) => window.ActivationMode switch
+        {
+            CoreWindowActivationMode.ActivatedInForeground => WindowActivationMode.ActivatedInForeground,
+            CoreWindowActivationMode.ActivatedNotForeground => WindowActivationMode.ActivatedNotForeground,
+            _ => WindowActivationMode.Deactivated
+        };
+
+        // The UWP args stop here: everything downstream sees Telegram.Navigation's own.
+        private void OnActivated(object sender, Windows.UI.Core.WindowActivatedEventArgs e)
+        {
+            // The event decides active or not, so that IsActive always agrees with the args it
+            // raises; ActivationMode only supplies the middle state, which the event cannot say.
+            RaiseActivated(e.WindowActivationState == CoreWindowActivationState.Deactivated
+                ? WindowActivationMode.Deactivated
+                : GetActivationMode(_window.CoreWindow) == WindowActivationMode.ActivatedNotForeground
+                    ? WindowActivationMode.ActivatedNotForeground
+                    : WindowActivationMode.ActivatedInForeground);
+        }
+
+        private void OnVisibilityChanged(object sender, VisibilityChangedEventArgs e)
+        {
+            RaiseVisibilityChanged(e.Visible);
+        }
+
+        private void OnSizeChanged(object sender, Windows.UI.Core.WindowSizeChangedEventArgs e)
+        {
+            //Bounds = _window.CoreWindow.Bounds;
+            SizeChanged?.Invoke(this, new WindowSizeChangedEventArgs(e.Size));
+        }
+
+        private void OnResizeStarted(CoreWindow sender, object args)
+        {
+            Logger.Debug(sender.Bounds);
+            //Bounds = sender.Bounds;
+
+            if (AppSettings.Diagnostics.WindowResizeDebug)
+            {
+                return;
+            }
+
+            if (_window.Content is FrameworkElement element)
+            {
+                element.Width = sender.Bounds.Width;
+                element.Height = sender.Bounds.Height;
+                element.HorizontalAlignment = HorizontalAlignment.Left;
+                element.VerticalAlignment = VerticalAlignment.Top;
+            }
+        }
+
+        private void OnResizeCompleted(CoreWindow sender, object args)
+        {
+            Logger.Debug(sender.Bounds);
+            //Bounds = sender.Bounds;
+
+            if (AppSettings.Diagnostics.WindowResizeDebug)
+            {
+                return;
+            }
+
+            if (_window.Content is FrameworkElement element)
+            {
+                element.Width = double.NaN;
+                element.Height = double.NaN;
+                element.HorizontalAlignment = HorizontalAlignment.Stretch;
+                element.VerticalAlignment = VerticalAlignment.Stretch;
+            }
+        }
+
+        public INavigationService GetNavigationService()
+        {
+            return GetNavigationService(_window);
+        }
+
+        public static INavigationService GetNavigationService(Window window)
+        {
+            var content = window.Content;
+            if (content is WindowPresenter contentControl)
+            {
+                content = contentControl.Content as UIElement;
+            }
+
+            return ResolveNavigationService(content);
+        }
+
+        #region Helper methods
+
+        public string Title
+        {
+            get => ApplicationView.GetForCurrentView().Title;
+            set => ApplicationView.GetForCurrentView().Title = value;
+        }
+
+        public Rect Bounds => _window.CoreWindow.Bounds;
+
+        // Must be used only by BootStrapper
+        public Compositor Compositor => _window.Compositor;
+
+        /// <summary>
+        /// Pointer position in window coordinates. Screen-relative on desktop, so callers
+        /// subtract <see cref="Bounds"/> themselves.
+        /// </summary>
+        public Point PointerPosition => _window.CoreWindow.PointerPosition;
+
+        /// <summary>
+        /// The window area not obscured by system chrome. Distinct from <see cref="Bounds"/>,
+        /// which is the whole window.
+        /// </summary>
+        public Rect VisibleBounds => ApplicationView.GetForCurrentView().VisibleBounds;
+
+        /// <summary>
+        /// The size a newly launched window starts at. Genuinely process-wide rather than
+        /// per-window, which is why it is static.
+        /// </summary>
+        public static Size PreferredLaunchViewSize
+        {
+            get => ApplicationView.PreferredLaunchViewSize;
+            set => ApplicationView.PreferredLaunchViewSize = value;
+        }
+
+        public bool TryResizeView(Size size)
+        {
+            return ApplicationView.GetForCurrentView().TryResizeView(size);
+        }
+
+        /// <summary>
+        /// Brings this window to the foreground.
+        /// </summary>
+        /// <param name="previous">
+        /// The window being left. Without it the switch replaces the calling thread's view, so a
+        /// caller running on this window's own thread would switch it to itself.
+        /// </param>
+        public IAsyncAction SwitchToAsync(WindowContext previous = null)
+        {
+            return previous != null
+                ? ApplicationViewSwitcher.SwitchAsync(Id, previous.Id)
+                : ApplicationViewSwitcher.SwitchAsync(Id);
+        }
+
+        public bool IsFullScreenMode => ApplicationView.GetForCurrentView().IsFullScreenMode;
+
+        public void ExitFullScreenMode()
+        {
+            ApplicationView.GetForCurrentView().ExitFullScreenMode();
+        }
+
+        public bool TryEnterFullScreenMode()
+        {
+            return ApplicationView.GetForCurrentView().TryEnterFullScreenMode();
+        }
+
+        /// <summary>
+        /// Shows this view in a window of its own. A secondary view is hosted inside the one that
+        /// launched it until this is called.
+        /// </summary>
+        public Task<bool> TryShowAsStandaloneAsync()
+        {
+            return ApplicationViewSwitcher.TryShowAsStandaloneAsync(Id).AsTask();
+        }
+
+        public bool IsCompactOverlaySupported => ApplicationView.GetForCurrentView().IsViewModeSupported(ApplicationViewMode.CompactOverlay);
+
+        public bool IsCompactOverlay => ApplicationView.GetForCurrentView().ViewMode == ApplicationViewMode.CompactOverlay;
+
+        public Task<bool> TryExitCompactOverlayAsync()
+        {
+            return ApplicationView.GetForCurrentView().TryEnterViewModeAsync(ApplicationViewMode.Default).AsTask();
+        }
+
+        /// <summary>
+        /// Mouse rather than touch. This follows tablet mode, not whether a mouse is attached.
+        /// </summary>
+        public bool IsMouseInteraction => UIViewSettings.GetForCurrentView().UserInteractionMode == UserInteractionMode.Mouse;
+
+        /// <summary>
+        /// The title bar's own colours, for a window that puts something dark behind it. Null puts
+        /// each one back to the system's.
+        /// </summary>
+        public void SetTitleBarForeground(Color? foreground)
+        {
+            var titlebar = ApplicationView.GetForCurrentView().TitleBar;
+            titlebar.ForegroundColor = foreground;
+            titlebar.ButtonForegroundColor = foreground;
+        }
+
+        public bool ExtendViewIntoTitleBar
+        {
+            get => CoreApplication.GetCurrentView().TitleBar.ExtendViewIntoTitleBar;
+            set => CoreApplication.GetCurrentView().TitleBar.ExtendViewIntoTitleBar = value;
+        }
+
+        /// <summary>
+        /// How much of the window the system's caption buttons take on each side. Both, because
+        /// which side they sit on follows the flow direction.
+        /// </summary>
+        public double SystemOverlayLeftInset => CoreApplication.GetCurrentView().TitleBar.SystemOverlayLeftInset;
+
+        public double SystemOverlayRightInset => CoreApplication.GetCurrentView().TitleBar.SystemOverlayRightInset;
+
+        public double TitleBarHeight => CoreApplication.GetCurrentView().TitleBar.Height;
+
+        /// <summary>
+        /// The media keys and the volume flyout's now-playing panel. Static, and so the calling
+        /// thread's: the controls belong to the view that asks for them, and the playback service
+        /// asks from whichever one it was started on.
+        /// </summary>
+        public static Windows.Media.SystemMediaTransportControls GetSystemMediaTransportControls()
+        {
+            return Windows.Media.SystemMediaTransportControls.GetForCurrentView();
+        }
+
+        private void OnTitleBarChanged(CoreApplicationViewTitleBar sender, object args)
+        {
+            TitleBarChanged?.Invoke(this, args);
+        }
+
+        public void SetTitleBar(UIElement titleBar)
+        {
+            _window.SetTitleBar(titleBar);
+        }
+
+        /// <summary>
+        /// The shell draws minimize, maximize and close for every view, and it is all three or
+        /// none - there is no asking it for a subset. So the app's own buttons exist only for the
+        /// subsets, and asking for all three means letting the shell do it.
+        /// </summary>
+        public static bool HasSystemCaptionButtons => true;
+
+        /// <summary>
+        /// The CoreWindow is the whole window, so tab already wraps within it once it runs out of
+        /// elements, and the content must not declare a navigation region of its own.
+        /// </summary>
+        public static bool HasSystemTabNavigation => true;
+
+        /// <summary>
+        /// Undocumented, and the only way a UWP view can be rid of the shell's caption buttons
+        /// while keeping the window: ExtendViewIntoTitleBar draws under them but does not remove
+        /// them. Reached through the CoreWindow's navigation client.
+        /// </summary>
+        partial void SetHostCaptionButtons(CaptionButtons buttons)
+        {
+            // Default, not an AlwaysVisible: the enum has only the two values, and Default is what
+            // a view that never asked for anything has.
+            var visibility = buttons == CaptionButtons.All
+                ? AppWindowTitleBarVisibility.Default
+                : AppWindowTitleBarVisibility.AlwaysHidden;
+
+#if NET9_0_OR_GREATER
+            var coreWindow = _window.CoreWindow.As<IInternalCoreWindowPhone>();
+            var navigationClient = coreWindow.get_NavigationClient().As<IApplicationWindowTitleBarNavigationClient>();
+
+            navigationClient.set_TitleBarPreferredVisibilityMode(visibility);
+#else
+            var coreWindow = (IInternalCoreWindowPhone)(object)_window.CoreWindow;
+            var navigationClient = (IApplicationWindowTitleBarNavigationClient)coreWindow.NavigationClient;
+
+            navigationClient.TitleBarPreferredVisibilityMode = visibility;
+#endif
+        }
+
+        #endregion
+
+        #region Legacy code
+
+        /// <summary>
+        /// Update the Title and Status Bars colors.
+        /// </summary>
+        public void UpdateTitleBar()
+        {
+            //Color background;
+            Color foreground;
+            Color buttonHover;
+            Color buttonPressed;
+
+            // Apply buttons feedback based on Light or Dark theme
+            var theme = NightModeService.Current.GetCalculatedApplicationTheme();
+            if (theme == ApplicationTheme.Dark)
+            {
+                //background = Color.FromArgb(255, 43, 43, 43);
+                foreground = Colors.White;
+                buttonHover = Color.FromArgb(25, 255, 255, 255);
+                buttonPressed = Color.FromArgb(51, 255, 255, 255);
+            }
+            else
+            {
+                //background = Color.FromArgb(255, 230, 230, 230);
+                foreground = Colors.Black;
+                buttonHover = Color.FromArgb(25, 0, 0, 0);
+                buttonPressed = Color.FromArgb(51, 0, 0, 0);
+            }
+
+            // Desktop Title Bar
+            var titleBar = Windows.UI.ViewManagement.ApplicationView.GetForCurrentView().TitleBar;
+            CoreApplication.GetCurrentView().TitleBar.ExtendViewIntoTitleBar = true;
+
+            // Background
+            //titleBar.BackgroundColor = background;
+            //titleBar.InactiveBackgroundColor = background;
+
+            // Foreground
+            titleBar.ForegroundColor = foreground;
+            titleBar.ButtonForegroundColor = foreground;
+            titleBar.ButtonHoverForegroundColor = foreground;
+
+            // Buttons
+            //titleBar.ButtonBackgroundColor = background;
+            //titleBar.ButtonInactiveBackgroundColor = background;
+            titleBar.ButtonBackgroundColor = Colors.Transparent;
+            titleBar.ButtonInactiveBackgroundColor = Colors.Transparent;
+
+            // Buttons feedback
+            titleBar.ButtonPressedBackgroundColor = buttonPressed;
+            titleBar.ButtonHoverBackgroundColor = buttonHover;
+        }
+
+        private void ClearTitleBar(ApplicationView view)
+        {
+            var titleBar = view.TitleBar;
+            titleBar.ForegroundColor = null;
+            titleBar.ButtonForegroundColor = null;
+            titleBar.ButtonHoverForegroundColor = null;
+            titleBar.ButtonBackgroundColor = null;
+            titleBar.ButtonInactiveBackgroundColor = null;
+            titleBar.ButtonPressedBackgroundColor = null;
+            titleBar.ButtonHoverBackgroundColor = null;
+        }
+
+        #endregion
+
+        public static bool IsKeyDown(VirtualKey key)
+        {
+            //return (InputKeyboardSource.GetKeyStateForCurrentThread(key) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+            return (Window.Current.CoreWindow.GetAsyncKeyState(key) & CoreVirtualKeyStates.Down) != 0;
+        }
+
+        public static bool IsKeyDownAsync(VirtualKey key)
+        {
+            //return (InputKeyboardSource.GetKeyStateForCurrentThread(key) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+            return (Window.Current.CoreWindow.GetAsyncKeyState(key) & CoreVirtualKeyStates.Down) != 0;
+        }
+
+        /// <summary>
+        /// The key's state as of the key event being handled. Only valid inside a key handler:
+        /// <see cref="IsKeyDown"/> reads the state now, and an injected Ctrl+V has released Ctrl by
+        /// the time its V is handled.
+        /// </summary>
+        public static bool IsKeyDownForEvent(VirtualKey key)
+        {
+            return (Window.Current.CoreWindow.GetKeyState(key) & CoreVirtualKeyStates.Down) != 0;
+        }
+
+        public static VirtualKeyModifiers KeyModifiers()
+        {
+            //return (InputKeyboardSource.GetKeyStateForCurrentThread(key) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+
+            var modifiers = VirtualKeyModifiers.None;
+            var coreWindow = Window.Current.CoreWindow;
+
+            if ((coreWindow.GetAsyncKeyState(VirtualKey.Control) & CoreVirtualKeyStates.Down) != 0)
+            {
+                modifiers |= VirtualKeyModifiers.Control;
+            }
+
+            if ((coreWindow.GetAsyncKeyState(VirtualKey.Menu) & CoreVirtualKeyStates.Down) != 0)
+            {
+                modifiers |= VirtualKeyModifiers.Menu;
+            }
+
+            if ((coreWindow.GetAsyncKeyState(VirtualKey.Shift) & CoreVirtualKeyStates.Down) != 0)
+            {
+                modifiers |= VirtualKeyModifiers.Shift;
+            }
+
+            return modifiers;
+        }
+
+        public static bool KeyModifiers(VirtualKeyModifiers compare)
+        {
+            //return (InputKeyboardSource.GetKeyStateForCurrentThread(key) & Windows.UI.Core.CoreVirtualKeyStates.Down) != 0;
+
+            var modifiers = VirtualKeyModifiers.None;
+            var coreWindow = Window.Current.CoreWindow;
+
+            if ((coreWindow.GetAsyncKeyState(VirtualKey.Control) & CoreVirtualKeyStates.Down) != 0)
+            {
+                modifiers |= VirtualKeyModifiers.Control;
+            }
+
+            if ((coreWindow.GetAsyncKeyState(VirtualKey.Menu) & CoreVirtualKeyStates.Down) != 0)
+            {
+                modifiers |= VirtualKeyModifiers.Menu;
+            }
+
+            if ((coreWindow.GetAsyncKeyState(VirtualKey.Shift) & CoreVirtualKeyStates.Down) != 0)
+            {
+                modifiers |= VirtualKeyModifiers.Shift;
+            }
+
+            return modifiers == compare;
+        }
+
+        private ViewLifetimeControl _lifetime;
+
+        /// <summary>
+        /// Hooks the view's lifetime control, whose Released event is the one point at which
+        /// everything this window owns can be released before the apartment starts going down.
+        /// Nothing subscribed it before, so the control closed the window itself the moment the
+        /// count reached zero - ahead of the Unloaded cascade, the native releases and the drain.
+        /// </summary>
+        private void AttachLifetime(ViewLifetimeControl control)
+        {
+            _lifetime = control;
+            control.Released += OnViewReleased;
+        }
+
+        /// <summary>
+        /// The view's lifetime control, or null for the main and hosted views, which have none.
+        /// Read by <see cref="ViewService"/> to build the synchronization context decorator.
+        /// </summary>
+        internal ViewLifetimeControl Lifetime => _lifetime;
+
+        private void OnViewReleased(object sender, EventArgs e)
+        {
+            _lifetime.Released -= OnViewReleased;
+            _lifetime = null;
+
+            Logger.Info();
+
+            // Idle, not Low: the Unloaded cascade that consolidation queued when it dropped the
+            // content has to have run first, and Low is not behind it - the shutdown drain runs
+            // at Low and was seen releasing a block's handles 80ms before ChatHistoryView.OnUnloaded
+            // reached them. A closing view's queue empties at once, so idle arrives immediately.
+            _ = _window.Dispatcher.RunIdleAsync(OnViewIdle);
+        }
+
+        private void OnViewIdle(IdleDispatchedHandlerArgs args)
+        {
+            ReleaseAndClose();
+        }
+
+#if NET9_0_OR_GREATER || true
+        private async void ReleaseAndClose()
+        {
+            // Order matters throughout, and every step depends on the one before it. ReleaseNative
+            // reads _xamlRoot and _content, so it goes first; Detach reads _xamlRoot and clears
+            // _content; ReleaseRoots then drops _xamlRoot itself. The collect has to see all of
+            // that already done or it finds the objects live and they are finalized once the
+            // apartment is gone. The close is last, because it is what starts the apartment down.
+            ReleaseNative();
+            OnClosed(null, null);
+            ReleaseRoots();
+
+            // Off-thread, and not as a detail: the finalizer marshals its release back into this
+            // apartment, so waiting for it here would block the very thread that has to service it.
+            var drain = Task.Run(Drain);
+            await Task.WhenAny(drain, Task.Delay(ShutdownDrainTimeout));
+
+            Logger.Info(drain.IsCompleted ? "drained, closing" : "drain timed out, closing anyway");
+
+            Close(_window);
+        }
+#else
+        private void ReleaseAndClose()
+        {
+            OnClosed(null, null);
+            ReleaseRoots();
+
+            Close(_window);
+        }
+#endif
+
+        /// <summary>
+        /// Drops the last managed references to this window's XAML objects. Without this the
+        /// collect below has nothing to do - the objects are reachable, so they are finalized
+        /// much later, by which time the apartment cannot service the release. XamlRoot itself
+        /// is one of them, which is why releasing handles by type could never be enough.
+        /// </summary>
+        private void ReleaseRoots()
+        {
+            _xamlRoot = null;
+            _lockedContent = null;
+
+            lock (_activeLock)
+            {
+                if (Active == this)
+                {
+                    Active = null;
+                }
+            }
+
+            // _current is the remaining root and is deliberately left to OnShutdownCompleted:
+            // it is thread-static, so anything still running on this thread reads it, and
+            // clearing it early only moves the failure. It holds no XamlRoot once the two
+            // fields above are null.
+
+            // Was left installed until OnShutdownCompleted, which put the uninstall after the
+            // point the counting mattered. The count is spent by now either way.
+            if (SynchronizationContext.Current is SecondaryViewSynchronizationContextDecorator decorator)
+            {
+                SynchronizationContext.SetSynchronizationContext(decorator.Context);
+            }
+        }
+
+        /// <summary>
+        /// Unroots and closes, in that order. The presenter branch is not decoration: dropping
+        /// the presenter itself rather than its content is what the original close did, and the
+        /// comment it carried - "explicitly calling Close breaks everything" - is the only record
+        /// of why. Under .NET 10 consolidation has already unrooted the tree, so this is a no-op
+        /// there and the branch only matters to the legacy flavour.
+        /// </summary>
+        private static void Close(Window window)
+        {
+            // Replacing the window content to trigger Unloaded on the current tree
+            window.Content = new Border();
+
+            NativeUtils.PrepareCoreWindowClose(window.CoreWindow);
+            window.Close();
+        }
+
+        private void OnShutdownCompleted(DispatcherQueue sender, object args)
+        {
+            sender.ShutdownCompleted -= OnShutdownCompleted;
+
+            // DIAGNOSTIC: timestamps the far side of the drain, so the tail in a crash report
+            // says how much of the teardown ran after it.
+            Logger.Info();
+
+            _current = null;
+
+            Theme.Current = null;
+
+            Direct2D.Release();
+            MessageBubbleBrush.Release();
+
+            // TODO: needed? From some tests, this prevented the whole Window root from being garbage collected
+            if (SynchronizationContext.Current is SecondaryViewSynchronizationContextDecorator decorator)
+            {
+                SynchronizationContext.SetSynchronizationContext(decorator.Context);
+            }
+        }
+
+        /// <summary>
+        /// A thread-static "the window on this thread" answers something only while a thread hosts
+        /// exactly one window, which is a UWP guarantee.
+        /// </summary>
+        [ThreadStatic]
+        private static WindowContext _current;
+        public static WindowContext Current => _current;
+
+        partial void SetBackdropMaterial(WindowPresenter content)
+        {
+            Microsoft.UI.Xaml.Controls.BackdropMaterial.SetApplyToRootOrPageBackground(content, true);
+        }
+
+        /// <summary>
+        /// Nothing to do: a UWP picker is owned by the view that opens it, and the app model knows
+        /// which that is. Only a desktop host has to say so - see the Win32 half.
+        /// </summary>
+        internal static void InitializeWithWindow(object target, XamlRoot xamlRoot)
+        {
+        }
+
+        partial void SetHostContent(UIElement content)
+        {
+            if (_window.Content is IPopupHost oldHost)
+            {
+                oldHost.PopupOpened();
+            }
+
+            _window.Content = content;
+
+            if (_window.Content is IPopupHost newHost)
+            {
+                newHost.PopupClosed();
+            }
+
+            if (content is WindowPresenter { Content: RichTextWindow })
+            {
+                ApplicationView.GetForCurrentView().SetPreferredMinSize(new Size(468, 500));
+            }
+        }
+
+        partial void SetScreenCaptureEnabled(bool enabled)
+        {
+            ApplicationView.GetForCurrentView().IsScreenCaptureEnabled = enabled;
+        }
+
+        private void OnBackRequested(object sender, BackRequestedEventArgs args)
+        {
+            Logger.Info();
+
+            //var handled = false;
+            //if (ApiInformation.IsApiContractPresent(nameof(Windows.Phone.PhoneContract), 1, 0))
+            //{
+            //    if (NavigationService?.CanGoBack == true)
+            //    {
+            //        handled = true;
+            //    }
+            //}
+            //else
+            //{
+            //    handled = (NavigationService?.CanGoBack == false);
+            //}
+            var navigationService = RootNavigationService;
+            var handled = navigationService?.CanGoBack == false;
+
+            RaiseBackRequested(VirtualKey.GoBack, ref handled);
+            args.Handled = handled;
+        }
+    }
+}

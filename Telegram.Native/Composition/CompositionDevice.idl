@@ -1,0 +1,15 @@
+import "Composition/DirectRectangleClip2.idl";
+
+namespace Telegram.Native.Composition
+{
+    [default_interface]
+    static runtimeclass CompositionDevice 
+    {
+        [default_overload]
+        static DirectRectangleClip2 CreateRectangleClip2(UIXaml.UIElement element);
+        static DirectRectangleClip2 CreateRectangleClip2(UIComposition.Visual visual);
+        static void SetClip(UIComposition.Visual visual, DirectRectangleClip2 clip);
+
+        static UIComposition.LayerVisual GetElementLayerVisual(UIXaml.UIElement element);
+    }
+}

@@ -1,0 +1,52 @@
+﻿<controls:ModalPopup x:Class="Telegram.Views.Wallet.Popups.WalletTestPopup"
+                     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                     xmlns:local="using:Telegram.Views.Wallet.Popups"
+                     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+                     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                     xmlns:controls="using:Telegram.Controls"
+                     xmlns:common="using:Telegram.Common"
+                     mc:Ignorable="d"
+                     PrimaryButtonClick="OnPrimaryButtonClick"
+                     Padding="0">
+
+    <Grid>
+        <ScrollViewer x:Name="ScrollingHost"
+                      VerticalScrollBarVisibility="Auto"
+                      VerticalScrollMode="Auto">
+            <Grid Padding="24,0,24,24">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition />
+                </Grid.RowDefinitions>
+                <controls:AnimatedImage Source="ms-appx:///Assets/Animations/WalletTest.tgs"
+                                        IsCachingEnabled="False"
+                                        AutoPlay="True"
+                                        LoopCount="1"
+                                        FrameSize="96,96"
+                                        DecodeFrameType="Logical"
+                                        Width="96"
+                                        Height="96"
+                                        Margin="0,12,0,12" />
+
+                <TextBlock Text="{CustomResource WalletTestPhrase}"
+                           Style="{StaticResource PopupTextBlockStyle}"
+                           TextAlignment="Center"
+                           VerticalAlignment="Top"
+                           Margin="0,0,0,8"
+                           Grid.Row="1" />
+
+                <TextBlock x:Name="Description"
+                           Style="{StaticResource BodyTextBlockStyle}"
+                           TextAlignment="Center"
+                           Grid.Row="2" />
+
+                <StackPanel x:Name="Words"
+                            Spacing="8"
+                            Grid.Row="3" />
+            </Grid>
+        </ScrollViewer>
+    </Grid>
+</controls:ModalPopup>

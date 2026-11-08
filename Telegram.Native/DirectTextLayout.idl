@@ -1,0 +1,166 @@
+import "TextFormat.idl";
+
+namespace Telegram.Native
+{
+    enum TextAlignmentMode
+    {
+        Leading,
+        Left,
+        Center,
+        Right
+    };
+
+    // How the lines sit in the layout box. Leading is the default and the one direction
+    // decides: the far edge right to left, the near one otherwise - which is what
+    // TextAlignment.DetectFromContent means on the other engine.
+    // One paragraph of the text, as a range of it: DirectWrite gives a layout one reading
+    // direction and one alignment, so a text whose paragraphs disagree - ordinary in a chat
+    // that mixes scripts - is laid out as one layout each, stacked.
+    struct TextParagraph
+    {
+        Int32 Offset;
+        Int32 Length;
+        Boolean RightToLeft;
+        TextAlignmentMode Alignment;
+    };
+
+    // A DirectWrite layout the caller owns: text, size, width, direction, colours and inline
+    // objects are its state, not arguments to every call. TextFormat is the other shape - a
+    // layout built to answer questions about text XAML laid out - and the two do not merge.
+    [default_interface]
+    runtimeclass DirectTextLayout : Windows.Foundation.IClosable
+    {
+        DirectTextLayout();
+
+        Double FontSize;
+
+        // The family the text is drawn in, empty for the one the app uses everywhere. A single
+        // name, not a chain: DirectWrite falls back on its own, where XAML wants the list.
+        String FontFamily;
+        Int32 FontWeight;
+        Boolean Italic;
+
+        Boolean RightToLeft;
+        TextAlignmentMode Alignment;
+
+        // The lines the text may take, 0 for as many as it needs. One is a single line with an
+        // ellipsis where it runs out; more than one keeps wrapping and cuts the box to the
+        // lines that fit.
+        Int32 MaxLines;
+
+        // Whether the text is only shown, as it is everywhere but an editor. Being edited, its
+        // surface spans the box the text is laid out in, with lines to spare below, so typing
+        // redraws the surface rather than replacing it every few characters. On by default.
+        Boolean IsReadOnly;
+
+        // Whether an edited text is laid out on IDWriteTextAnalyzer rather than by an
+        // IDWriteTextLayout: see notes/native-editor-performance-plan.md. Only a text that is
+        // one paragraph with no MaxLines; anything else is laid out as before. Off unless set:
+        // DirectTextBlock sets it from Diagnostics' Analyzer Text Layout, which is on.
+        Boolean UseAnalyzer;
+
+        // Both layouts built from this one's state, and a report of where they disagree.
+        String CompareWithAnalyzer();
+
+        // Whether the text did not fit in MaxLines, and how many lines it takes: a caller
+        // offering to expand asks the second, which is an answer about the text rather than
+        // about the limit it is under at the moment.
+        Boolean IsTrimmed{ get; };
+        Int32 LineCount{ get; };
+
+        void SetText(String text, Windows.Foundation.Collections.IVector<TextStylePart> entities);
+
+        // An edit, where SetText hands over all of the text again: length characters at offset
+        // replaced by text, and the entities those of the text it leaves. The inline objects are
+        // cleared as SetText clears them; the colours move with the text, and one the edit cuts
+        // into is dropped. Everything outside the range has to be as it was, styles included,
+        // which is what lets the next build start from the edit instead of finding it.
+        void ReplaceText(Int32 offset, Int32 length, String text, Windows.Foundation.Collections.IVector<TextStylePart> entities);
+
+        // The text as it stands, for a caller that handed over edits rather than strings.
+        String Text{ get; };
+
+        // How the text is divided. Set after SetText, which leaves it as one paragraph reading
+        // the way RightToLeft and Alignment say. Everything else here - a colour, an inline
+        // object, a hit test, a range - is in offsets into the whole text, whichever paragraph
+        // they land in.
+        void SetParagraphs(Windows.Foundation.Collections.IVector<TextParagraph> paragraphs);
+        void SetColor(Int32 offset, Int32 length, Windows.UI.Color color);
+
+        // Takes the colour off a range again - a spoiler that has been revealed draws in
+        // whatever the caller draws the rest of the text with.
+        void ClearColor(Int32 offset, Int32 length);
+
+        // Every colour off, and many on at once, appended without replacing a range set before:
+        // a code block's tokens, which SetColor one at a time looks up among each other.
+        void ClearColors();
+        void AddColors(Int32[] offsets, Int32[] lengths, Windows.UI.Color[] colors);
+
+        // An element the text flows around: the caller draws it, the layout only reserves the
+        // box. A fixed one - an emoji - declares its size; a variable one - a button - is
+        // measured by the caller first.
+        void SetInlineObject(Int32 offset, Int32 length, Windows.Foundation.Size size, Double baseline);
+
+        // False when the expression is not one: the caller leaves the text as it was written.
+        Boolean SetMathObject(Int32 offset, Int32 length, String expression);
+
+        Windows.Foundation.Size Measure(Double availableWidth);
+
+        // The narrowest the text can be laid out without breaking a word, and its widest line
+        // when nothing wraps it: what a table sizes a column from. Neither depends on the width.
+        Windows.Foundation.Numerics.Vector2 ContentWidths();
+
+        // The width the caller shows the text in, when that is wider than Measure left the box:
+        // a text not drawn from the leading edge throughout - right to left, centred, or both
+        // ways - is laid out again in it, so that each paragraph sits against its own edge of
+        // it, where moving the whole text across moved every paragraph to one side. Left to
+        // right, it changes nothing.
+        void Arrange(Double width);
+
+        // Everything derived comes off the same layout the text was drawn from.
+        Windows.Foundation.Rect[] Ranges(Int32 offset, Int32 length);
+        Windows.Foundation.Rect Caret(Int32 offset);
+        Windows.Foundation.Rect[] Lines(Int32 offset, Int32 length);
+
+        // How many characters each line holds, for a caller walking the text by line - what a
+        // screen reader asks for, and what the rectangles alone cannot say.
+        Int32[] LineLengths();
+
+        // The position nearest the point, and whether the point was on the text at all: a
+        // selection wants the first, a link the second.
+        Int32 HitTest(Windows.Foundation.Point point, out Boolean inside);
+        Int32 HitTestContent(Windows.Foundation.Point point, out Boolean inside);
+
+        // Where the last line ends, for a caller placing something beside it.
+        Windows.Foundation.Point ContentEnd();
+
+
+        // The text drawn into a surface of its own. The same surface comes back every time -
+        // resized only when the text no longer fits it, and redrawn by itself when the
+        // rendering device is replaced - so a brush set on it once never has to be set again.
+        // Null only when there is nothing to draw or no surface to be had: a surface whose draw
+        // failed comes back too, and is drawn when the device is replaced.
+        UIComposition.CompositionDrawingSurface Render(Windows.UI.Color color, Double rasterizationScale);
+
+        // Whether that surface is a virtual one, which a long edited text on the analyzer is
+        // drawn into: only the tiles in the viewport and a margin around it are drawn, so the
+        // caller says where the viewport is, in DIPs from the top of the text, whenever it
+        // moves. Only those tiles are kept.
+        Boolean HasVirtualSurface{ get; };
+        void SetViewport(Double top, Double bottom);
+
+        // The size of the text as it was last drawn, in the top left of that surface. The
+        // surface is rounded up from it, so this is what says how much of it carries the text.
+        Windows.Graphics.SizeInt32 RenderedPixels{ get; };
+
+        // What the layout itself spends, split the way the work splits: building a layout from
+        // scratch, reflowing one to another width, the surface, and the parts of a draw.
+        // Process-wide.
+        static String Counters{ get; };
+        static void ResetCounters();
+
+        // Whether every update of an analyzer layout is checked against a build of the same
+        // text from scratch, the result in Counters. Diagnostics: it costs a cold build a key.
+        static Boolean VerifyAnalyzer;
+    }
+}

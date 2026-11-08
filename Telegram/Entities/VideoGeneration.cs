@@ -1,0 +1,94 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Collections.Generic;
+using Telegram.Controls;
+using Windows.Foundation;
+using Windows.UI;
+
+namespace Telegram.Entities
+{
+    public partial class VideoGeneration
+    {
+        public bool Transcode { get; set; }
+        public bool Mute { get; set; }
+        public uint Width { get; set; }
+        public uint Height { get; set; }
+        public uint VideoBitrate { get; set; }
+        public uint AudioBitrate { get; set; }
+
+        public TimeSpan? TrimStartTime { get; set; }
+        public TimeSpan? TrimStopTime { get; set; }
+
+        public ImageRotation Rotation { get; set; }
+        public ImageFlip Flip { get; set; }
+
+        /// <summary>
+        /// The crop as fractions of the frame once turned and flipped, as a photo's edit has it, or
+        /// empty for none. Turned by <see cref="Angle"/> about its own centre.
+        /// </summary>
+        public Rect Rectangle { get; set; }
+
+        /// <summary>
+        /// Free rotation in degrees, clockwise, after <see cref="Rotation"/> and <see cref="Flip"/>.
+        /// </summary>
+        public double Angle { get; set; }
+
+        /// <summary>
+        /// A fixed size to encode at, for video notes and profile videos; otherwise the crop's,
+        /// fitted to the quality picked or else to the longest side allowed.
+        /// </summary>
+        public Size OutputSize { get; set; }
+
+        /// <summary>
+        /// The longest side of the cropped output at the quality picked; 0 for none.
+        /// </summary>
+        public int MaxSide { get; set; }
+
+        /// <summary>
+        /// Drawn over every frame through the frame's own transform: the strokes, then the objects
+        /// in the order they were made.
+        /// </summary>
+        public IReadOnlyList<SmoothPathBuilder> Strokes { get; set; }
+
+        public IReadOnlyList<PaintEntity> Entities { get; set; }
+
+        /// <summary>
+        /// A video note's corners: blurred and darkened outside the circle, with the name and the
+        /// plane in white.
+        /// </summary>
+        public bool RoundOverlay { get; set; }
+
+        /// <summary>
+        /// A story's frame, as <see cref="ImageGeneration.FrameSize"/>: <see cref="Rectangle"/> is
+        /// the frame over the video, encoded at <see cref="OutputSize"/>, and the strokes and
+        /// objects are laid out in the frame.
+        /// </summary>
+        public Size FrameSize { get; set; }
+
+        public Color FrameTopColor { get; set; }
+
+        public Color FrameBottomColor { get; set; }
+
+        /// <summary>
+        /// How long a photo is held as a video, as a story with an animated sticker on it is; zero
+        /// when the source is a video.
+        /// </summary>
+        public TimeSpan StillDuration { get; set; }
+
+        public bool IsStill => StillDuration > TimeSpan.Zero;
+
+        public bool HasFrame => FrameSize.Width > 0 && FrameSize.Height > 0;
+
+        public bool HasOverlay => Strokes is { Count: > 0 } || Entities is { Count: > 0 };
+
+        public bool HasRectangle => Rectangle.Width > 0 && Rectangle.Height > 0;
+
+        public bool HasOutputSize => HasRectangle || MaxSide > 0;
+    }
+}

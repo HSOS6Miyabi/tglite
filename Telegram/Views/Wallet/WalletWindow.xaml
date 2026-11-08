@@ -1,0 +1,413 @@
+﻿<controls:WindowContent x:Class="Telegram.Views.Wallet.WalletWindow"
+                        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                        xmlns:local="using:Telegram.Views.Wallet"
+                        xmlns:controls="using:Telegram.Controls"
+                        xmlns:cells="using:Telegram.Controls.Cells"
+                        xmlns:muxc="using:Microsoft.UI.Xaml.Controls"
+                        xmlns:media="using:Telegram.Controls.Media"
+                        xmlns:common="using:Telegram.Common"
+                        xmlns:wallet="using:Telegram.Controls.Wallet"
+                        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+                        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                        mc:Ignorable="d">
+
+    <!-- The drop target for a gift dragged from the list, wherever the pointer is: the card may
+         be translated where layout does not see it, so the window works out what is under it. -->
+    <Grid x:Name="DropRoot"
+          AllowDrop="True"
+          DragLeave="OnDragLeave"
+          Drop="OnDrop"
+          Background="Transparent">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition />
+        </Grid.RowDefinitions>
+        <!--<Border Margin="0,0,0,-24"
+                IsHitTestVisible="False"
+                Canvas.ZIndex="1">
+            <Border.Background>
+                <media:LinearGaussianBrush StartPoint="0,1"
+                                           EndPoint="0,0" />
+            </Border.Background>
+        </Border>-->
+        <!--
+            The title bar of the other windows - logo, title, drag handle - with the mini apps'
+            menu button beside it. The last column is not decoration: the window draws its own
+            close button over this strip, and anything under it, the drag handle included, takes
+            the pointer away from it.
+        -->
+        <Grid x:Name="TitlePanel"
+              Height="40"
+              Margin="12,0,0,0"
+              Background="Transparent"
+              Canvas.ZIndex="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <Border x:Name="TitleBarHandle"
+                    Background="Transparent"
+                    Grid.Column="2" />
+
+            <HyperlinkButton x:Name="TitleBarLogo"
+                             Style="{StaticResource EmptyHyperlinkButtonStyle}"
+                             IsTabStop="False"
+                             Margin="-10,0,4,0"
+                             Width="40"
+                             Height="40"
+                             Grid.Column="1">
+                <Grid Background="Transparent">
+                    <Border x:Name="LogoBasic"
+                            Width="20"
+                            Height="20"
+                            CornerRadius="10">
+                        <Border.Background>
+                            <LinearGradientBrush StartPoint="4.44444,3.33333"
+                                                 EndPoint="18.8889,16.6667"
+                                                 MappingMode="Absolute">
+                                <LinearGradientBrush.GradientStops>
+                                    <GradientStopCollection>
+                                        <GradientStop Color="#29C3FF" />
+                                        <GradientStop Offset="1"
+                                                      Color="#2052CB" />
+                                    </GradientStopCollection>
+                                </LinearGradientBrush.GradientStops>
+                            </LinearGradientBrush>
+                        </Border.Background>
+                        <Path Data="M4.52684 9.89446C7.44204 8.62435 9.38597 7.78702 10.3586 7.38246C13.1357 6.22737 13.7128 6.02672 14.0889 6.02009C14.1716 6.01863 14.3566 6.03913 14.4764 6.13635C14.5776 6.21844 14.6054 6.32934 14.6187 6.40717C14.632 6.485 14.6486 6.6623 14.6354 6.80083C14.485 8.38207 13.8338 12.2193 13.5025 13.9903C13.3623 14.7397 13.0863 14.991 12.8191 15.0156C12.2384 15.069 11.7974 14.6318 11.2349 14.2631C10.3548 13.6861 9.85759 13.327 9.00328 12.764C8.01596 12.1134 8.656 11.7558 9.21866 11.1714C9.36592 11.0184 11.9246 8.69115 11.9741 8.48003C11.9803 8.45362 11.986 8.3552 11.9276 8.30323C11.8691 8.25126 11.7828 8.26903 11.7205 8.28316C11.6322 8.3032 10.2262 9.23253 7.50246 11.0711C7.10337 11.3452 6.74188 11.4787 6.418 11.4717C6.06095 11.464 5.37413 11.2698 4.86355 11.1039C4.23729 10.9003 3.73956 10.7927 3.7829 10.4469C3.80548 10.2669 4.05346 10.0827 4.52684 9.89446Z"
+                              Fill="#FFFFFF" />
+                    </Border>
+
+                    <controls:CustomEmojiIcon x:Name="LogoEmoji"
+                                              x:Load="False"
+                                              HorizontalAlignment="Center"
+                                              VerticalAlignment="Center" />
+                </Grid>
+            </HyperlinkButton>
+
+            <TextBlock x:Name="StateLabel"
+                       VerticalAlignment="Center"
+                       TextLineBounds="TrimToCapHeight"
+                       TextWrapping="NoWrap"
+                       AutomationProperties.LiveSetting="Assertive"
+                       Foreground="{ThemeResource PageHeaderForegroundBrush}"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       IsHitTestVisible="False"
+                       Margin="0,2,6,0"
+                       Grid.Column="2" />
+
+            <controls:MoreButton x:Name="MoreButton"
+                                 Click="More_ContextRequested"
+                                 Width="46"
+                                 Height="40"
+                                 Grid.Column="3">
+                <Button.Resources>
+                    <ResourceDictionary>
+                        <ResourceDictionary.ThemeDictionaries>
+                            <ResourceDictionary x:Key="Default">
+                                <SolidColorBrush x:Key="TitleBarButtonBackgroundPointerOver">#19FFFFFF</SolidColorBrush>
+                                <SolidColorBrush x:Key="TitleBarButtonBackgroundPressed">#33FFFFFF</SolidColorBrush>
+                            </ResourceDictionary>
+                            <ResourceDictionary x:Key="Light">
+                                <SolidColorBrush x:Key="TitleBarButtonBackgroundPointerOver">#19000000</SolidColorBrush>
+                                <SolidColorBrush x:Key="TitleBarButtonBackgroundPressed">#33000000</SolidColorBrush>
+                            </ResourceDictionary>
+                        </ResourceDictionary.ThemeDictionaries>
+                    </ResourceDictionary>
+                </Button.Resources>
+                <Button.Template>
+                    <ControlTemplate TargetType="controls:MoreButton">
+                        <Grid Background="{TemplateBinding Background}">
+                            <VisualStateManager.VisualStateGroups>
+                                <VisualStateGroup x:Name="CommonStates">
+                                    <VisualState x:Name="Normal" />
+                                    <VisualState x:Name="PointerOver">
+                                        <Storyboard>
+                                            <ObjectAnimationUsingKeyFrames Storyboard.TargetProperty="Background"
+                                                                           Storyboard.TargetName="RootGrid">
+                                                <DiscreteObjectKeyFrame KeyTime="0"
+                                                                        Value="{ThemeResource TitleBarButtonBackgroundPointerOver}" />
+                                            </ObjectAnimationUsingKeyFrames>
+                                        </Storyboard>
+                                        <VisualState.Setters>
+                                            <Setter Target="Icon.(muxc:AnimatedIcon.State)"
+                                                    Value="PointerOver" />
+                                        </VisualState.Setters>
+                                    </VisualState>
+                                    <VisualState x:Name="Pressed">
+                                        <Storyboard>
+                                            <ObjectAnimationUsingKeyFrames Storyboard.TargetProperty="Background"
+                                                                           Storyboard.TargetName="RootGrid">
+                                                <DiscreteObjectKeyFrame KeyTime="0"
+                                                                        Value="{ThemeResource TitleBarButtonBackgroundPressed}" />
+                                            </ObjectAnimationUsingKeyFrames>
+                                        </Storyboard>
+                                        <VisualState.Setters>
+                                            <Setter Target="Icon.(muxc:AnimatedIcon.State)"
+                                                    Value="Pressed" />
+                                        </VisualState.Setters>
+                                    </VisualState>
+                                    <VisualState x:Name="Disabled" />
+                                </VisualStateGroup>
+                            </VisualStateManager.VisualStateGroups>
+                            <Border x:Name="RootGrid" />
+
+                            <muxc:AnimatedIcon x:Name="Icon"
+                                               muxc:AnimatedIcon.State="Normal"
+                                               Source="{TemplateBinding IconSource}"
+                                               HorizontalAlignment="Center"
+                                               VerticalAlignment="Center"
+                                               AutomationProperties.AccessibilityView="Raw"
+                                               Width="20"
+                                               Height="20" />
+                        </Grid>
+                    </ControlTemplate>
+                </Button.Template>
+            </controls:MoreButton>
+
+            <!-- The window draws its own close button now; this is the room it needs. -->
+            <Border Width="46"
+                    Grid.Column="4" />
+        </Grid>
+
+        <!--
+            The header and both lists scroll together. The lists have no scroll viewer of their
+            own, so they still virtualize against this one; each starts under an empty header as
+            tall as the real one, which lies over it.
+        -->
+        <ScrollViewer x:Name="ScrollingHost"
+                      Loaded="OnLoaded"
+                      SizeChanged="OnSizeChanged"
+                      HorizontalScrollBarVisibility="Disabled"
+                      VerticalScrollBarVisibility="Auto"
+                      CanContentRenderOutsideBounds="True"
+                      Margin="0,-8,0,0"
+                      Grid.Row="0"
+                      Grid.RowSpan="2">
+            <Grid>
+                <controls:SettingsPanel x:Name="HeaderPanel"
+                                        IsHeader="True"
+                                        HasTopPadding="False"
+                                        SizeChanged="HeaderPanel_SizeChanged"
+                                        VerticalAlignment="Top"
+                                        Canvas.ZIndex="1">
+                    <controls:StickyHeader x:Name="Header"
+                                           Margin="0,0,0,-26" />
+
+                    <!-- Shown only once the account says there is something there, which is
+                         one request answered per window. -->
+                    <controls:SettingsButton x:Name="WalletBotButton"
+                                             Click="WalletBot_Click"
+                                             Content="{CustomResource WalletWaltFunds}"
+                                             IsChevronVisible="True"
+                                             IsGlyphVisible="False"
+                                             BorderThickness="1"
+                                             CornerRadius="4"
+                                             Visibility="Collapsed"
+                                             Margin="24,0,24,0" />
+
+                    <!-- Same terms as the My Grams entry in settings, and the content is built
+                         in code because the amount carries the gram glyph in the icon font. -->
+                    <controls:SettingsButton x:Name="EarningsButton"
+                                             Click="Earnings_Click"
+                                             IsChevronVisible="True"
+                                             IsGlyphVisible="False"
+                                             BorderThickness="1"
+                                             CornerRadius="4"
+                                             Visibility="Collapsed"
+                                             Margin="24,0,24,0" />
+
+                    <!-- Only when there is something on them, and the content is built in code
+                         because the amount carries the gram glyph in the icon font. -->
+                    <controls:SettingsButton x:Name="ArchiveButton"
+                                             Click="Archive_Click"
+                                             IsChevronVisible="True"
+                                             IsGlyphVisible="False"
+                                             BorderThickness="1"
+                                             CornerRadius="4"
+                                             Visibility="Collapsed"
+                                             Margin="24,0,24,0" />
+
+                    <controls:WalletCard x:Name="Card"
+                                         Margin="24,0"
+                                         MaxWidth="360" />
+                    <Grid MaxWidth="360"
+                          ColumnSpacing="8"
+                          Margin="24,-8,24,16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition />
+                            <ColumnDefinition />
+                        </Grid.ColumnDefinitions>
+                        <Button Click="AddFunds_Click"
+                                Content="{CustomResource WalletAddFunds}"
+                                Style="{StaticResource AccentButtonStyle}"
+                                HorizontalAlignment="Stretch"
+                                Height="40"
+                                CornerRadius="20" />
+                        <Button Click="Send_Click"
+                                Content="{CustomResource WalletSend}"
+                                Style="{StaticResource AccentButtonStyle}"
+                                HorizontalAlignment="Stretch"
+                                Height="40"
+                                CornerRadius="20"
+                                Grid.Column="1" />
+                    </Grid>
+
+                    <controls:StickyHeaderTabs x:Name="HeaderTabs"
+                                               x:Load="{x:Bind ViewModel.HasCollectibles, Mode=OneWay}"
+                                               Header="{x:Bind Header}"
+                                               SizeChanged="HeaderTabs_SizeChanged"
+                                               HorizontalContentAlignment="Center"
+                                               Margin="0,0,0,6">
+                        <controls:TopNavView x:Name="Navigation"
+                                             SelectedIndex="0"
+                                             SelectionChanged="Navigation_SelectionChanged"
+                                             Height="48"
+                                             Padding="8,0,8,4"
+                                             Margin="-4">
+                            <controls:TopNavView.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel Orientation="Horizontal"
+                                                HorizontalAlignment="Center"
+                                                Margin="0,0,8,0" />
+                                </ItemsPanelTemplate>
+                            </controls:TopNavView.ItemsPanel>
+                            <controls:TopNavViewItem Content="{CustomResource WalletTransactions}" />
+                            <controls:TopNavViewItem Content="{CustomResource WalletCollectibles}" />
+                        </controls:TopNavView>
+                    </controls:StickyHeaderTabs>
+
+                    <!-- The empty state: what the header shows instead of history, until there
+                         is any. Collapsed until the first page comes back, so it does not flash
+                         on the way to a wallet that has transactions. -->
+                    <StackPanel x:Name="EmptyPanel"
+                                Visibility="Collapsed">
+                        <controls:PopupInfo Title="{CustomResource WalletSendInstantly}"
+                                            Subtitle="{CustomResource WalletSendInstantlyInfo}"
+                                            Glyph="&#xEB2B;" />
+                        <controls:PopupInfo Title="{CustomResource WalletNoFees}"
+                                            Subtitle="{CustomResource WalletNoFeesInfo}"
+                                            Glyph="&#xEA9D;" />
+                        <controls:PopupInfo Title="{CustomResource WalletBlockchainVerified}"
+                                            Subtitle="{CustomResource WalletBlockchainVerifiedInfo}"
+                                            Glyph="&#xEA8B;" />
+                    </StackPanel>
+                </controls:SettingsPanel>
+
+                <controls:TableListView x:Name="TransactionsList"
+                                        ContainerContentChanging="OnContainerContentChanging"
+                                        ItemClick="OnItemClick"
+                                        IsItemClickEnabled="True"
+                                        SelectionMode="None"
+                                        Padding="0,0,0,24"
+                                        VerticalAlignment="Top">
+                    <ListView.Template>
+                        <ControlTemplate TargetType="ListView">
+                            <Border BorderBrush="{TemplateBinding BorderBrush}"
+                                    Background="{TemplateBinding Background}"
+                                    BorderThickness="{TemplateBinding BorderThickness}">
+                                <Border.Resources>
+                                    <x:Boolean x:Key="ListViewBaseItemRoundedChromeEnabled">False</x:Boolean>
+                                </Border.Resources>
+                                <ItemsPresenter Header="{TemplateBinding Header}"
+                                                HeaderTemplate="{TemplateBinding HeaderTemplate}"
+                                                HeaderTransitions="{TemplateBinding HeaderTransitions}"
+                                                Footer="{TemplateBinding Footer}"
+                                                FooterTemplate="{TemplateBinding FooterTemplate}"
+                                                FooterTransitions="{TemplateBinding FooterTransitions}"
+                                                Padding="{TemplateBinding Padding}" />
+                            </Border>
+                        </ControlTemplate>
+                    </ListView.Template>
+                    <ListView.ItemTemplate>
+                        <DataTemplate>
+                            <cells:WalletTransactionCell />
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                    <ListView.ItemContainerTransitions>
+                        <TransitionCollection />
+                    </ListView.ItemContainerTransitions>
+                    <ListView.Header>
+                        <Border x:Name="TransactionsHeader" />
+                    </ListView.Header>
+                </controls:TableListView>
+
+                <!-- The wallet's NFTs. The gifts among them can be dragged onto the card. -->
+                <wallet:WalletNftGridView x:Name="CollectiblesList"
+                                          ChoosingItemContainer="Collectibles_ChoosingItemContainer"
+                                          ContainerContentChanging="Collectibles_ContainerContentChanging"
+                                          ItemClick="Collectibles_ItemClick"
+                                          IsItemClickEnabled="True"
+                                          SelectionMode="None"
+                                          Visibility="Collapsed"
+                                          Padding="24,0,20,24"
+                                          VerticalAlignment="Top"
+                                          common:FluidGridView.Padding="0,0,4,0"
+                                          common:FluidGridView.MaxLength="364">
+                    <common:FluidGridView.Triggers>
+                        <common:FluidGridViewTrigger MinLength="0"
+                                                     RowsOrColumns="3" />
+                    </common:FluidGridView.Triggers>
+                    <GridView.Template>
+                        <ControlTemplate TargetType="GridView">
+                            <Border BorderBrush="{TemplateBinding BorderBrush}"
+                                    Background="{TemplateBinding Background}"
+                                    BorderThickness="{TemplateBinding BorderThickness}"
+                                    CornerRadius="{TemplateBinding CornerRadius}">
+                                <ItemsPresenter Header="{TemplateBinding Header}"
+                                                HeaderTemplate="{TemplateBinding HeaderTemplate}"
+                                                HeaderTransitions="{TemplateBinding HeaderTransitions}"
+                                                Footer="{TemplateBinding Footer}"
+                                                FooterTemplate="{TemplateBinding FooterTemplate}"
+                                                FooterTransitions="{TemplateBinding FooterTransitions}"
+                                                Padding="{TemplateBinding Padding}" />
+                            </Border>
+                        </ControlTemplate>
+                    </GridView.Template>
+                    <GridView.ItemContainerStyle>
+                        <Style TargetType="GridViewItem"
+                               BasedOn="{StaticResource DefaultGridViewItemStyle}">
+                            <Setter Property="Margin"
+                                    Value="0,4,4,0" />
+                            <Setter Property="Padding"
+                                    Value="0" />
+                            <Setter Property="HorizontalContentAlignment"
+                                    Value="Stretch" />
+                            <Setter Property="VerticalContentAlignment"
+                                    Value="Stretch" />
+                        </Style>
+                    </GridView.ItemContainerStyle>
+                    <GridView.ItemTemplate>
+                        <DataTemplate>
+                            <cells:WalletCollectibleCell />
+                        </DataTemplate>
+                    </GridView.ItemTemplate>
+                    <GridView.ItemContainerTransitions>
+                        <TransitionCollection />
+                    </GridView.ItemContainerTransitions>
+                    <GridView.Header>
+                        <Border x:Name="CollectiblesHeader" />
+                    </GridView.Header>
+                </wallet:WalletNftGridView>
+            </Grid>
+        </ScrollViewer>
+
+        <!-- The gift being dragged from the list, over everything until it lands. Scaled to the
+             card, so it is the size it will be on it. -->
+        <wallet:WalletStickerLayer x:Name="DragLayer"
+                                   IsHitTestVisible="False"
+                                   HorizontalAlignment="Left"
+                                   VerticalAlignment="Top"
+                                   Canvas.ZIndex="2"
+                                   Grid.RowSpan="2">
+            <wallet:WalletStickerLayer.RenderTransform>
+                <ScaleTransform x:Name="DragLayerScale" />
+            </wallet:WalletStickerLayer.RenderTransform>
+        </wallet:WalletStickerLayer>
+    </Grid>
+</controls:WindowContent>

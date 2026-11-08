@@ -1,0 +1,2655 @@
+﻿#include "pch.h"
+#include "Direct2DDevice.h"
+#if __has_include("Direct2DDevice.g.cpp")
+#include "Direct2DDevice.g.cpp"
+#endif
+
+#include "AppModelPaths.h"
+#include "SVG/nanosvg.h"
+#include "StringUtils.h"
+#include "Helpers\COMHelper.h"
+#include "RichMathSurface.h"
+#include "FrameSurface.h"
+#include "Helpers\BlurHelper.h"
+
+#include <zlib.h>
+
+#include <format>
+#include <numbers>
+
+#include <src\webp\decode.h>
+#include <src\webp\demux.h>
+
+#include <shcore.h>
+#include <propkey.h>
+#include <dxgi1_3.h>
+
+#include <winrt/Windows.ApplicationModel.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Graphics.Effects.h>
+#include <winrt/Windows.Security.Cryptography.h>
+
+#include <BufferSurface.h>
+
+using namespace D2D1;
+using namespace winrt::Windows::ApplicationModel;
+using namespace winrt::GraphicsDirectX;
+using namespace winrt::UIXaml::Media::Imaging;
+
+namespace winrt::Telegram::Native::implementation
+{
+    class CustomEmojiInlineObject
+        : public winrt::implements<CustomEmojiInlineObject, IDWriteInlineObject>
+    {
+        IFACEMETHODIMP2 Draw(
+            _In_opt_ void* clientDrawingContext,
+            _In_ IDWriteTextRenderer* renderer,
+            FLOAT originX,
+            FLOAT originY,
+            BOOL isSideways,
+            BOOL isRightToLeft,
+            _In_opt_ IUnknown* clientDrawingEffect
+        ) override
+        {
+            return S_OK;
+        }
+
+        IFACEMETHODIMP2 GetMetrics(_Out_ DWRITE_INLINE_OBJECT_METRICS* metrics) override
+        {
+            DWRITE_INLINE_OBJECT_METRICS inlineMetrics = {};
+            inlineMetrics.width = 20;
+            inlineMetrics.height = 20;
+            inlineMetrics.baseline = 20;
+            *metrics = inlineMetrics;
+            return S_OK;
+        }
+
+        IFACEMETHODIMP2 GetOverhangMetrics(_Out_ DWRITE_OVERHANG_METRICS* overhangs) override
+        {
+            DWRITE_OVERHANG_METRICS inlineOverhangs = {};
+            inlineOverhangs.left = 0;
+            inlineOverhangs.top = -2;
+            inlineOverhangs.right = 0;
+            inlineOverhangs.bottom = -6;
+            *overhangs = inlineOverhangs;
+            return S_OK;
+        }
+
+        IFACEMETHODIMP2 GetBreakConditions(_Out_ DWRITE_BREAK_CONDITION* breakConditionBefore, _Out_ DWRITE_BREAK_CONDITION* breakConditionAfter) override
+        {
+            *breakConditionBefore = DWRITE_BREAK_CONDITION_CAN_BREAK;
+            *breakConditionAfter = DWRITE_BREAK_CONDITION_MAY_NOT_BREAK;
+            return S_OK;
+        }
+    };
+
+    class CustomFontFileEnumerator
+        : public winrt::implements<CustomFontFileEnumerator, IDWriteFontFileEnumerator>
+    {
+        winrt::com_ptr<IDWriteFactory> m_factory;
+        std::vector<const wchar_t*> m_filenames;
+        int32_t m_index;
+        winrt::com_ptr<IDWriteFontFile> m_theFile;
+
+    public:
+        CustomFontFileEnumerator(IDWriteFactory* factory, void const* collectionKey, uint32_t collectionKeySize)
+            : m_factory()
+            , m_index(0)
+        {
+            auto keys = static_cast<const wchar_t* const*>(collectionKey);
+            auto count = collectionKeySize / sizeof(const wchar_t*);
+
+            m_filenames = std::vector<const wchar_t*>(keys, keys + count);
+            m_factory.copy_from(factory);
+        }
+
+        IFACEMETHODIMP2 MoveNext(BOOL* hasCurrentFile) override
+        {
+            if (m_index == m_filenames.size())
+            {
+                *hasCurrentFile = FALSE;
+            }
+            else if (SUCCEEDED(m_factory->CreateFontFileReference(m_filenames[m_index++], nullptr, m_theFile.put())))
+            {
+                *hasCurrentFile = TRUE;
+            }
+            else
+            {
+                *hasCurrentFile = FALSE;
+            }
+
+            return S_OK;
+        }
+
+        IFACEMETHODIMP2 GetCurrentFontFile(IDWriteFontFile** fontFile) override
+        {
+            m_theFile.copy_to(fontFile);
+            return S_OK;
+        }
+    };
+
+
+
+    class CustomFontLoader
+        : public winrt::implements<CustomFontLoader, IDWriteFontCollectionLoader>
+    {
+        // DWrite keeps its own copy of the collection key and hands it back to
+        // CreateEnumeratorFromKey whenever it needs to rebuild the collection, so the strings the
+        // key points at have to live as long as the loader is registered, not as long as the call
+        // that creates the collection.
+        hstring m_paths[2];
+        const wchar_t* m_key[2];
+
+    public:
+        CustomFontLoader(hstring const& fontPath, hstring const& emojiPath)
+            : m_paths{ fontPath, emojiPath }
+            , m_key{ m_paths[0].c_str(), m_paths[1].c_str() }
+        {
+        }
+
+        void const* Key() const noexcept
+        {
+            return m_key;
+        }
+
+        // Byte count, as DWrite expects: it copies collectionKeySize bytes out of the key.
+        uint32_t KeySize() const noexcept
+        {
+            return static_cast<uint32_t>(sizeof(m_key));
+        }
+
+        IFACEMETHODIMP2 CreateEnumeratorFromKey(
+            IDWriteFactory* factory,
+            void const* collectionKey,
+            uint32_t collectionKeySize,
+            IDWriteFontFileEnumerator** fontFileEnumerator) override
+        {
+            return ExceptionBoundary(
+                [=]
+                {
+                    auto enumerator = winrt::make_self<CustomFontFileEnumerator>(factory, collectionKey, collectionKeySize);
+                    enumerator.as<IDWriteFontFileEnumerator>().copy_to(fontFileEnumerator);
+                });
+        }
+    };
+
+    IBuffer Direct2DDevice::DrawWebP(hstring fileName, int32_t maxWidth, int32_t& pixelWidth, int32_t& pixelHeight) noexcept
+    {
+        pixelWidth = 0;
+        pixelHeight = 0;
+
+        DWORD desired_access = GENERIC_READ;
+
+        // TODO: share mode
+        DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_DELETE | FILE_SHARE_WRITE;
+
+        // OPEN_EXISTING, not OPEN_ALWAYS: this only ever reads, and OPEN_ALWAYS left an empty
+        // file behind whenever it was asked about one that was not there.
+        DWORD creation_disposition = OPEN_EXISTING;
+
+        DWORD native_flags = FILE_FLAG_BACKUP_SEMANTICS;
+        //if (flags & Direct) {
+        //	native_flags |= FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING;
+        //}
+        //if (flags & WinStat) {
+        //	native_flags |= FILE_FLAG_BACKUP_SEMANTICS;
+        //}
+        CREATEFILE2_EXTENDED_PARAMETERS extended_parameters;
+        std::memset(&extended_parameters, 0, sizeof(extended_parameters));
+        extended_parameters.dwSize = sizeof(extended_parameters);
+        extended_parameters.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        extended_parameters.dwFileFlags = native_flags;
+        HANDLE handle = CreateFile2FromAppW(fileName.c_str(), desired_access, share_mode, creation_disposition, &extended_parameters);
+
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return nullptr;
+        }
+
+        LARGE_INTEGER pFileSize;
+        if (!GetFileSizeEx(handle, &pFileSize))
+        {
+            CloseHandle(handle);
+            return nullptr;
+        }
+
+        size_t length = static_cast<size_t>(pFileSize.QuadPart);
+        char* buffer = (char*)malloc(length);
+
+        if (buffer == nullptr)
+        {
+            CloseHandle(handle);
+            return nullptr;
+        }
+
+        DWORD numberOfBytesRead;
+        if (!ReadFile(handle, buffer, length, &numberOfBytesRead, NULL) || numberOfBytesRead != length)
+        {
+            free(buffer);
+            CloseHandle(handle);
+            return nullptr;
+        }
+
+        CloseHandle(handle);
+
+        WebPData webPData;
+        webPData.bytes = (uint8_t*)buffer;
+        webPData.size = length;
+
+        auto spDemuxer = std::unique_ptr<WebPDemuxer, decltype(&WebPDemuxDelete)>
+        {
+            WebPDemux(&webPData),
+            WebPDemuxDelete
+        };
+        if (!spDemuxer)
+        {
+            //throw ref new InvalidArgumentException(ref new String(L"Failed to create demuxer"));
+            free(buffer);
+            return nullptr;
+        }
+
+        IBuffer surface;
+        WebPIterator iter{};
+        if (WebPDemuxGetFrame(spDemuxer.get(), 1, &iter))
+        {
+            WebPDecoderConfig config;
+            int ret = WebPInitDecoderConfig(&config);
+            if (!ret)
+            {
+                //throw ref new FailureException(ref new String(L"WebPInitDecoderConfig failed"));
+                WebPDemuxReleaseIterator(&iter);
+                free(buffer);
+                return nullptr;
+            }
+
+            ret = (WebPGetFeatures(iter.fragment.bytes, iter.fragment.size, &config.input) == VP8_STATUS_OK);
+            if (!ret)
+            {
+                //throw ref new FailureException(ref new String(L"WebPGetFeatures failed"));
+                WebPDemuxReleaseIterator(&iter);
+                free(buffer);
+                return nullptr;
+            }
+
+            int width = iter.width;
+            int height = iter.height;
+
+            if (iter.width > maxWidth || iter.height > maxWidth)
+            {
+                auto ratioX = (double)maxWidth / iter.width;
+                auto ratioY = (double)maxWidth / iter.height;
+                auto ratio = std::min(ratioX, ratioY);
+
+                width = (int)(iter.width * ratio);
+                height = (int)(iter.height * ratio);
+            }
+
+            pixelWidth = width;
+            pixelHeight = height;
+
+            surface = Telegram::Native::BufferSurface::Create(width * 4 * height);
+            auto pixels = surface.data();
+            //uint8_t* pixels = new uint8_t[(width * 4) * height];
+
+            if (width != iter.width || height != iter.height)
+            {
+                config.options.scaled_width = width;
+                config.options.scaled_height = height;
+                config.options.use_scaling = 1;
+                config.options.no_fancy_upsampling = 1;
+            }
+
+            config.output.colorspace = MODE_bgrA;
+            config.output.is_external_memory = 1;
+            config.output.u.RGBA.rgba = pixels;
+            config.output.u.RGBA.stride = width * 4;
+            config.output.u.RGBA.size = (width * 4) * height;
+
+            ret = WebPDecode(iter.fragment.bytes, iter.fragment.size, &config);
+
+            if (ret != VP8_STATUS_OK)
+            {
+                //throw ref new FailureException(ref new String(L"Failed to decode frame"));
+                //delete[] pixels;
+
+                WebPDemuxReleaseIterator(&iter);
+                free(buffer);
+                return nullptr;
+            }
+
+            //delete[] pixels;
+
+            WebPDemuxReleaseIterator(&iter);
+        }
+
+        free(buffer);
+        return surface;
+    }
+
+    bool Direct2DDevice::IsWebP(hstring fileName, int32_t& pixelWidth, int32_t& pixelHeight) noexcept
+    {
+        pixelWidth = 0;
+        pixelHeight = 0;
+
+        DWORD desired_access = GENERIC_READ;
+
+        // TODO: share mode
+        DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_DELETE | FILE_SHARE_WRITE;
+
+        // OPEN_EXISTING, not OPEN_ALWAYS: this only ever reads, and OPEN_ALWAYS left an empty
+        // file behind whenever it was asked about one that was not there.
+        DWORD creation_disposition = OPEN_EXISTING;
+
+        DWORD native_flags = FILE_FLAG_BACKUP_SEMANTICS;
+        //if (flags & Direct) {
+        //	native_flags |= FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING;
+        //}
+        //if (flags & WinStat) {
+        //	native_flags |= FILE_FLAG_BACKUP_SEMANTICS;
+        //}
+        CREATEFILE2_EXTENDED_PARAMETERS extended_parameters;
+        std::memset(&extended_parameters, 0, sizeof(extended_parameters));
+        extended_parameters.dwSize = sizeof(extended_parameters);
+        extended_parameters.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+        extended_parameters.dwFileFlags = native_flags;
+        HANDLE handle = CreateFile2FromAppW(fileName.c_str(), desired_access, share_mode, creation_disposition, &extended_parameters);
+
+        if (handle == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        LARGE_INTEGER pFileSize;
+        if (!GetFileSizeEx(handle, &pFileSize))
+        {
+            CloseHandle(handle);
+            return false;
+        }
+
+        size_t length = static_cast<size_t>(pFileSize.QuadPart);
+        char* buffer = (char*)malloc(length);
+
+        if (buffer == nullptr)
+        {
+            CloseHandle(handle);
+            return false;
+        }
+
+        DWORD numberOfBytesRead;
+        if (!ReadFile(handle, buffer, length, &numberOfBytesRead, NULL) || numberOfBytesRead != length)
+        {
+            free(buffer);
+            CloseHandle(handle);
+            return false;
+        }
+
+        CloseHandle(handle);
+
+        WebPData webPData;
+        webPData.bytes = (uint8_t*)buffer;
+        webPData.size = length;
+
+        auto spDemuxer = std::unique_ptr<WebPDemuxer, decltype(&WebPDemuxDelete)>
+        {
+            WebPDemux(&webPData),
+            WebPDemuxDelete
+        };
+        if (!spDemuxer)
+        {
+            //throw ref new InvalidArgumentException(ref new String(L"Failed to create demuxer"));
+            free(buffer);
+            return false;
+        }
+
+        WebPIterator iter{};
+        if (WebPDemuxGetFrame(spDemuxer.get(), 1, &iter))
+        {
+            pixelWidth = iter.width;
+            pixelHeight = iter.height;
+            WebPDemuxReleaseIterator(&iter);
+        }
+
+        free(buffer);
+        return true;
+    }
+
+    winrt::Telegram::Native::FrameSurface Direct2DDevice::CreateFrameSurface(CompositionGraphicsDevice const& device, int32_t pixelWidth, int32_t pixelHeight, int32_t rotation)
+    {
+        auto turned = rotation == 90 || rotation == 270;
+
+        try
+        {
+            auto surface = device.CreateDrawingSurface2({ turned ? pixelHeight : pixelWidth, turned ? pixelWidth : pixelHeight }, DirectXPixelFormat::B8G8R8A8UIntNormalized, DirectXAlphaMode::Premultiplied);
+            return winrt::make<FrameSurface>(surface, m_d2dFactory, pixelWidth, pixelHeight, rotation);
+        }
+        catch (...)
+        {
+            // Throws while the rendering device is lost.
+            return nullptr;
+        }
+    }
+
+    CompositionGraphicsDevice Direct2DDevice::CreateGraphicsDevice()
+    {
+        std::lock_guard const guard(m_criticalSection);
+
+        if (m_compositor == nullptr || m_d2dDevice == nullptr)
+        {
+            return nullptr;
+        }
+
+        auto compositorInterop = m_compositor.as<abi::ICompositorInterop>();
+#ifdef WINUI3
+        // The Windows App SDK declares the interop with the projected type, not an ABI one.
+        winrt::UIComposition::ICompositionGraphicsDevice deviceInterop{ nullptr };
+        winrt::check_hresult(compositorInterop->CreateGraphicsDevice(m_d2dDevice.get(), &deviceInterop));
+#else
+        winrt::com_ptr<abi::ICompositionGraphicsDevice> deviceInterop;
+        winrt::check_hresult(compositorInterop->CreateGraphicsDevice(m_d2dDevice.get(), deviceInterop.put()));
+#endif
+
+        auto device = deviceInterop.as<CompositionGraphicsDevice>();
+        m_graphicsDevices.push_back(device);
+
+        return device;
+    }
+
+    void Direct2DDevice::ReleaseGraphicsDevice(CompositionGraphicsDevice const& device)
+    {
+        std::lock_guard const guard(m_criticalSection);
+        std::erase(m_graphicsDevices, device);
+    }
+
+    void Direct2DDevice::Trim()
+    {
+        winrt::com_ptr<ID3D11Device> d3dDevice;
+
+        {
+            std::lock_guard const guard(m_criticalSection);
+            d3dDevice = m_d3dDevice;
+        }
+
+        if (d3dDevice == nullptr)
+        {
+            return;
+        }
+
+        winrt::com_ptr<ID3D11DeviceContext> context;
+        d3dDevice->GetImmediateContext(context.put());
+
+        // Direct2D uses the immediate context from other threads, under this lock. No ClearState,
+        // which the documentation asks for before Trim: the context is Direct2D's as much as ours.
+        auto multithread = m_d2dFactory.try_as<ID2D1Multithread>();
+        if (multithread)
+        {
+            multithread->Enter();
+        }
+
+        context->Flush();
+
+        if (auto dxgiDevice = d3dDevice.try_as<IDXGIDevice3>())
+        {
+            dxgiDevice->Trim();
+        }
+
+        if (multithread)
+        {
+            multithread->Leave();
+        }
+    }
+
+    void Direct2DDevice::WaitForCompositorClock()
+    {
+        using PFN_DCompositionWaitForCompositorClock = DWORD(WINAPI*)(UINT, const HANDLE*, DWORD);
+
+        // dcomp.dll is loaded by the time anything draws, since XAML renders through it.
+        static auto s_wait = []() -> PFN_DCompositionWaitForCompositorClock
+        {
+            if (HMODULE dcomp = GetModuleHandle(L"dcomp.dll"))
+            {
+                return reinterpret_cast<PFN_DCompositionWaitForCompositorClock>(GetProcAddress(dcomp, "DCompositionWaitForCompositorClock"));
+            }
+
+            return nullptr;
+        }();
+
+        if (s_wait)
+        {
+            s_wait(0, nullptr, 100);
+            return;
+        }
+
+        // Sleep rounds up to the system timer's 15.6 ms, which would make every other frame late.
+        thread_local winrt::handle s_timer{ CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS) };
+
+        LARGE_INTEGER due;
+        due.QuadPart = -10'000'000LL / 60;
+
+        if (s_timer && SetWaitableTimer(s_timer.get(), &due, 0, nullptr, nullptr, FALSE))
+        {
+            WaitForSingleObject(s_timer.get(), INFINITE);
+        }
+        else
+        {
+            Sleep(16);
+        }
+    }
+
+    winrt::Telegram::Native::SurfaceImage Direct2DDevice::Create(int32_t pixelWidth, int32_t pixelHeight)
+    {
+        std::lock_guard const guard(m_criticalSection);
+
+        auto surface = winrt::make_self<SurfaceImage>(m_d2dDevice.get(), pixelWidth, pixelHeight);
+        return surface.as<winrt::Telegram::Native::SurfaceImage>();
+    }
+
+    HRESULT Direct2DDevice::Invalidate(winrt::Telegram::Native::SurfaceImage imageSource, IBuffer buffer)
+    {
+        std::lock_guard const guard(m_criticalSection);
+        HRESULT result;
+
+        com_ptr<SurfaceImage> source = imageSource.as<SurfaceImage>();
+        int32_t pixelWidth = source->m_pixelWidth;
+        int32_t pixelHeight = source->m_pixelHeight;
+        winrt::com_ptr<ISurfaceImageSourceNativeWithD2D> native = source->m_native;
+
+        D2D1_SIZE_U size{ pixelWidth, pixelHeight };
+        D2D1_RECT_U rect{ 0, 0, pixelWidth, pixelHeight };
+        RECT updateRect{ 0, 0, pixelWidth, pixelHeight };
+        POINT offset{ 0, 0 };
+
+        com_ptr<ID2D1DeviceContext> d2d1DeviceContext;
+        result = native->BeginDraw(updateRect, __uuidof(ID2D1DeviceContext), d2d1DeviceContext.put_void(), &offset);
+
+        if (result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET)
+        {
+            ReturnIfFailed(result, CreateDeviceResources());
+            ReturnIfFailed(result, source->CreateDeviceResources(m_d2dDevice.get()));
+            return Invalidate(imageSource, buffer);
+        }
+
+        com_ptr<ID2D1Bitmap1> bitmap;
+        D2D1_BITMAP_PROPERTIES1 properties = { { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, 96, 96, D2D1_BITMAP_OPTIONS_NONE, 0 };
+        CleanupIfFailed(result, d2d1DeviceContext->CreateBitmap(size, buffer.data(), pixelWidth * 4, &properties, bitmap.put()));
+
+        d2d1DeviceContext->SetTransform(D2D1::Matrix3x2F::Translation(offset.x, offset.y));
+        d2d1DeviceContext->Clear(D2D1::ColorF(0, 0, 0, 0));
+        d2d1DeviceContext->DrawBitmap(bitmap.get());
+
+    Cleanup:
+        return native->EndDraw();
+    }
+
+    // Parsed in the background, drawn back on the caller's thread.
+    winrt::Windows::Foundation::IAsyncOperation<winrt::Telegram::Native::ChatBackgroundPattern> Direct2DDevice::DrawSvgAsync(hstring path, float intensity, bool negative, double rasterizationScale, float minimumHeight)
+    {
+        auto strong = get_strong();
+
+        winrt::apartment_context ui_thread;
+        co_await winrt::resume_background();
+
+        std::shared_ptr<const SvgPattern> svg;
+        try
+        {
+            svg = GetSvgPattern(path);
+        }
+        catch (...)
+        {
+            svg = nullptr;
+        }
+
+        co_await ui_thread;
+
+        if (svg == nullptr)
+        {
+            co_return nullptr;
+        }
+
+        co_return CreatePattern(svg, intensity, negative, rasterizationScale, minimumHeight);
+    }
+
+    constexpr float PI = 3.14159265358979323846f;
+
+    inline static ChatBackgroundSymbol ParseGiftPattern(float topLeftX, float topLeftY, float topRightX, float topRightY, float bottomRightX, float bottomRightY, float bottomLeftX, float bottomLeftY)
+    {
+        ChatBackgroundSymbol pattern;
+        pattern.Offset = float2(topLeftX, topLeftY);
+
+        float dx_top = topRightX - topLeftX;
+        float dy_top = topRightY - topLeftY;
+        pattern.RotationAngle = atan2(dy_top, dx_top);
+
+        float dx_left = bottomLeftX - topLeftX;
+        float dy_left = bottomLeftY - topLeftY;
+        float width = sqrt(dx_top * dx_top + dy_top * dy_top);
+        float height = sqrt(dx_left * dx_left + dy_left * dy_left);
+        pattern.Size = float2(width, height);
+
+        return pattern;
+    }
+
+    inline static bool IsGzipCompressed(const char* data, size_t length)
+    {
+        if (length < 10) return false;
+        return (static_cast<unsigned char>(data[0]) == 0x1f &&
+            static_cast<unsigned char>(data[1]) == 0x8b);
+    }
+
+    inline static std::string DecompressFromFile(hstring path)
+    {
+        FILE* file;
+        _wfopen_s(&file, path.c_str(), L"rb");
+        if (file == NULL)
+        {
+            return "";
+        }
+
+        fseek(file, 0, SEEK_END);
+        size_t length = ftell(file);
+        fseek(file, 0, SEEK_SET);
+
+        if (length == 0)
+        {
+            fclose(file);
+            return "";
+        }
+
+        char* buffer = (char*)malloc(length);
+        if (!buffer)
+        {
+            fclose(file);
+            return "";
+        }
+
+        fread(buffer, 1, length, file);
+        fclose(file);
+
+        if (!IsGzipCompressed(buffer, length))
+        {
+            // Construct the string *before* freeing the buffer; the previous order read freed memory.
+            std::string raw(buffer, length);
+            free(buffer);
+            return raw;
+        }
+
+        z_stream stream = {};
+
+        if (inflateInit2(&stream, 15 + 16) != Z_OK)
+        {
+            free(buffer);
+            return "";
+        }
+
+        stream.next_in = reinterpret_cast<Bytef*>(buffer);
+        stream.avail_in = static_cast<uInt>(length);
+
+        std::string decompressed;
+        // Pre-size to avoid the append/realloc cascade that fragments the heap (gzip on these is ~3-5x).
+        decompressed.reserve(length * 4);
+
+        // One reusable stack buffer instead of allocating a vector on every inflate iteration.
+        char chunk[32768];
+
+        int ret;
+        do
+        {
+            stream.next_out = reinterpret_cast<Bytef*>(chunk);
+            stream.avail_out = static_cast<uInt>(sizeof(chunk));
+
+            ret = inflate(&stream, Z_NO_FLUSH);
+
+            if (ret != Z_OK && ret != Z_STREAM_END)
+            {
+                inflateEnd(&stream);
+                free(buffer);
+                return "";
+            }
+
+            decompressed.append(chunk, sizeof(chunk) - stream.avail_out);
+
+        } while (ret != Z_STREAM_END);
+
+        inflateEnd(&stream);
+        free(buffer);
+        return decompressed;
+    }
+
+    HRESULT Direct2DDevice::ParseSvgPattern(hstring const& path, SvgPattern& pattern)
+    {
+        HRESULT result;
+
+        // nsvgParse mutates its input in place, which is fine: nothing else holds these bytes.
+        auto data = DecompressFromFile(path);
+        if (data.empty())
+        {
+            return E_FAIL;
+        }
+
+        auto image = std::unique_ptr<NSVGimage, decltype(&nsvgDelete)>(nsvgParse(data.data(), "px", 96), &nsvgDelete);
+        if (image == nullptr)
+        {
+            return E_FAIL;
+        }
+
+        pattern.Width = image->width;
+        pattern.Height = image->height;
+
+        std::vector<winrt::com_ptr<ID2D1PathGeometry1>> solid;
+
+        for (auto shape = image->shapes; shape != NULL; shape = shape->next)
+        {
+            if (!(shape->flags & NSVG_FLAGS_VISIBLE) || (shape->fill.type == NSVG_PAINT_NONE && shape->stroke.type == NSVG_PAINT_NONE))
+            {
+                continue;
+            }
+
+            if (strcmp(shape->id, "GiftPatterns") == 0)
+            {
+                if (shape->paths && shape->paths->npts == 13)
+                {
+                    auto pts = shape->paths->pts;
+                    pattern.Symbols.push_back(ParseGiftPattern(pts[0], pts[1], pts[6], pts[7], pts[12], pts[13], pts[18], pts[19]));
+                }
+
+                continue;
+            }
+
+            SvgShape prepared;
+            prepared.Opacity = shape->opacity;
+            prepared.Fill = shape->fill.type != NSVG_PAINT_NONE;
+            prepared.StrokeWidth = shape->strokeWidth;
+
+            ReturnIfFailed(result, m_d2dFactory->CreatePathGeometry(prepared.Geometry.put()));
+
+            winrt::com_ptr<ID2D1GeometrySink> sink;
+            ReturnIfFailed(result, prepared.Geometry->Open(sink.put()));
+
+            if (prepared.Fill)
+            {
+                sink->SetFillMode(shape->fillRule == NSVG_FILLRULE_EVENODD
+                    ? D2D1_FILL_MODE_ALTERNATE
+                    : D2D1_FILL_MODE_WINDING);
+            }
+
+            for (NSVGpath* path = shape->paths; path != NULL; path = path->next)
+            {
+                sink->BeginFigure({ path->pts[0], path->pts[1] }, D2D1_FIGURE_BEGIN_FILLED);
+
+                for (int i = 0; i < path->npts - 1; i += 3)
+                {
+                    float* p = &path->pts[i * 2];
+                    sink->AddBezier({ { p[2], p[3] }, { p[4], p[5] }, { p[6], p[7] } });
+                }
+
+                sink->EndFigure(path->closed ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+            }
+
+            ReturnIfFailed(result, sink->Close());
+
+            // Solid fills are drawn together, as one group. Outline first: it leaves a shape filling
+            // the same under either rule, its outer figures all wound one way, so a winding group of
+            // outlines fills exactly their union. Order is free, since every shape is the same colour.
+            if (prepared.Fill && prepared.Opacity >= 1)
+            {
+                winrt::com_ptr<ID2D1PathGeometry1> outline;
+                ReturnIfFailed(result, m_d2dFactory->CreatePathGeometry(outline.put()));
+
+                winrt::com_ptr<ID2D1GeometrySink> outlineSink;
+                ReturnIfFailed(result, outline->Open(outlineSink.put()));
+                ReturnIfFailed(result, prepared.Geometry->Outline(nullptr, outlineSink.get()));
+                ReturnIfFailed(result, outlineSink->Close());
+
+                solid.push_back(outline);
+                prepared.Fill = false;
+            }
+
+            if (shape->stroke.type != NSVG_PAINT_NONE)
+            {
+                D2D1_STROKE_STYLE_PROPERTIES1 strokeProperties{};
+                strokeProperties.miterLimit = shape->miterLimit;
+
+                switch (shape->strokeLineCap)
+                {
+                case NSVG_CAP_BUTT:
+                    strokeProperties.startCap = strokeProperties.endCap = D2D1_CAP_STYLE_FLAT;
+                    break;
+                case NSVG_CAP_ROUND:
+                    strokeProperties.startCap = strokeProperties.endCap = D2D1_CAP_STYLE_ROUND;
+                    break;
+                case NSVG_CAP_SQUARE:
+                    strokeProperties.startCap = strokeProperties.endCap = D2D1_CAP_STYLE_SQUARE;
+                    break;
+                default:
+                    break;
+                }
+
+                switch (shape->strokeLineJoin)
+                {
+                case NSVG_JOIN_BEVEL:
+                    strokeProperties.lineJoin = D2D1_LINE_JOIN_BEVEL;
+                    break;
+                case NSVG_JOIN_MITER:
+                    strokeProperties.lineJoin = D2D1_LINE_JOIN_MITER;
+                    break;
+                case NSVG_JOIN_ROUND:
+                    strokeProperties.lineJoin = D2D1_LINE_JOIN_ROUND;
+                    break;
+                default:
+                    break;
+                }
+
+                ReturnIfFailed(result, m_d2dFactory->CreateStrokeStyle(strokeProperties, NULL, 0, prepared.StrokeStyle.put()));
+            }
+
+            if (prepared.Fill || prepared.StrokeStyle)
+            {
+                pattern.Shapes.push_back(std::move(prepared));
+            }
+        }
+
+        if (solid.size() > 0)
+        {
+            std::vector<ID2D1Geometry*> geometries;
+            geometries.reserve(solid.size());
+
+            for (auto const& geometry : solid)
+            {
+                geometries.push_back(geometry.get());
+            }
+
+            // The group holds its own references to the members.
+            ReturnIfFailed(result, m_d2dFactory->CreateGeometryGroup(D2D1_FILL_MODE_WINDING, geometries.data(), (UINT32)geometries.size(), pattern.Solid.put()));
+        }
+
+        return S_OK;
+    }
+
+    // Geometries come from the factory, not the device, so they survive a device loss and can be
+    // drawn at any scale; only the surface is redone per render.
+    //
+    // The parse runs outside every lock, m_criticalSection above all: HandleDeviceLost takes that one
+    // on each Direct2D.Current access, so a parse under it would stall the view's thread.
+    std::shared_ptr<const SvgPattern> Direct2DDevice::GetSvgPattern(hstring const& path)
+    {
+        std::wstring key(path.c_str());
+
+        {
+            std::lock_guard const guard(m_svgCacheLock);
+
+            auto found = m_svgCacheIndex.find(key);
+            if (found != m_svgCacheIndex.end())
+            {
+                m_svgCacheList.splice(m_svgCacheList.begin(), m_svgCacheList, found->second);
+                return found->second->second;
+            }
+        }
+
+        auto pattern = std::make_shared<SvgPattern>();
+        if (FAILED(ParseSvgPattern(path, *pattern)))
+        {
+            // Not cached, so a file that is not downloaded yet is read again next time.
+            return nullptr;
+        }
+
+        std::lock_guard const guard(m_svgCacheLock);
+
+        // Parsed meanwhile by another caller: theirs is the one patterns may already share.
+        auto found = m_svgCacheIndex.find(key);
+        if (found != m_svgCacheIndex.end())
+        {
+            m_svgCacheList.splice(m_svgCacheList.begin(), m_svgCacheList, found->second);
+            return found->second->second;
+        }
+
+        m_svgCacheList.emplace_front(key, pattern);
+        m_svgCacheIndex[key] = m_svgCacheList.begin();
+
+        if (m_svgCacheList.size() > kSvgCacheCapacity)
+        {
+            m_svgCacheIndex.erase(m_svgCacheList.back().first);
+            m_svgCacheList.pop_back();
+        }
+
+        return pattern;
+    }
+
+    winrt::Telegram::Native::ChatBackgroundPattern Direct2DDevice::DrawSvg(hstring path, float intensity, bool negative, double rasterizationScale, float minimumHeight)
+    {
+        auto svg = GetSvgPattern(path);
+        if (svg == nullptr)
+        {
+            return nullptr;
+        }
+
+        return CreatePattern(svg, intensity, negative, rasterizationScale, minimumHeight);
+    }
+
+    winrt::Telegram::Native::ChatBackgroundPattern Direct2DDevice::CreatePattern(std::shared_ptr<const SvgPattern> const& svg, float intensity, bool negative, double rasterizationScale, float minimumHeight)
+    {
+        // The background instance has no compositor, and so nothing to draw into.
+        if (m_compositionDevice == nullptr)
+        {
+            return nullptr;
+        }
+
+        auto imageWidth = svg->Width;
+        auto imageHeight = svg->Height;
+
+        if (rasterizationScale < 1)
+        {
+            rasterizationScale = 1;
+        }
+
+        // A pattern shorter than the area is drawn larger rather than stretched, so it stays sharp.
+        // RenderSize is unaffected: it divides the same factor back out.
+        if (imageHeight > 0 && minimumHeight > imageHeight * 0.25f)
+        {
+            rasterizationScale *= minimumHeight / (imageHeight * 0.25f);
+        }
+
+        if (rasterizationScale > 4)
+        {
+            rasterizationScale = 4;
+        }
+
+        float dpi = 0.25f * (float)rasterizationScale;
+
+        auto patterns = winrt::single_threaded_vector<ChatBackgroundSymbol>();
+
+        for (auto symbol : svg->Symbols)
+        {
+            symbol.Offset *= dpi;
+            symbol.Size *= dpi;
+            patterns.Append(symbol);
+        }
+
+        winrt::Windows::Foundation::Size imageSize(imageWidth * dpi, imageHeight * dpi);
+
+        try
+        {
+            auto surface = m_compositionDevice.CreateDrawingSurface(imageSize, DirectXPixelFormat::B8G8R8A8UIntNormalized, DirectXAlphaMode::Premultiplied);
+            auto pattern = winrt::make_self<implementation::ChatBackgroundPattern>(m_compositionDevice, surface, svg, (float)rasterizationScale, dpi, intensity, negative, patterns);
+
+            // An empty surface as the source of the background's effect blanks the fill under it
+            // too, so no pattern at all is the better failure.
+            if (FAILED(pattern->Invalidate()))
+            {
+                pattern->Close();
+                return nullptr;
+            }
+
+            return pattern.as<winrt::Telegram::Native::ChatBackgroundPattern>();
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
+    }
+
+    SoftwareBitmap Direct2DDevice::DrawBlurred(hstring fileName, float blurAmount)
+    {
+        HRESULT result;
+
+        HANDLE file = CreateFile2FromAppW(fileName.data(), GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, nullptr);
+
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return nullptr;
+        }
+
+        winrt::com_ptr<IWICBitmapDecoder> wicBitmapDecoder;
+        winrt::com_ptr<IWICBitmapFrameDecode> wicFrameDecode;
+        winrt::com_ptr<IWICFormatConverter> wicFormatConverter;
+        SoftwareBitmap bitmap{ nullptr };
+
+        CleanupIfFailed(result, m_wicFactory->CreateDecoderFromFileHandle(reinterpret_cast<ULONG_PTR>(file), nullptr, WICDecodeMetadataCacheOnDemand, wicBitmapDecoder.put()));
+
+        CleanupIfFailed(result, wicBitmapDecoder->GetFrame(0, wicFrameDecode.put()));
+
+        CleanupIfFailed(result, m_wicFactory->CreateFormatConverter(wicFormatConverter.put()));
+        CleanupIfFailed(result, wicFormatConverter->Initialize(wicFrameDecode.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom));
+
+        CleanupIfFailed(result, DrawBlurredImpl(wicFormatConverter.get(), blurAmount, bitmap, false));
+
+    Cleanup:
+        CloseHandle(file);
+
+        return bitmap;
+    }
+
+    SoftwareBitmap Direct2DDevice::DrawBlurred(array_view<uint8_t const> bytes, float blurAmount)
+    {
+        HRESULT result;
+
+        winrt::com_ptr<IStream> stream;
+        auto bytesView = std::vector<byte>(bytes.begin(), bytes.end());
+
+        winrt::com_ptr<IWICBitmapDecoder> wicBitmapDecoder;
+        winrt::com_ptr<IWICBitmapFrameDecode> wicFrameDecode;
+        winrt::com_ptr<IWICFormatConverter> wicFormatConverter;
+        SoftwareBitmap bitmap{ nullptr };
+
+        CleanupIfFailed(result, CreateStreamOnHGlobal(nullptr, TRUE, stream.put()));
+
+        CleanupIfFailed(result, stream->Write(bytesView.data(), bytesView.size(), nullptr));
+        CleanupIfFailed(result, stream->Seek({ 0 }, STREAM_SEEK_SET, nullptr));
+
+        CleanupIfFailed(result, m_wicFactory->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnDemand, wicBitmapDecoder.put()));
+
+        CleanupIfFailed(result, wicBitmapDecoder->GetFrame(0, wicFrameDecode.put()));
+
+        CleanupIfFailed(result, m_wicFactory->CreateFormatConverter(wicFormatConverter.put()));
+        CleanupIfFailed(result, wicFormatConverter->Initialize(wicFrameDecode.get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0.f, WICBitmapPaletteTypeCustom));
+
+        CleanupIfFailed(result, DrawBlurredImpl(wicFormatConverter.get(), blurAmount, bitmap, true));
+
+    Cleanup:
+        return bitmap;
+    }
+
+    HRESULT Direct2DDevice::DrawBlurredImpl(IWICBitmapSource* wicBitmapSource, float blurAmount, SoftwareBitmap& bitmap, bool minithumbnail)
+    {
+        HRESULT result;
+
+        D2D1_SIZE_U size;
+        ReturnIfFailed(result, wicBitmapSource->GetSize(&size.width, &size.height));
+
+        uint32_t totalPixels = size.width * size.height;
+        // Small enough that reaching D2D costs more than the blur does. The device round trip is
+        // an image source, a render target, BeginDraw/EndDraw and a mapped readback behind the
+        // shared context, measured at a ~529us floor in situ; GaussianBlur runs at ~14ns a pixel,
+        // so it stays under that up to roughly 128x128. Minithumbnails are ~40px and ~91% of all
+        // blurs, so they clear it by a wide margin - 20us against 529us.
+        //
+        // One threshold for both amounts, because the running sum makes sigma 15 cost what sigma 3
+        // costs. Widening it is a measurable experiment, not a guess: the probes in
+        // ThumbnailController report blur.file.solo separately.
+        if (totalPixels <= 128 * 128)
+        {
+            UINT rowSizeBytes = size.width * 4;
+
+            bitmap = SoftwareBitmap(BitmapPixelFormat::Bgra8, size.width, size.height, BitmapAlphaMode::Premultiplied);
+            auto buffer = bitmap.LockBuffer(BitmapBufferAccessMode::Write);
+            auto reference = buffer.CreateReference();
+            auto pixels = reference.data();
+            auto stride = static_cast<UINT>(buffer.GetPlaneDescription(0).Stride);
+
+            // GaussianBlur indexes rows by width * 4, so a padded bitmap is blurred in a packed
+            // copy and written back a row at a time.
+            std::vector<uint8_t> packed;
+            uint8_t* target = pixels;
+
+            if (stride != rowSizeBytes)
+            {
+                packed.resize(static_cast<size_t>(rowSizeBytes) * size.height);
+                target = packed.data();
+            }
+
+            WICRect rect = { 0, 0, static_cast<INT>(size.width), static_cast<INT>(size.height) };
+            ReturnIfFailed(result, wicBitmapSource->CopyPixels(&rect, rowSizeBytes, rowSizeBytes * size.height, target));
+
+            GaussianBlur::Apply(target, size.width, size.height, blurAmount);
+
+            if (target != pixels)
+            {
+                const uint8_t* srcRow = target;
+                uint8_t* dstRow = pixels;
+
+                for (uint32_t y = 0; y < size.height; ++y)
+                {
+                    memcpy(dstRow, srcRow, rowSizeBytes);
+                    srcRow += rowSizeBytes;
+                    dstRow += stride;
+                }
+            }
+
+            return S_OK;
+        }
+
+        // Everything above needs no device, so it runs unlocked: the caller's WIC decode, the
+        // file it opened, and the CPU blur. From here the shared context and the shared blur
+        // effect are driven as one sequence - SetValue, SetInput, SetTarget, BeginDraw..EndDraw -
+        // and it is the sequence that needs protecting, not the individual calls, which D2D
+        // already serializes for a D2D1_FACTORY_TYPE_MULTI_THREADED factory.
+        std::lock_guard const guard(m_criticalSection);
+
+        winrt::com_ptr<ID2D1ImageSourceFromWic> imageSource;
+        winrt::com_ptr<ID2D1Bitmap1> targetBitmap;
+
+        // A loop rather than the recursive call this replaces: m_criticalSection is a plain
+        // std::mutex, so re-entering after a device loss would deadlock. Both resources belong to
+        // the lost device and are rebuilt on the retry; com_ptr::put() releases what it overwrites.
+        for (;;)
+        {
+            ReturnIfFailed(result, m_d2dContext->CreateImageSourceFromWic(wicBitmapSource, imageSource.put()));
+
+            D2D1_BITMAP_PROPERTIES1 properties = { { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, 96, 96, D2D1_BITMAP_OPTIONS_TARGET, 0 };
+            ReturnIfFailed(result, m_d2dContext->CreateBitmap(size, nullptr, 0, &properties, targetBitmap.put()));
+
+            ReturnIfFailed(result, m_gaussianBlurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, blurAmount));
+
+            m_gaussianBlurEffect->SetInput(0, imageSource.get());
+
+            m_d2dContext->SetTarget(targetBitmap.get());
+            m_d2dContext->BeginDraw();
+            //m_d2dContext->SetTransform(D2D1::Matrix3x2F::Identity());
+            m_d2dContext->Clear(D2D1::ColorF(ColorF::Black, 0.0f));
+            m_d2dContext->DrawImage(m_gaussianBlurEffect.get());
+
+            if ((result = m_d2dContext->EndDraw()) != D2DERR_RECREATE_TARGET)
+            {
+                break;
+            }
+
+            ReturnIfFailed(result, CreateDeviceResources());
+        }
+
+        //winrt::com_ptr<IDXGISurface> surface;
+        //ReturnIfFailed(result, targetBitmap->GetSurface(surface.put()));
+
+        //winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface direct3DSurface{ nullptr };
+        //ReturnIfFailed(result, CreateDirect3D11SurfaceFromDXGISurface(surface.get(), reinterpret_cast<::IInspectable**>(winrt::put_abi(direct3DSurface))));
+
+        //bitmap = SoftwareBitmap::CreateCopyFromSurfaceAsync(direct3DSurface, BitmapAlphaMode::Premultiplied).get();
+        //return result;
+
+        winrt::com_ptr<ID2D1Bitmap1> readBitmap;
+        D2D1_BITMAP_PROPERTIES1 properties2 = { { DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED }, 96, 96, D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW, 0 };
+        ReturnIfFailed(result, m_d2dContext->CreateBitmap(size, nullptr, 0, &properties2, readBitmap.put()));
+
+        D2D1_POINT_2U origin{ 0, 0 };
+        D2D1_RECT_U source{ 0, 0, size.width, size.height };
+        D2D1_MAPPED_RECT map;
+        ReturnIfFailed(result, readBitmap->CopyFromBitmap(&origin, targetBitmap.get(), &source));
+        ReturnIfFailed(result, readBitmap->Map(D2D1_MAP_OPTIONS_READ, &map));
+
+        // Fast path
+        uint32_t rowSizeBytes = size.width * 4;
+        if (map.pitch == rowSizeBytes)
+        {
+            uint32_t bufferSize = map.pitch * size.height;
+            winrt::array_view<const uint8_t> pixelData(
+                static_cast<const uint8_t*>(map.bits),
+                static_cast<const uint8_t*>(map.bits) + bufferSize
+            );
+
+            // BufferSurface here also works
+            auto buffer = winrt::Windows::Security::Cryptography::CryptographicBuffer::CreateFromByteArray(pixelData);
+            bitmap = SoftwareBitmap::CreateCopyFromBuffer(buffer, BitmapPixelFormat::Bgra8, size.width, size.height, BitmapAlphaMode::Premultiplied);
+        }
+        else
+        {
+            bitmap = SoftwareBitmap(BitmapPixelFormat::Bgra8, size.width, size.height, BitmapAlphaMode::Premultiplied);
+            auto buffer = bitmap.LockBuffer(BitmapBufferAccessMode::Write);
+            auto reference = buffer.CreateReference();
+
+            const uint8_t* srcRow = static_cast<const uint8_t*>(map.bits);
+            uint8_t* dstRow = reference.data();
+
+            // The destination has a stride of its own, and it is no more guaranteed to be packed
+            // than the mapped source this branch exists to handle.
+            auto dstStride = static_cast<uint32_t>(buffer.GetPlaneDescription(0).Stride);
+
+            for (uint32_t y = 0; y < size.height; ++y)
+            {
+                memcpy(dstRow, srcRow, rowSizeBytes);
+                srcRow += map.pitch;
+                dstRow += dstStride;
+            }
+        }
+
+        return readBitmap->Unmap();
+    }
+
+    // The compositor is per thread, and null for the background instance, which draws into
+    // software bitmaps and composes nothing.
+    Direct2DDevice::Direct2DDevice(Compositor compositor)
+        : m_compositor(compositor)
+        , m_compositionDevice(nullptr)
+        , m_alphaMaskFactory(nullptr)
+    {
+        // Made here, on the compositor's own thread: the device-lost callback that needs them runs
+        // on the threadpool. Before CreateDeviceResources, which starts watching the device.
+        // The thread's queue rather than Compositor.DispatcherQueue, which is ICompositor7 and
+        // so Windows 11 only: Windows 10 fails the constructor with E_NOINTERFACE.
+        if (m_compositor)
+        {
+            m_dispatcherQueue = winrt::UIDispatching::DispatcherQueue::GetForCurrentThread();
+        }
+
+        if (m_dispatcherQueue)
+        {
+            m_recoveryTimer = m_dispatcherQueue.CreateTimer();
+            m_recoveryTimer.IsRepeating(false);
+            m_recoveryTick = m_recoveryTimer.Tick({ get_weak(), &Direct2DDevice::OnRecoveryTick });
+        }
+
+        winrt::check_hresult(CreateDeviceIndependentResources());
+        winrt::check_hresult(CreateDeviceResources());
+    }
+
+    HRESULT Direct2DDevice::CreateDeviceIndependentResources()
+    {
+        if (m_compositor)
+        {
+            auto alphaMask = winrt::make_self<CompositionAlphaMaskEffect>();
+            alphaMask->Name(L"AlphaMask");
+            alphaMask->Source(CompositionEffectSourceParameter(L"source"));
+            alphaMask->AlphaMask(CompositionEffectSourceParameter(L"mask"));
+
+            m_alphaMaskFactory = m_compositor.CreateEffectFactory(alphaMask.as<IGraphicsEffect>());
+        }
+
+        HRESULT result;
+        D2D1_FACTORY_OPTIONS options = {};
+        ReturnIfFailed(result, D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, __uuidof(ID2D1Factory1), &options, m_d2dFactory.put_void()));
+        ReturnIfFailed(result, CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&m_wicFactory)));
+        ReturnIfFailed(result, DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)m_dwriteFactory.put()));
+
+        m_customEmoji = winrt::make_self<CustomEmojiInlineObject>();
+
+        hstring path = AppModel::InstalledPath();
+
+        auto loader = winrt::make_self<CustomFontLoader>(path + L"\\Assets\\Fonts\\Telegram.ttf", path + L"\\Assets\\Emoji\\apple.ttf");
+        m_customLoader = loader.as<IDWriteFontCollectionLoader>();
+
+        ReturnIfFailed(result, m_dwriteFactory->RegisterFontCollectionLoader(m_customLoader.get()));
+        ReturnIfFailed(result, m_dwriteFactory->CreateCustomFontCollection(m_customLoader.get(), loader->Key(), loader->KeySize(), m_fontCollection.put()));
+        ReturnIfFailed(result, m_dwriteFactory->GetSystemFontCollection(m_systemCollection.put()));
+
+        for (auto familyName : { L"Cascadia Mono", L"Consolas" })
+        {
+            UINT32 index;
+            BOOL exists = FALSE;
+            if (SUCCEEDED(m_systemCollection->FindFamilyName(familyName, &index, &exists)) && exists)
+            {
+                m_monospaceFamily = familyName;
+                break;
+            }
+        }
+
+        m_fontChains = std::make_shared<FontChains>(m_dwriteFactory.as<IDWriteFactory>(), m_systemCollection, std::wstring(path.c_str()), std::wstring(m_monospaceFamily));
+
+        return S_OK;
+    }
+
+    static winrt::com_ptr<IDXGIAdapter1> GetHardwareAdapter(winrt::com_ptr<IDXGIFactory1> const& factory)
+    {
+        winrt::com_ptr<IDXGIAdapter1> adapter;
+        for (UINT i = 0; SUCCEEDED(factory->EnumAdapters1(i, adapter.put())); ++i)
+        {
+            DXGI_ADAPTER_DESC1 desc;
+            if (SUCCEEDED(adapter->GetDesc1(&desc)) && (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0)
+            {
+                return adapter;
+            }
+
+            adapter = nullptr;
+        }
+
+        return nullptr;
+    }
+
+    bool Direct2DDevice::IsAdapterStale()
+    {
+        // Runs on every access: IsCurrent stays in user mode, at about 60 ns a call.
+        if (m_dxgiFactory == nullptr || m_dxgiFactory->IsCurrent())
+        {
+            return false;
+        }
+
+        m_dxgiFactory = nullptr;
+
+        winrt::com_ptr<IDXGIFactory1> factory;
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(factory.put()))))
+        {
+            return false;
+        }
+
+        auto adapter = GetHardwareAdapter(factory);
+        DXGI_ADAPTER_DESC1 desc;
+        if (adapter == nullptr || FAILED(adapter->GetDesc1(&desc)))
+        {
+            m_dxgiFactory = factory;
+            return false;
+        }
+
+        if (desc.AdapterLuid.LowPart == m_adapterLuid.LowPart && desc.AdapterLuid.HighPart == m_adapterLuid.HighPart)
+        {
+            m_dxgiFactory = factory;
+            return false;
+        }
+
+        LOGGER_INFO(L"Moving to another adapter");
+        return true;
+    }
+
+    HRESULT Direct2DDevice::CreateDeviceResources()
+    {
+        HRESULT result;
+        UINT creationFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+
+        // The removed device has to go before a new one is created: com_ptr::put() overwrites the
+        // pointer without releasing it, so recreating over a live device strands it and everything
+        // the display driver holds behind it.
+        m_d3dDevice = nullptr;
+        m_dxgiFactory = nullptr;
+
+        // The compositor moves to the first hardware adapter of a current factory when that
+        // changes, as when a display goes away on a hybrid laptop. Ours has to follow it, or every
+        // surface we draw is copied across adapters, through system memory.
+        winrt::com_ptr<IDXGIAdapter1> adapter;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(m_dxgiFactory.put()))))
+        {
+            adapter = GetHardwareAdapter(m_dxgiFactory);
+        }
+
+        winrt::com_ptr<ID3D11DeviceContext> context;
+        if (FAILED(D3D11CreateDevice(adapter.get(),
+            adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, 0,
+            creationFlags,									// optionally set debug and Direct2D compatibility flags
+            NULL,											// list of feature levels this app can support
+            0,												// number of possible feature levels
+            D3D11_SDK_VERSION,
+            m_d3dDevice.put(),								// returns the Direct3D device created
+            &m_featureLevel,								// returns feature level of device created
+            context.put()									// returns the device immediate context
+        )))
+        {
+            // A failed D3D11CreateDevice can still have written the out parameters, and put()
+            // would overwrite them.
+            m_d3dDevice = nullptr;
+            context = nullptr;
+
+            // Try again using WARP (software rendering)
+            ReturnIfFailed(result, D3D11CreateDevice(nullptr,
+                D3D_DRIVER_TYPE_WARP, 0,
+                creationFlags,
+                NULL,
+                0,
+                D3D11_SDK_VERSION,
+                m_d3dDevice.put(),
+                &m_featureLevel,
+                context.put()
+            ));
+        }
+
+        winrt::com_ptr<IDXGIDevice> dxgiDevice = m_d3dDevice.as<IDXGIDevice>();
+
+        // Read back rather than taken from the adapter above, which WARP replaces when the
+        // hardware device fails.
+        winrt::com_ptr<IDXGIAdapter> deviceAdapter;
+        DXGI_ADAPTER_DESC deviceAdapterDesc;
+        if (SUCCEEDED(dxgiDevice->GetAdapter(deviceAdapter.put())) && SUCCEEDED(deviceAdapter->GetDesc(&deviceAdapterDesc)))
+        {
+            m_adapterLuid = deviceAdapterDesc.AdapterLuid;
+        }
+
+        // Released one at a time, just before each put(), for the same reason as m_d3dDevice: a
+        // stranded ID2D1Device keeps the device it was built on alive, and after an adapter switch
+        // that device has not been removed, so its memory stays on the other adapter.
+        m_d2dDevice = nullptr;
+        ReturnIfFailed(result, m_d2dFactory->CreateDevice(dxgiDevice.get(), m_d2dDevice.put()));
+
+        winrt::com_ptr<ID2D1DeviceContext> d2dContext;
+        ReturnIfFailed(result, m_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, d2dContext.put()));
+        m_d2dContext = d2dContext.as<ID2D1DeviceContext2>();
+
+        m_gaussianBlurEffect = nullptr;
+        ReturnIfFailed(result, m_d2dContext->CreateEffect(CLSID_D2D1GaussianBlur, m_gaussianBlurEffect.put()));
+        ReturnIfFailed(result, m_gaussianBlurEffect->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_HARD));
+
+        m_d2dContext->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+        m_imageEncoder = nullptr;
+        ReturnIfFailed(result, m_wicFactory->CreateImageEncoder(m_d2dDevice.get(), m_imageEncoder.put()));
+
+        if (m_compositor)
+        {
+            // If the composition device already exists, invalidate the rendering device
+            if (m_compositionDevice)
+            {
+                winrt::com_ptr<abi::ICompositionGraphicsDeviceInterop> compositionGraphicsDeviceInterop{ m_compositionDevice.as<abi::ICompositionGraphicsDeviceInterop>() };
+                result = compositionGraphicsDeviceInterop->SetRenderingDevice(m_d2dDevice.get());
+
+                // Each raises its own RenderingDeviceReplaced, the only signal its owner gets.
+                for (auto const& device : m_graphicsDevices)
+                {
+                    device.as<abi::ICompositionGraphicsDeviceInterop>()->SetRenderingDevice(m_d2dDevice.get());
+                }
+            }
+            else
+            {
+                auto compositorInterop = m_compositor.as<abi::ICompositorInterop>();
+#ifdef WINUI3
+                winrt::UIComposition::ICompositionGraphicsDevice deviceInterop{ nullptr };
+                ReturnIfFailed(result, compositorInterop->CreateGraphicsDevice(m_d2dDevice.get(), &deviceInterop));
+#else
+                winrt::com_ptr<abi::ICompositionGraphicsDevice> deviceInterop;
+                ReturnIfFailed(result, compositorInterop->CreateGraphicsDevice(m_d2dDevice.get(), deviceInterop.put()));
+#endif
+
+                m_compositionDevice = deviceInterop.as<CompositionGraphicsDevice>();
+            }
+        }
+
+        m_deviceLostHelper.WatchDevice(dxgiDevice);
+        m_deviceLostHelper.DeviceLost({ this, &Direct2DDevice::OnDirect3DDeviceLost });
+
+        return S_OK;
+    }
+
+    void Direct2DDevice::OnDirect3DDeviceLost(DeviceLostHelper const* /* sender */, DeviceLostEventArgs const& /* args */)
+    {
+        // Deliberately does not recreate the device here. This runs on the threadpool callback for
+        // the device-removed event, so the display driver is still tearing itself down, and calling
+        // D3D11CreateDevice at that moment faults inside the vendor user-mode driver.
+        //
+        // Direct2D asks HandleDeviceLost() on every access to the singleton, but an idle window
+        // makes none and would stay blank. So a device with a compositor also schedules the rebuild
+        // on its own thread, late, to keep clear of the reset.
+        LOGGER_ERROR(L"Direct3D device lost");
+
+        // Close() clears the queue only after draining this callback, so the read cannot race it.
+        // The timer is the view thread's, so it is started from there.
+        if (m_dispatcherQueue)
+        {
+            m_dispatcherQueue.TryEnqueue([weak = get_weak()]
+            {
+                // A null timer means Close() ran after the post.
+                if (auto self = weak.get(); self && self->m_recoveryTimer)
+                {
+                    self->m_recoveryAttempt = 0;
+                    self->StartRecovery();
+                }
+            });
+        }
+    }
+
+    void Direct2DDevice::StartRecovery()
+    {
+        m_recoveryTimer.Interval(std::chrono::milliseconds(500 << m_recoveryAttempt));
+        m_recoveryTimer.Start();
+    }
+
+    void Direct2DDevice::OnRecoveryTick(winrt::UIDispatching::DispatcherQueueTimer const&, winrt::Windows::Foundation::IInspectable const&)
+    {
+        // A failure is a driver that is still resetting: tried again later, and then left to the
+        // next access.
+        if (FAILED(HandleDeviceLost()) && ++m_recoveryAttempt < s_recoveryAttempts)
+        {
+            StartRecovery();
+        }
+    }
+
+    HRESULT Direct2DDevice::CreateTextFormat(double fontSize)
+    {
+        if (m_appleFormat != nullptr && fontSize == m_appleFormat->GetFontSize())
+        {
+            return S_OK;
+        }
+
+        HRESULT result;
+        ReturnIfFailed(result, m_dwriteFactory->CreateTextFormat(
+            L"Segoe UI Emoji",						// font family name
+            m_fontCollection.get(),			        // system font collection
+            DWRITE_FONT_WEIGHT_NORMAL,				// font weight 
+            DWRITE_FONT_STYLE_NORMAL,				// font style
+            DWRITE_FONT_STRETCH_NORMAL,				// default font stretch
+            fontSize,								// font size
+            L"",									// locale name
+            m_appleFormat.put()
+        ));
+        ReturnIfFailed(result, m_appleFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING));
+        ReturnIfFailed(result, m_appleFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR));
+        return result;
+    }
+
+    winrt::Telegram::Native::TextFormat Direct2DDevice::CreateTextFormat2(hstring text, IVector<TextStylePart> entities, double fontSize, double width)
+    {
+        winrt::com_ptr<TextFormat> textFormat;
+        CreateTextFormatImpl(text, entities, fontSize, width, textFormat);
+        return textFormat.as<winrt::Telegram::Native::TextFormat>();
+    }
+
+    winrt::Telegram::Native::DirectTextLayout Direct2DDevice::CreateLayout()
+    {
+        auto layout = winrt::make_self<DirectTextLayout>(m_compositionDevice, m_dwriteFactory, m_fontCollection, m_systemCollection, hstring(m_monospaceFamily), m_fontChains);
+        return layout.as<winrt::Telegram::Native::DirectTextLayout>();
+    }
+
+    // A formula rasterized into the caller's buffer, which must hold PixelWidth by PixelHeight
+    // scaled premultiplied BGRA pixels. For the caller that hosts a formula as an image rather
+    // than drawing it into a surface of its own - a text layout with one in a line draws it
+    // straight into the context it already has open, and none of this happens.
+    //
+    // Here rather than on the formula because this is where the factories are, and a formula
+    // outlives any one of them: it is parsed once and drawn for as long as it is on screen.
+    void Direct2DDevice::RenderMath(winrt::Telegram::Native::RichMathSurface math, IBuffer buffer, double rasterizationScale, Windows::UI::Color foreground)
+    {
+        if (math == nullptr || buffer == nullptr || rasterizationScale <= 0)
+        {
+            return;
+        }
+
+        auto self = winrt::get_self<RichMathSurface>(math);
+
+        const uint32_t width = (uint32_t)(self->PixelWidth() * rasterizationScale);
+        const uint32_t height = (uint32_t)(self->PixelHeight() * rasterizationScale);
+        const uint32_t stride = width * 4;
+        const uint64_t size = (uint64_t)stride * height;
+
+        // The caller sized its buffer from the same two numbers, but this is what writes into
+        // it: a disagreement is a corrupt heap, not a wrong picture.
+        if (width == 0 || height == 0 || buffer.Capacity() < size)
+        {
+            return;
+        }
+
+        winrt::com_ptr<IWICBitmap> bitmap;
+
+        if (FAILED(m_wicFactory->CreateBitmap(width, height, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, bitmap.put())))
+        {
+            return;
+        }
+
+        // Rasterized at the scale through the target's DPI rather than by scaling the formula:
+        // the glyphs are laid out for the pixel grid they land on, which is the whole reason
+        // this is drawn again on a scale change instead of the bitmap being stretched.
+        const auto props = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            96.f * (float)rasterizationScale, 96.f * (float)rasterizationScale);
+
+        winrt::com_ptr<ID2D1RenderTarget> target;
+
+        if (FAILED(m_d2dFactory->CreateWicBitmapRenderTarget(bitmap.get(), props, target.put())))
+        {
+            return;
+        }
+
+        target->BeginDraw();
+        target->Clear(D2D1::ColorF(0, 0, 0, 0));
+
+        self->Draw(target.get(), 0, 0, foreground);
+
+        // Half a formula, or none of it: the buffer is left as the caller made it rather than
+        // filled with what the target happens to hold.
+        if (FAILED(target->EndDraw()))
+        {
+            return;
+        }
+
+        bitmap->CopyPixels(nullptr, stride, (UINT)size, buffer.data());
+    }
+
+    // The layout drawn once into a surface of its own size, for a caller that hosts it as a
+    // visual instead of building an element per run. The layout is the caller's: it measured
+    // with it, and it draws from the same one rather than laying the text out a second time.
+    HRESULT Direct2DDevice::CreateTextFormatImpl(hstring text, IVector<TextStylePart> entities, double fontSize, double width, winrt::com_ptr<TextFormat>& textFormat2)
+    {
+        // No lock: DirectWrite's factory is DWRITE_FACTORY_TYPE_SHARED and thread-safe, the font
+        // collections are read-only after CreateDeviceIndependentResources, and the text format
+        // and layout below are local to this call. m_appleFormat is not touched - see the note
+        // on its declaration.
+        HRESULT result;
+
+        //ReturnIfFailed(result, CreateTextFormat(fontSize));
+
+        winrt::com_ptr<IDWriteTextFormat> textFormat;
+        ReturnIfFailed(result, m_dwriteFactory->CreateTextFormat(
+            L"Segoe UI Emoji",						// font family name
+            m_fontCollection.get(),			        // system font collection
+            DWRITE_FONT_WEIGHT_NORMAL,				// font weight 
+            DWRITE_FONT_STYLE_NORMAL,				// font style
+            DWRITE_FONT_STRETCH_NORMAL,				// default font stretch
+            fontSize,								// font size
+            L"",									// locale name
+            textFormat.put()
+        ));
+        ReturnIfFailed(result, textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING));
+        ReturnIfFailed(result, textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR));
+        // TextWrapping.Wrap breaks inside a word that doesn't fit, so the layout has to as
+        // well, or a single long word puts the two engines on different line counts.
+        ReturnIfFailed(result, textFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK));
+
+        winrt::com_ptr<IDWriteTextLayout> textLayout;
+        ReturnIfFailed(result, m_dwriteFactory->CreateTextLayout(
+            text.data(),					// The string to be laid out and formatted.
+            text.size(),        			// The length of the string.
+            textFormat.get(),			    // The text format to apply to the string (contains font information, etc).
+            width,							// The width of the layout box.
+            INFINITY,						// The height of the layout box.
+            textLayout.put()				// The IDWriteTextLayout interface pointer.
+        ));
+
+        for (const TextStylePart& entity : entities)
+        {
+            UINT32 startPosition = entity.Offset;
+            UINT32 length = entity.Length;
+
+            if (entity.Type == TextStyle::Bold)
+            {
+                ReturnIfFailed(result, textLayout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, { startPosition, length }));
+            }
+            else if (entity.Type == TextStyle::Italic)
+            {
+                ReturnIfFailed(result, textLayout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, { startPosition, length }));
+            }
+            else if (entity.Type == TextStyle::Strikethrough)
+            {
+                ReturnIfFailed(result, textLayout->SetStrikethrough(TRUE, { startPosition, length }));
+            }
+            else if (entity.Type == TextStyle::Underline)
+            {
+                ReturnIfFailed(result, textLayout->SetUnderline(TRUE, { startPosition, length }));
+            }
+            //else if (name == winrt::name_of<TextStylePartTypeCustomEmoji>())
+            //{
+            //    textLayout->SetInlineObject(m_customEmoji.get(), { startPosition, length });
+            //}
+            else if (entity.Type == TextStyle::Monospace)
+            {
+                ReturnIfFailed(result, textLayout->SetFontCollection(m_systemCollection.get(), { startPosition, length }));
+                ReturnIfFailed(result, textLayout->SetFontFamilyName(m_monospaceFamily, { startPosition, length }));
+            }
+        }
+
+        textFormat2 = winrt::make_self<TextFormat>(textLayout, text.size(), fontSize, width);
+        return result;
+    }
+
+    float2 Direct2DDevice::ContentEnd(hstring text, IVector<TextStylePart> entities, double fontSize, double width)
+    {
+        HRESULT result;
+
+        winrt::com_ptr<TextFormat> textFormat;
+        ReturnDefaultIfFailed(result, CreateTextFormatImpl(text, entities, fontSize, width, textFormat));
+
+        return textFormat->ContentEnd(fontSize, width);
+    }
+
+    com_array<Windows::Foundation::Rect> Direct2DDevice::LineMetrics(hstring text, IVector<TextStylePart> entities, double fontSize, double width, bool rtl)
+    {
+        HRESULT result;
+
+        winrt::com_ptr<TextFormat> textFormat;
+        ReturnDefaultIfFailed(result, CreateTextFormatImpl(text, entities, fontSize, width, textFormat));
+
+        return textFormat->LineMetrics(0, text.size(), fontSize, width, rtl, true);
+    }
+
+    com_array<Windows::Foundation::Rect> Direct2DDevice::RangeMetrics(hstring text, int32_t offset, int32_t length, IVector<TextStylePart> entities, double fontSize, double width, bool rtl, bool wrap)
+    {
+        HRESULT result;
+
+        winrt::com_ptr<TextFormat> textFormat;
+        ReturnDefaultIfFailed(result, CreateTextFormatImpl(text, entities, fontSize, width, textFormat));
+
+        return textFormat->RangeMetrics(offset, length, fontSize, width, rtl, wrap, 0);
+    }
+
+    Windows::Foundation::Rect Direct2DDevice::LayoutMetrics(hstring text, int32_t offset, int32_t length, IVector<TextStylePart> entities, double fontSize, double width, bool rtl)
+    {
+        // No lock: DirectWrite's factory is DWRITE_FACTORY_TYPE_SHARED and thread-safe, the font
+        // collections are read-only after CreateDeviceIndependentResources, and the text format
+        // and layout below are local to this call. m_appleFormat is not touched - see the note
+        // on its declaration.
+        HRESULT result;
+
+        //ReturnIfFailed(result, CreateTextFormat(fontSize));
+        //ReturnIfFailed(result, m_appleFormat->SetReadingDirection(rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT));
+
+        winrt::com_ptr<IDWriteTextFormat> textFormat;
+        ReturnDefaultIfFailed(result, m_dwriteFactory->CreateTextFormat(
+            L"Segoe UI Emoji",						// font family name
+            m_fontCollection.get(),			        // system font collection
+            DWRITE_FONT_WEIGHT_NORMAL,				// font weight 
+            DWRITE_FONT_STYLE_NORMAL,				// font style
+            DWRITE_FONT_STRETCH_NORMAL,				// default font stretch
+            fontSize,								// font size
+            L"",									// locale name
+            textFormat.put()
+        ));
+        ReturnDefaultIfFailed(result, textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING));
+        ReturnDefaultIfFailed(result, textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR));
+        ReturnDefaultIfFailed(result, textFormat->SetReadingDirection(rtl ? DWRITE_READING_DIRECTION_RIGHT_TO_LEFT : DWRITE_READING_DIRECTION_LEFT_TO_RIGHT));
+        ReturnDefaultIfFailed(result, textFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK));
+
+        winrt::com_ptr<IDWriteTextLayout> textLayout;
+        ReturnDefaultIfFailed(result, m_dwriteFactory->CreateTextLayout(
+            text.data(),					// The string to be laid out and formatted.
+            text.size(),        			// The length of the string.
+            textFormat.get(),			    // The text format to apply to the string (contains font information, etc).
+            width,							// The width of the layout box.
+            INFINITY,						// The height of the layout box.
+            textLayout.put()				// The IDWriteTextLayout interface pointer.
+        ));
+
+        for (const TextStylePart& entity : entities)
+        {
+            UINT32 startPosition = entity.Offset;
+            UINT32 length = entity.Length;
+
+            if (entity.Type == TextStyle::Bold)
+            {
+                ReturnDefaultIfFailed(result, textLayout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, { startPosition, length }));
+            }
+            else if (entity.Type == TextStyle::Italic)
+            {
+                ReturnDefaultIfFailed(result, textLayout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, { startPosition, length }));
+            }
+            else if (entity.Type == TextStyle::Strikethrough)
+            {
+                ReturnDefaultIfFailed(result, textLayout->SetStrikethrough(TRUE, { startPosition, length }));
+            }
+            else if (entity.Type == TextStyle::Underline)
+            {
+                ReturnDefaultIfFailed(result, textLayout->SetUnderline(TRUE, { startPosition, length }));
+            }
+            //else if (name == winrt::name_of<TextStylePartTypeCustomEmoji>())
+            //{
+            //    textLayout->SetInlineObject(m_customEmoji.get(), { startPosition, length });
+            //}
+            else if (entity.Type == TextStyle::Monospace)
+            {
+                ReturnDefaultIfFailed(result, textLayout->SetFontCollection(m_systemCollection.get(), { startPosition, length }));
+                ReturnDefaultIfFailed(result, textLayout->SetFontFamilyName(m_monospaceFamily, { startPosition, length }));
+            }
+        }
+
+        DWRITE_TEXT_METRICS metrics;
+        ReturnDefaultIfFailed(result, textLayout->GetMetrics(&metrics));
+
+        return { metrics.left, metrics.top, metrics.width, metrics.height };
+    }
+
+    MaxLinesMetrics Direct2DDevice::MaxLines(hstring text, int32_t offset, int32_t length, IVector<TextStylePart> entities, double fontSize, double width, bool rtl, int32_t maxLines)
+    {
+        HRESULT result;
+
+        winrt::com_ptr<TextFormat> textFormat;
+        ReturnDefaultIfFailed(result, CreateTextFormatImpl(text, entities, fontSize, width, textFormat));
+
+        return textFormat->MaxLines(offset, length, fontSize, width, rtl, maxLines);
+    }
+
+    HRESULT Direct2DDevice::WriteBytes(array_view<uint8_t const> hash, IRandomAccessStream randomAccessStream) noexcept
+    {
+        HRESULT result;
+        winrt::com_ptr<IStream> stream;
+        ReturnIfFailed(result, CreateStreamOverRandomAccessStream(winrt::get_unknown(randomAccessStream), IID_PPV_ARGS(&stream)));
+
+        ReturnIfFailed(result, stream->Write(hash.data(), hash.size(), nullptr));
+        ReturnIfFailed(result, stream->Seek({ 0 }, STREAM_SEEK_SET, nullptr));
+
+        return S_OK;
+    }
+
+    inline static HRESULT GetTextFromLocalizedStrings(UINT32 stringIndex, winrt::com_ptr<IDWriteLocalizedStrings> const& localizedStrings, hstring* nameIfFound)
+    {
+        HRESULT result;
+
+        UINT32 attributeLength;
+        ReturnIfFailed(result, localizedStrings->GetStringLength(stringIndex, &attributeLength));
+
+        std::wstring buffer(attributeLength + 1, L'\0');
+        ReturnIfFailed(result, localizedStrings->GetString(stringIndex, buffer.data(), attributeLength + 1));
+
+        buffer.resize(attributeLength);
+        *nameIfFound = hstring(buffer);
+
+        return S_OK;
+    }
+
+    inline static HRESULT TryGetLocalizedName(wchar_t const* locale, winrt::com_ptr<IDWriteLocalizedStrings> const& familyNames, hstring* nameIfFound)
+    {
+        HRESULT result;
+
+        UINT32 index;
+        BOOL found;
+        ReturnIfFailed(result, familyNames->FindLocaleName(locale, &index, &found));
+        if (found)
+        {
+            ReturnIfFailed(result, GetTextFromLocalizedStrings(index, familyNames, nameIfFound));
+            return S_OK;
+        }
+
+        return E_FAIL;
+    }
+
+
+    inline static HRESULT TryGetLocalizedNameUsingLocaleList(IVector<hstring> const& localeList, winrt::com_ptr<IDWriteLocalizedStrings> const& familyNames, hstring* nameIfFound)
+    {
+        for (auto const& locale : localeList)
+        {
+            HRESULT result = TryGetLocalizedName(locale.c_str(), familyNames, nameIfFound);
+
+            if (SUCCEEDED(result))
+            {
+                return S_OK;
+            }
+        }
+
+        return E_FAIL;
+    }
+
+    IVector<hstring> Direct2DDevice::GetSystemFontFamilies(IVector<hstring> localeNames)
+    {
+        auto families = winrt::single_threaded_vector<hstring>();
+
+        HRESULT result;
+        UINT32 count = m_systemCollection->GetFontFamilyCount();
+
+        for (UINT32 i = 0; i < count; i++)
+        {
+            winrt::com_ptr<IDWriteFontFamily> fontFamily;
+            ContinueIfFailed(result, m_systemCollection->GetFontFamily(i, fontFamily.put()));
+
+            winrt::com_ptr<IDWriteLocalizedStrings> familyNames;
+            ContinueIfFailed(result, fontFamily->GetFamilyNames(familyNames.put()));
+
+            hstring name;
+            result = TryGetLocalizedNameUsingLocaleList(localeNames, familyNames, &name);
+
+            if (FAILED(result))
+            {
+                result = TryGetLocalizedName(L"en-us", familyNames, &name);
+            }
+
+            if (FAILED(result))
+            {
+                result = GetTextFromLocalizedStrings(0, familyNames, &name);
+            }
+
+            if (SUCCEEDED(result))
+            {
+                families.Append(name);
+            }
+        }
+
+        return families;
+    }
+
+    winrt::Telegram::Native::FreeformGradientSurface Direct2DDevice::CreateFreeformGradient(IVectorView<int32_t> colors)
+    {
+        auto surface = CreateDrawingSurface({ 50, 50 });
+        if (surface)
+        {
+            auto gradient = winrt::make_self<FreeformGradientSurface>(m_compositionDevice, m_d2dFactory, m_compositor, surface, colors);
+            return gradient.as<winrt::Telegram::Native::FreeformGradientSurface>();
+        }
+
+        return nullptr;
+    }
+
+    // Nothing reports that a XamlRoot has gone, so expired buckets are dropped whenever a window is
+    // seen for the first time. Pruning on lookup instead would put a weak resolve on the path every
+    // bubble takes, to reclaim a handful of small surfaces sooner.
+    void Direct2DDevice::PruneNineGridCache()
+    {
+        for (auto it = m_nineGridCache.begin(); it != m_nineGridCache.end();)
+        {
+            if (it->second.Root.get())
+            {
+                ++it;
+            }
+            else
+            {
+                it = m_nineGridCache.erase(it);
+            }
+        }
+    }
+
+    winrt::com_ptr<MessageBubbleNineGrid> Direct2DDevice::GetNineGrid(XamlRoot const& xamlRoot, int topLeftRadius, int topRightRadius, int bottomRightRadius, int bottomLeftRadius)
+    {
+        // Bubbles are realized before the window has content, so a missing XamlRoot is expected.
+        if (xamlRoot == nullptr || m_compositionDevice == nullptr)
+        {
+            return nullptr;
+        }
+
+        // Pack 4 radius values into one int
+        // Each value needs only 5 bits (0-31 range), so 4 values fit in 20 bits
+        int key = (topLeftRadius << 15) | (topRightRadius << 10) | (bottomRightRadius << 5) | bottomLeftRadius;
+
+        // The projection always holds the same interface pointer for a given XamlRoot, so its ABI
+        // pointer identifies the window without keeping it alive. Reuse of a freed address is not a
+        // hazard because a bucket is only ever added after pruning.
+        auto owner = winrt::get_abi(xamlRoot);
+
+        auto bucket = m_nineGridCache.find(owner);
+        if (bucket == m_nineGridCache.end())
+        {
+            PruneNineGridCache();
+            bucket = m_nineGridCache.emplace(owner, NineGridBucket{ winrt::make_weak(xamlRoot), {} }).first;
+        }
+        else
+        {
+            auto it = bucket->second.Grids.find(key);
+            if (it != bucket->second.Grids.end())
+            {
+                return it->second;
+            }
+        }
+
+        double rasterizationScale = xamlRoot.RasterizationScale();
+        SizeInt32 imageSize(std::ceil(MessageBubbleNineGrid::s_width * rasterizationScale), std::ceil(MessageBubbleNineGrid::s_height * rasterizationScale));
+
+        auto surface = CreateDrawingSurface(imageSize);
+        if (surface)
+        {
+            auto effect = m_alphaMaskFactory.CreateBrush();
+            auto nineGrid = winrt::make_self<MessageBubbleNineGrid>(m_compositionDevice, m_d2dFactory, m_compositor, xamlRoot, surface, effect, topLeftRadius, topRightRadius, bottomRightRadius, bottomLeftRadius);
+            bucket->second.Grids[key] = nineGrid;
+            return nineGrid;
+        }
+
+        return nullptr;
+    }
+
+    CompositionEffectBrush Direct2DDevice::GetTail(XamlRoot xamlRoot, int topLeftRadius, int topRightRadius, int bottomRightRadius, int bottomLeftRadius)
+    {
+        auto nineGrid = GetNineGrid(xamlRoot, topLeftRadius, topRightRadius, bottomRightRadius, bottomLeftRadius);
+        return nineGrid ? nineGrid->Effect() : nullptr;
+    }
+
+    // The alpha mask of GetTail, for callers that paint the silhouette rather than mask a layer:
+    // a CompositionMaskBrush over this costs no offscreen intermediate, a LayerVisual effect does.
+    CompositionNineGridBrush Direct2DDevice::GetTailMask(XamlRoot xamlRoot, int topLeftRadius, int topRightRadius, int bottomRightRadius, int bottomLeftRadius)
+    {
+        auto nineGrid = GetNineGrid(xamlRoot, topLeftRadius, topRightRadius, bottomRightRadius, bottomLeftRadius);
+        return nineGrid ? nineGrid->Mask() : nullptr;
+    }
+
+    CompositionDrawingSurface Direct2DDevice::CreateDrawingSurface(SizeInt32 size)
+    {
+        try
+        {
+            return m_compositionDevice.CreateDrawingSurface2(size, DirectXPixelFormat::B8G8R8A8UIntNormalized, DirectXAlphaMode::Premultiplied);
+        }
+        catch (...)
+        {
+            // TODO: handle device lost, for now we return null
+            return nullptr;
+        }
+    }
+
+    //CompositionPath Direct2DDevice::GetOutline(IVector<ClosedVectorPath> contours)
+    //{
+    //    std::lock_guard const guard(m_criticalSection);
+    //    HRESULT result;
+
+    //    winrt::com_ptr<ID2D1GeometrySink> d2dGeometrySink;
+    //    winrt::com_ptr<ID2D1PathGeometry1> d2dPathGeometry;
+
+    //    ReturnNullIfFailed(result, m_d2dFactory->CreatePathGeometry(d2dPathGeometry.put()));
+    //    ReturnNullIfFailed(result, d2dPathGeometry->Open(d2dGeometrySink.put()));
+
+    //    for (const ClosedVectorPath& path : contours)
+    //    {
+    //        bool open = true;
+    //        VectorPathCommandCubicBezierCurve endCurve{ nullptr };
+
+    //        for (const VectorPathCommand& command : path.Commands())
+    //        {
+    //            if (auto line = command.try_as<VectorPathCommandLine>())
+    //            {
+    //                auto endPoint = line.EndPoint();
+    //                if (open)
+    //                {
+    //                    open = false;
+    //                    d2dGeometrySink->BeginFigure({ (float)endPoint.X(), (float)endPoint.Y() }, D2D1_FIGURE_BEGIN_FILLED);
+    //                }
+    //                else
+    //                {
+    //                    d2dGeometrySink->AddLine({ (float)endPoint.X(), (float)endPoint.Y() });
+    //                }
+    //            }
+    //            else if (auto cubicBezierCurve = command.try_as<VectorPathCommandCubicBezierCurve>())
+    //            {
+    //                auto endPoint = cubicBezierCurve.EndPoint();
+
+    //                if (open)
+    //                {
+    //                    open = false;
+    //                    d2dGeometrySink->BeginFigure({ (float)endPoint.X(), (float)endPoint.Y() }, D2D1_FIGURE_BEGIN_FILLED);
+    //                    endCurve = cubicBezierCurve;
+    //                }
+    //                else
+    //                {
+    //                    auto controlPoint1 = cubicBezierCurve.StartControlPoint();
+    //                    auto controlPoint2 = cubicBezierCurve.EndControlPoint();
+
+    //                    d2dGeometrySink->AddBezier({
+    //                        { (float)controlPoint1.X(), (float)controlPoint1.Y() },
+    //                        { (float)controlPoint2.X(), (float)controlPoint2.Y() },
+    //                        { (float)endPoint.X(), (float)endPoint.Y() }
+    //                        });
+    //                }
+    //            }
+    //        }
+
+    //        if (endCurve)
+    //        {
+    //            auto endPoint = endCurve.EndPoint();
+    //            auto controlPoint1 = endCurve.StartControlPoint();
+    //            auto controlPoint2 = endCurve.EndControlPoint();
+
+    //            d2dGeometrySink->AddBezier({
+    //                { (float)controlPoint1.X(), (float)controlPoint1.Y() },
+    //                { (float)controlPoint2.X(), (float)controlPoint2.Y() },
+    //                { (float)endPoint.X(), (float)endPoint.Y() }
+    //                });
+    //        }
+
+    //        d2dGeometrySink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    //    }
+
+    //    ReturnNullIfFailed(result, d2dGeometrySink->Close());
+
+    //    auto geometry = winrt::make_self<CompositionPathSource>(d2dPathGeometry);
+    //    return CompositionPath(geometry.as<winrt::Windows::Graphics::IGeometrySource2D>());
+    //}
+
+    CompositionPath Direct2DDevice::GetEllipticalClip(float width, float height, float radius, float x, float y)
+    {
+        // No lock: m_d2dFactory is D2D1_FACTORY_TYPE_MULTI_THREADED, so it serializes itself,
+        // and every geometry below is local to this call. Holding the device lock here only
+        // parked the UI thread behind whatever background blur happened to own it.
+        HRESULT result;
+
+        winrt::com_ptr<ID2D1GeometrySink> d2dGeometrySink;
+        winrt::com_ptr<ID2D1PathGeometry1> d2dPathGeometry;
+
+        ReturnNullIfFailed(result, m_d2dFactory->CreatePathGeometry(d2dPathGeometry.put()));
+        ReturnNullIfFailed(result, d2dPathGeometry->Open(d2dGeometrySink.put()));
+
+        d2dGeometrySink->SetFillMode(D2D1_FILL_MODE_ALTERNATE);
+        d2dGeometrySink->BeginFigure({ 0, 0 }, D2D1_FIGURE_BEGIN_FILLED);
+        d2dGeometrySink->AddLine({ width, 0 });
+        d2dGeometrySink->AddLine({ width, height });
+        d2dGeometrySink->AddLine({ 0, height });
+        d2dGeometrySink->EndFigure(D2D1_FIGURE_END_CLOSED);
+
+        D2D1_POINT_2F startPoint = D2D1::Point2F(x + radius, y);
+        D2D1_SIZE_F radii = D2D1::SizeF(radius, radius);
+
+        d2dGeometrySink->BeginFigure(startPoint, D2D1_FIGURE_BEGIN_FILLED);
+        d2dGeometrySink->AddArc(D2D1::ArcSegment(
+            D2D1::Point2F(x - radius, y),
+            radii,
+            0.0f,
+            D2D1_SWEEP_DIRECTION_CLOCKWISE,
+            D2D1_ARC_SIZE_SMALL
+        ));
+        d2dGeometrySink->AddArc(D2D1::ArcSegment(
+            startPoint,
+            radii,
+            0.0f,
+            D2D1_SWEEP_DIRECTION_CLOCKWISE,
+            D2D1_ARC_SIZE_SMALL
+        ));
+        d2dGeometrySink->EndFigure(D2D1_FIGURE_END_CLOSED);
+
+        ReturnNullIfFailed(result, d2dGeometrySink->Close());
+
+        auto geometry = winrt::make_self<CompositionPathSource>(d2dPathGeometry);
+        return CompositionPath(geometry.as<winrt::Windows::Graphics::IGeometrySource2D>());
+    }
+
+    inline void AppendButton(winrt::com_ptr<ID2D1GeometrySink> d2dGeometrySink, float x, float y, float width, float height, float topLeftRadius, float topRightRadius, float bottomRightRadius, float bottomLeftRadius)
+    {
+        d2dGeometrySink->BeginFigure({ x + topLeftRadius, y }, D2D1_FIGURE_BEGIN_FILLED);
+
+        // Top edge
+        d2dGeometrySink->AddLine({ x + width - topRightRadius, y });
+
+        // Top-right corner
+        if (topRightRadius > 0)
+            d2dGeometrySink->AddArc({ { x + width, y + topRightRadius }, { topRightRadius, topRightRadius }, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL });
+
+        // Right edge
+        d2dGeometrySink->AddLine({ x + width, y + height - bottomRightRadius });
+
+        // Bottom-right corner
+        if (bottomRightRadius > 0)
+            d2dGeometrySink->AddArc({ { x + width - bottomRightRadius, y + height }, { bottomRightRadius, bottomRightRadius }, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL });
+
+        // Bottom edge
+        d2dGeometrySink->AddLine({ x + bottomLeftRadius, y + height });
+
+        // Bottom-left corner
+        if (bottomLeftRadius > 0)
+            d2dGeometrySink->AddArc({ { x, y + height - bottomLeftRadius }, { bottomLeftRadius, bottomLeftRadius }, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL });
+
+        // Left edge
+        d2dGeometrySink->AddLine({ x, y + topLeftRadius });
+
+        // Top-left corner
+        if (topLeftRadius > 0)
+            d2dGeometrySink->AddArc({ { x + topLeftRadius, y }, { topLeftRadius, topLeftRadius }, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL });
+
+        d2dGeometrySink->EndFigure(D2D1_FIGURE_END_CLOSED);
+    }
+
+    CompositionPath Direct2DDevice::GetReplyMarkupClip(IVector<IVector<Windows::Foundation::Rect>> rows, float bottomRightRadius, float bottomLeftRadius)
+    {
+        // No lock: m_d2dFactory is D2D1_FACTORY_TYPE_MULTI_THREADED, so it serializes itself,
+        // and every geometry below is local to this call. Holding the device lock here only
+        // parked the UI thread behind whatever background blur happened to own it.
+        HRESULT result;
+
+        winrt::com_ptr<ID2D1GeometrySink> d2dGeometrySink;
+        winrt::com_ptr<ID2D1PathGeometry1> d2dPathGeometry;
+
+        ReturnNullIfFailed(result, m_d2dFactory->CreatePathGeometry(d2dPathGeometry.put()));
+        ReturnNullIfFailed(result, d2dPathGeometry->Open(d2dGeometrySink.put()));
+
+        auto padding = 2;
+        auto x = 0.f;
+        auto y = 0.f;
+
+        auto j = 0;
+
+        for (const IVector<Windows::Foundation::Rect>& row : rows)
+        {
+            auto i = 0;
+
+            for (const Windows::Foundation::Rect& button : row)
+            {
+                auto bottomRight = 4.f;
+                auto bottomLeft = 4.f;
+
+                if (j == rows.Size() - 1)
+                {
+                    if (i == 0)
+                    {
+                        bottomLeft = bottomLeftRadius;
+                    }
+
+                    if (i == row.Size() - 1)
+                    {
+                        bottomRight = bottomRightRadius;
+                    }
+                }
+
+                AppendButton(d2dGeometrySink, button.X, button.Y, button.Width, button.Height, 4, 4, bottomRight, bottomLeft);
+
+                i++;
+            }
+
+            j++;
+        }
+
+        ReturnNullIfFailed(result, d2dGeometrySink->Close());
+
+        auto geometry = winrt::make_self<CompositionPathSource>(d2dPathGeometry);
+        return CompositionPath(geometry.as<winrt::Windows::Graphics::IGeometrySource2D>());
+    }
+
+    CompositionPath Direct2DDevice::GetVoiceNoteClip(array_view<uint8_t const> waveform, double waveformWidth)
+    {
+        // No lock: m_d2dFactory is D2D1_FACTORY_TYPE_MULTI_THREADED, so it serializes itself,
+        // and every geometry below is local to this call. Holding the device lock here only
+        // parked the UI thread behind whatever background blur happened to own it.
+        HRESULT result;
+
+        winrt::com_ptr<ID2D1GeometrySink> d2dGeometrySink;
+        winrt::com_ptr<ID2D1PathGeometry1> d2dPathGeometry;
+
+        ReturnNullIfFailed(result, m_d2dFactory->CreatePathGeometry(d2dPathGeometry.put()));
+        ReturnNullIfFailed(result, d2dPathGeometry->Open(d2dGeometrySink.put()));
+
+        auto lines = waveform.size() * 8 / 5;
+        auto bytes = new double[lines];
+
+        for (int i = 0; i < lines; i++)
+        {
+            int j = (i * 5) / 8, shift = (i * 5) % 8;
+            bytes[i] = ((waveform.at(j) | ((j + 1 < waveform.size() ? waveform.at(j + 1) : 0) << 8)) >> shift & 0x1F) / 31.0;
+        }
+
+        auto imageWidth = waveformWidth; // 142d; // double.IsNaN(ActualWidth) ? 142 : ActualWidth;
+        auto imageHeight = 20;
+
+        auto space = 1.0;
+        auto lineWidth = 2.0;
+        auto maxLines = (imageWidth - space) / (lineWidth + space);
+        auto maxWidth = lines / maxLines;
+
+        for (int index = 0; index < maxLines; index++)
+        {
+            auto lineIndex = (int)(index * maxWidth);
+            auto lineHeight = bytes[lineIndex] * (double)(imageHeight - 2.0) + 2.0;
+
+            float x1 = (int)(index * (lineWidth + space));
+            float y1 = (imageHeight - (int)lineHeight) / 2;
+            float x2 = (int)(index * (lineWidth + space) + lineWidth);
+            float y2 = imageHeight - y1;
+
+            //d2dGeometrySink->BeginFigure({ x1, y1 }, D2D1_FIGURE_BEGIN_FILLED);
+            //d2dGeometrySink->AddLine({ x2, y1 });
+            //d2dGeometrySink->AddLine({ x2, y2 });
+            //d2dGeometrySink->AddLine({ x1, y2 });
+            //d2dGeometrySink->EndFigure(D2D1_FIGURE_END_CLOSED);
+
+            if (lineHeight > 2)
+            {
+                d2dGeometrySink->BeginFigure({ x1, y1 + 1 }, D2D1_FIGURE_BEGIN_FILLED);
+                d2dGeometrySink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(x2, y1 + 1),
+                    D2D1::SizeF(1, 1),
+                    0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    D2D1_ARC_SIZE_SMALL
+                ));
+                d2dGeometrySink->AddLine({ x2, y2 - 1 });
+                d2dGeometrySink->AddArc(D2D1::ArcSegment(
+                    { x1, y2 - 1 },
+                    D2D1::SizeF(1, 1),
+                    0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    D2D1_ARC_SIZE_SMALL
+                ));
+            }
+            else
+            {
+                d2dGeometrySink->BeginFigure({ x1, 10 }, D2D1_FIGURE_BEGIN_FILLED);
+                d2dGeometrySink->AddArc(D2D1::ArcSegment(
+                    D2D1::Point2F(x2, 10),
+                    D2D1::SizeF(1, 1),
+                    0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    D2D1_ARC_SIZE_SMALL
+                ));
+                d2dGeometrySink->AddArc(D2D1::ArcSegment(
+                    { x1, 10 },
+                    D2D1::SizeF(1, 1),
+                    0.0f,
+                    D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    D2D1_ARC_SIZE_SMALL
+                ));
+            }
+
+            d2dGeometrySink->EndFigure(D2D1_FIGURE_END_CLOSED);
+        }
+
+        delete[] bytes;
+
+        ReturnNullIfFailed(result, d2dGeometrySink->Close());
+
+        auto geometry = winrt::make_self<CompositionPathSource>(d2dPathGeometry);
+        return CompositionPath(geometry.as<winrt::Windows::Graphics::IGeometrySource2D>());
+    }
+
+    // The rectangles of every shape end to end, and the count of each: a collection per shape
+    // meant a wrapper per shape across the ABI, on a path that runs for every arrange of a
+    // message still streaming.
+    CompositionPath Direct2DDevice::GetRoundedPolygon(array_view<Windows::Foundation::Rect const> rects, array_view<int32_t const> shapes)
+    {
+        // No lock: m_d2dFactory is D2D1_FACTORY_TYPE_MULTI_THREADED, so it serializes itself,
+        // and every geometry below is local to this call. Holding the device lock here only
+        // parked the UI thread behind whatever background blur happened to own it.
+        HRESULT result;
+
+        winrt::com_ptr<ID2D1GeometrySink> d2dGeometrySink;
+        winrt::com_ptr<ID2D1PathGeometry1> d2dPathGeometry;
+
+        ReturnNullIfFailed(result, m_d2dFactory->CreatePathGeometry(d2dPathGeometry.put()));
+        ReturnNullIfFailed(result, d2dPathGeometry->Open(d2dGeometrySink.put()));
+
+        auto angle = -90 * std::numbers::pi_v<float> / 180.0f; // MathFEx.ToRadians(-90);
+        static auto rightAt = [](const winrt::Windows::Foundation::Rect& rect)
+            {
+                return rect.X + rect.Width;
+            };
+
+        uint32_t offset = 0;
+
+        for (uint32_t j = 0; j < shapes.size(); j++)
+        {
+            const int count = shapes[j];
+
+            if (count <= 0 || offset + count > rects.size())
+            {
+                break;
+            }
+
+            auto rectangles = [&](int index) -> const winrt::Windows::Foundation::Rect&
+                {
+                    return rects[offset + index];
+                };
+
+            for (int i = 0; i < count; i++)
+            {
+                const auto& rect = rectangles(i);
+                const auto right = rect.X + rect.Width;
+                const auto bottom = rect.Y + rect.Height;
+
+                if (i == 0)
+                {
+                    d2dGeometrySink->BeginFigure({ right - 4, rect.Y }, D2D1_FIGURE_BEGIN_FILLED);
+                    d2dGeometrySink->AddArc(D2D1::ArcSegment({ right, rect.Y + 4 }, { 4, 4 }, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                }
+                else
+                {
+                    auto y1diff = i > 0 ? right - rightAt(rectangles(i - 1)) : 4;
+                    auto y1radius = fminf(4, fabsf(y1diff));
+
+                    if (y1diff < 0)
+                    {
+                        d2dGeometrySink->AddLine({ right + y1radius, rect.Y });
+                        d2dGeometrySink->AddArc(D2D1::ArcSegment({ right, rect.Y + y1radius }, { y1radius, y1radius }, 0, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    }
+                    else if (y1diff > 0)
+                    {
+                        d2dGeometrySink->AddLine({ right - y1radius, rect.Y });
+                        d2dGeometrySink->AddArc(D2D1::ArcSegment({ right, rect.Y + y1radius }, { y1radius, y1radius }, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                    }
+                }
+
+                auto y2diff = i < count - 1 ? right - rightAt(rectangles(i + 1)) : 4;
+                auto y2radius = fminf(4, fabsf(y2diff));
+
+                d2dGeometrySink->AddLine({ right, bottom - y2radius });
+
+                if (y2diff < 0)
+                {
+                    d2dGeometrySink->AddArc(D2D1::ArcSegment({ right + y2radius, rectangles(i + 1).Y }, { y2radius, y2radius }, 0, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                }
+                else if (y2diff > 0)
+                {
+                    d2dGeometrySink->AddArc(D2D1::ArcSegment({ right - y2radius, bottom }, { y2radius, y2radius }, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                }
+            }
+
+            for (int i = count - 1; i >= 0; i--)
+            {
+                const auto& rect = rectangles(i);
+                const auto right = rect.X + rect.Width;
+                const auto bottom = rect.Y + rect.Height;
+
+                auto y1diff = i < count - 1 ? rect.X - rectangles(i + 1).X : -4;
+                auto y1radius = fminf(4, fabsf(y1diff));
+
+                if (y1diff > 0)
+                {
+                    d2dGeometrySink->AddLine({ rect.X - y1radius, bottom });
+                    d2dGeometrySink->AddArc(D2D1::ArcSegment({ rect.X, bottom - y1radius }, { y1radius, y1radius }, 0, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                }
+                else if (y1diff < 0)
+                {
+                    d2dGeometrySink->AddLine({ rect.X + y1radius, bottom });
+                    d2dGeometrySink->AddArc(D2D1::ArcSegment({ rect.X, bottom - y1radius }, { y1radius, y1radius }, 0, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                }
+
+                auto y2diff = i > 0 ? rect.X - rectangles(i - 1).X : -4;
+                auto y2radius = fminf(4, fabsf(y2diff));
+
+                d2dGeometrySink->AddLine({ rect.X, rect.Y + y2radius });
+
+                if (y2diff > 0)
+                {
+                    d2dGeometrySink->AddArc(D2D1::ArcSegment({ rect.X - y2radius, rect.Y }, { y2radius, y2radius }, angle, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                }
+                else if (y2diff < 0)
+                {
+                    d2dGeometrySink->AddArc(D2D1::ArcSegment({ rect.X + y2radius, rect.Y }, { y2radius, y2radius }, angle, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+                }
+            }
+
+            d2dGeometrySink->EndFigure(D2D1_FIGURE_END_CLOSED);
+            offset += count;
+        }
+
+        ReturnNullIfFailed(result, d2dGeometrySink->Close());
+
+        auto geometry = winrt::make_self<CompositionPathSource>(d2dPathGeometry);
+        return CompositionPath(geometry.as<winrt::Windows::Graphics::IGeometrySource2D>());
+    }
+
+    // Collects a layout's glyph outlines into one sink. GetGlyphRunOutline emits every run around
+    // the origin, so each one is streamed back out through a translation to its own baseline:
+    // Simplify writes straight into the caller's open sink, which a transformed geometry per run
+    // would not.
+    class GlyphRunOutlineRenderer
+        : public winrt::implements<GlyphRunOutlineRenderer, IDWriteTextRenderer>
+    {
+    public:
+        GlyphRunOutlineRenderer(ID2D1Factory* factory, ID2D1GeometrySink* sink)
+            : m_factory(factory)
+            , m_sink(sink)
+        {
+        }
+
+        IFACEMETHODIMP2 DrawGlyphRun(
+            _In_opt_ void* /* clientDrawingContext */,
+            FLOAT baselineOriginX,
+            FLOAT baselineOriginY,
+            DWRITE_MEASURING_MODE /* measuringMode */,
+            _In_ DWRITE_GLYPH_RUN const* glyphRun,
+            _In_ DWRITE_GLYPH_RUN_DESCRIPTION const* /* glyphRunDescription */,
+            _In_opt_ IUnknown* /* clientDrawingEffect */
+        ) override
+        {
+            HRESULT result;
+
+            winrt::com_ptr<ID2D1PathGeometry> runGeometry;
+            winrt::com_ptr<ID2D1GeometrySink> runSink;
+
+            ReturnIfFailed(result, m_factory->CreatePathGeometry(runGeometry.put()));
+            ReturnIfFailed(result, runGeometry->Open(runSink.put()));
+
+            ReturnIfFailed(result, glyphRun->fontFace->GetGlyphRunOutline(
+                glyphRun->fontEmSize,
+                glyphRun->glyphIndices,
+                glyphRun->glyphAdvances,
+                glyphRun->glyphOffsets,
+                glyphRun->glyphCount,
+                glyphRun->isSideways,
+                glyphRun->bidiLevel & 1,
+                runSink.get()
+            ));
+
+            ReturnIfFailed(result, runSink->Close());
+
+            return runGeometry->Simplify(
+                D2D1_GEOMETRY_SIMPLIFICATION_OPTION_CUBICS_AND_LINES,
+                D2D1::Matrix3x2F::Translation(baselineOriginX, baselineOriginY),
+                m_sink);
+        }
+
+        // Nothing reaches these: GetTextOutline applies no styles, so the layout has no
+        // decorations and no inline objects to draw.
+        IFACEMETHODIMP2 DrawUnderline(_In_opt_ void*, FLOAT, FLOAT, _In_ DWRITE_UNDERLINE const*, _In_opt_ IUnknown*) override
+        {
+            return S_OK;
+        }
+
+        IFACEMETHODIMP2 DrawStrikethrough(_In_opt_ void*, FLOAT, FLOAT, _In_ DWRITE_STRIKETHROUGH const*, _In_opt_ IUnknown*) override
+        {
+            return S_OK;
+        }
+
+        IFACEMETHODIMP2 DrawInlineObject(_In_opt_ void*, FLOAT, FLOAT, _In_ IDWriteInlineObject*, BOOL, BOOL, _In_opt_ IUnknown*) override
+        {
+            return S_OK;
+        }
+
+        // Outlines are resolution independent and the compositor rasterizes them through whatever
+        // transform the visual carries, so there is no pixel grid here to snap a baseline to.
+        IFACEMETHODIMP2 IsPixelSnappingDisabled(_In_opt_ void*, _Out_ BOOL* isDisabled) override
+        {
+            *isDisabled = TRUE;
+            return S_OK;
+        }
+
+        IFACEMETHODIMP2 GetCurrentTransform(_In_opt_ void*, _Out_ DWRITE_MATRIX* transform) override
+        {
+            *transform = { 1, 0, 0, 1, 0, 0 };
+            return S_OK;
+        }
+
+        IFACEMETHODIMP2 GetPixelsPerDip(_In_opt_ void*, _Out_ FLOAT* pixelsPerDip) override
+        {
+            *pixelsPerDip = 1;
+            return S_OK;
+        }
+
+    private:
+        ID2D1Factory* m_factory;
+        ID2D1GeometrySink* m_sink;
+    };
+
+    // The text as filled outlines rather than glyphs, for a caller that draws it through a
+    // transform XAML would otherwise resolve by rotating an axis-aligned glyph texture. A
+    // CompositionSpriteShape built from this rasterizes in the compositor under the visual's
+    // world transform, so it stays sharp at any angle and any scale.
+    CompositionPath Direct2DDevice::GetTextOutline(hstring text, hstring fontFamily, int32_t fontWeight, double fontSize, double maxWidth, float2& size)
+    {
+        // No lock: DirectWrite's factory is DWRITE_FACTORY_TYPE_SHARED and thread-safe, the font
+        // collections are read-only after CreateDeviceIndependentResources, and m_d2dFactory is
+        // D2D1_FACTORY_TYPE_MULTI_THREADED, so it serializes itself. Everything below is local
+        // to this call.
+        size = {};
+
+        HRESULT result;
+
+        // The system collection, not m_fontCollection: that one holds only the packaged icon and
+        // Apple emoji faces, so a system family name would fall back out of it.
+        winrt::com_ptr<IDWriteTextFormat> textFormat;
+        ReturnNullIfFailed(result, m_dwriteFactory->CreateTextFormat(
+            fontFamily.c_str(),
+            m_systemCollection.get(),
+            static_cast<DWRITE_FONT_WEIGHT>(fontWeight),
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            fontSize,
+            L"",
+            textFormat.put()
+        ));
+        ReturnNullIfFailed(result, textFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING));
+        ReturnNullIfFailed(result, textFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR));
+
+        winrt::com_ptr<IDWriteTextLayout> textLayout;
+        ReturnNullIfFailed(result, m_dwriteFactory->CreateTextLayout(
+            text.data(),
+            text.size(),
+            textFormat.get(),
+            maxWidth,
+            INFINITY,
+            textLayout.put()
+        ));
+
+        winrt::com_ptr<ID2D1GeometrySink> d2dGeometrySink;
+        winrt::com_ptr<ID2D1PathGeometry1> d2dPathGeometry;
+
+        ReturnNullIfFailed(result, m_d2dFactory->CreatePathGeometry(d2dPathGeometry.put()));
+        ReturnNullIfFailed(result, d2dPathGeometry->Open(d2dGeometrySink.put()));
+
+        // Glyph contours are wound so that a counter - the hole in an 'o' - runs opposite its
+        // outer contour. The sink defaults to alternate fill, which fills them in.
+        d2dGeometrySink->SetFillMode(D2D1_FILL_MODE_WINDING);
+
+        auto renderer = winrt::make_self<GlyphRunOutlineRenderer>(m_d2dFactory.get(), d2dGeometrySink.get());
+        ReturnNullIfFailed(result, textLayout->Draw(nullptr, renderer.as<IDWriteTextRenderer>().get(), 0, 0));
+        ReturnNullIfFailed(result, d2dGeometrySink->Close());
+
+        DWRITE_TEXT_METRICS metrics;
+        ReturnNullIfFailed(result, textLayout->GetMetrics(&metrics));
+        size = { metrics.left + metrics.width, metrics.top + metrics.height };
+
+        auto geometry = winrt::make_self<CompositionPathSource>(d2dPathGeometry);
+        return CompositionPath(geometry.as<winrt::Windows::Graphics::IGeometrySource2D>());
+    }
+
+    HRESULT Direct2DDevice::Encode(IBuffer source, IRandomAccessStream destination, int32_t width, int32_t height, int32_t rotation)
+    {
+        HRESULT result;
+        winrt::com_ptr<IStream> stream;
+        ReturnIfFailed(result, CreateStreamOverRandomAccessStream(winrt::get_unknown(destination), IID_PPV_ARGS(&stream)));
+
+        if (destination.Size())
+        {
+            stream->SetSize({ 0 });
+        }
+
+        winrt::com_ptr<IWICBitmapEncoder> wicBitmapEncoder;
+        ReturnIfFailed(result, m_wicFactory->CreateEncoder(GUID_ContainerFormatPng, nullptr, wicBitmapEncoder.put()));
+        ReturnIfFailed(result, wicBitmapEncoder->Initialize(stream.get(), WICBitmapEncoderNoCache));
+
+        winrt::com_ptr<IWICBitmapFrameEncode> wicFrameEncode;
+        ReturnIfFailed(result, wicBitmapEncoder->CreateNewFrame(wicFrameEncode.put(), nullptr));
+        ReturnIfFailed(result, wicFrameEncode->Initialize(nullptr));
+
+        WICPixelFormatGUID pixelFormat = GUID_WICPixelFormat32bppBGRA;
+        ReturnIfFailed(result, wicFrameEncode->SetSize(width, height));
+        ReturnIfFailed(result, wicFrameEncode->SetPixelFormat(&pixelFormat));
+
+        if (rotation)
+        {
+            winrt::com_ptr<IWICMetadataQueryWriter> pMetadataWriter;
+            ReturnIfFailed(result, wicFrameEncode->GetMetadataQueryWriter(pMetadataWriter.put()));
+
+            PROPVARIANT propValue;
+            PropVariantInit(&propValue);
+            propValue.vt = VT_UI2;
+
+            switch (rotation)
+            {
+            case 90:
+                propValue.uiVal = PHOTO_ORIENTATION_ROTATE270;
+                break;
+            case 180:
+                propValue.uiVal = PHOTO_ORIENTATION_ROTATE180;
+                break;
+            case 270:
+                propValue.uiVal = PHOTO_ORIENTATION_ROTATE90;
+                break;
+            default:
+                propValue.uiVal = PHOTO_ORIENTATION_NORMAL;
+                break;
+            }
+
+            ReturnIfFailed(result, pMetadataWriter->SetMetadataByName(L"System.Photo.Orientation", &propValue));
+            PropVariantClear(&propValue);
+        }
+
+        ReturnIfFailed(result, wicFrameEncode->WritePixels(height, width * 4, width * height * 4, source.data()));
+        ReturnIfFailed(result, wicFrameEncode->Commit());
+        ReturnIfFailed(result, wicBitmapEncoder->Commit());
+
+        ReturnIfFailed(result, stream->Commit(STGC_DEFAULT));
+
+        return stream->Seek({ 0 }, STREAM_SEEK_SET, nullptr);
+    }
+
+    HRESULT Direct2DDevice::SaveImageToStream(ID2D1Image* image, REFGUID wicFormat, IRandomAccessStream randomAccessStream)
+    {
+        HRESULT result;
+        winrt::com_ptr<IStream> stream;
+        ReturnIfFailed(result, CreateStreamOverRandomAccessStream(winrt::get_unknown(randomAccessStream), IID_PPV_ARGS(&stream)));
+
+        if (randomAccessStream.Size())
+        {
+            stream->SetSize({ 0 });
+        }
+
+        winrt::com_ptr<IWICBitmapEncoder> wicBitmapEncoder;
+        ReturnIfFailed(result, m_wicFactory->CreateEncoder(wicFormat, nullptr, wicBitmapEncoder.put()));
+        ReturnIfFailed(result, wicBitmapEncoder->Initialize(stream.get(), WICBitmapEncoderNoCache));
+
+        winrt::com_ptr<IWICBitmapFrameEncode> wicFrameEncode;
+        ReturnIfFailed(result, wicBitmapEncoder->CreateNewFrame(wicFrameEncode.put(), nullptr));
+        ReturnIfFailed(result, wicFrameEncode->Initialize(nullptr));
+
+        ReturnIfFailed(result, m_imageEncoder->WriteFrame(image, wicFrameEncode.get(), nullptr));
+        ReturnIfFailed(result, wicFrameEncode->Commit());
+        ReturnIfFailed(result, wicBitmapEncoder->Commit());
+
+        ReturnIfFailed(result, stream->Commit(STGC_DEFAULT));
+
+        return stream->Seek({ 0 }, STREAM_SEEK_SET, nullptr);
+    }
+} // namespace winrt::Telegram::Native::implementation

@@ -1,0 +1,63 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using Telegram.Common;
+using Telegram.Converters;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+
+// The User Control item template is documented at https://go.microsoft.com/fwlink/?LinkId=234236
+
+namespace Telegram.Charts
+{
+    public sealed partial class ChartHeaderView : UserControl
+    {
+        public ChartHeaderView()
+        {
+            InitializeComponent();
+        }
+
+        public void SetTitle(string title)
+        {
+            Label2.Text = title ?? string.Empty;
+        }
+
+        public void SetDates(long v1, long v2)
+        {
+            var start = Formatter.ToLocalTime(v1 / 1000);
+            var end = Formatter.ToLocalTime(v2 / 1000);
+
+            if (this.HasThreadAccess())
+            {
+                Label1.Text = string.Format("{0} - {1}", Formatter.Date(start), Formatter.Date(end));
+            }
+            else
+            {
+                this.BeginOnUIThread(() => Label1.Text = string.Format("{0} - {1}", Formatter.Date(start), Formatter.Date(end)));
+            }
+        }
+
+        public void ZoomTo(BaseChartView zoomedChartView, long d, bool v)
+        {
+            Back.Visibility = Visibility.Visible;
+            Label2.Visibility = Visibility.Collapsed;
+        }
+
+        public void ZoomOut(BaseChartView chartView, bool animated)
+        {
+            Back.Visibility = Visibility.Collapsed;
+            Label2.Visibility = Visibility.Visible;
+        }
+
+        public event RoutedEventHandler Click;
+
+        private void Back_Click(object sender, RoutedEventArgs e)
+        {
+            Click?.Invoke(sender, e);
+        }
+    }
+}

@@ -1,0 +1,28 @@
+﻿namespace Telegram.Native
+{
+    // The Windows spell checker for one language. Use it from the thread pool only: what it wraps
+    // is the system's COM checker, which is not promised to be agile.
+    [default_interface]
+    runtimeclass SpellChecker
+    {
+        static Boolean IsSupported(String languageTag);
+
+        // Null when the system has no dictionary for the language.
+        static SpellChecker Create(String languageTag);
+
+        String LanguageTag { get; };
+
+        // The scripts the language is written in, as the locale gives them: "Latn;".
+        String Scripts { get; };
+
+        // The misspelled ranges of the text, in UTF-16 units: start, length, start, length...
+        // Only words in the language's scripts: the system's checker takes any other word for a
+        // misspelling, so a word in another script is for another checker to judge.
+        Windows.Foundation.Collections.IVector<Int32> Check(String text);
+
+        Windows.Foundation.Collections.IVector<String> Suggest(String word);
+
+        void Add(String word);
+        void Ignore(String word);
+    }
+}

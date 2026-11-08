@@ -1,0 +1,77 @@
+import "SurfaceImage.idl";
+import "FrameSurface.idl";
+import "TextFormat.idl";
+import "DirectTextLayout.idl";
+import "RichMathSurface.idl";
+import "ChatBackgroundPattern.idl";
+import "FreeformGradientSurface.idl";
+import "NativeUtils.idl";
+
+namespace Telegram.Native
+{
+    [default_interface]
+    runtimeclass Direct2DDevice : Windows.Foundation.IClosable
+    {
+        Direct2DDevice(UIComposition.Compositor compositor);
+        void HandleDeviceLost();
+
+        UIComposition.CompositionGraphicsDevice Device{ get; };
+
+        // A graphics device of its own on the same rendering device, for a thread that draws apart
+        // from the view's: each graphics device takes one drawing session at a time. Given the new
+        // rendering device after a loss until ReleaseGraphicsDevice, or until this device closes.
+        UIComposition.CompositionGraphicsDevice CreateGraphicsDevice();
+        void ReleaseGraphicsDevice(UIComposition.CompositionGraphicsDevice device);
+
+        // Direct3D destroys a released resource, and gives back the driver's own buffers, only when
+        // the context is next flushed, which a window with nothing left to draw never does. On an
+        // integrated GPU that memory is the process's own.
+        void Trim();
+
+        static void WriteBytes(byte[] hash, Windows.Storage.Streams.IRandomAccessStream randomAccessStream);
+        static Windows.Storage.Streams.IBuffer DrawWebP(String fileName, Int32 maxWidth, out Int32 pixelWidth, out Int32 pixelHeight);
+        static Boolean IsWebP(String fileName, out Int32 pixelWidth, out Int32 pixelHeight);
+
+        Windows.Foundation.Collections.IVector<String> GetSystemFontFamilies(Windows.Foundation.Collections.IVector<String> localeNames);
+
+        FreeformGradientSurface CreateFreeformGradient(Windows.Foundation.Collections.IVectorView<Int32> colors);
+
+        UIComposition.CompositionEffectBrush GetTail(UIXaml.XamlRoot xamlRoot, Single topLeftRadius, Single topRightRadius, Single bottomRightRadius, Single bottomLeftRadius);
+        UIComposition.CompositionNineGridBrush GetTailMask(UIXaml.XamlRoot xamlRoot, Single topLeftRadius, Single topRightRadius, Single bottomRightRadius, Single bottomLeftRadius);
+        //UIComposition.CompositionPath GetOutline(Windows.Foundation.Collections.IVector<Telegram.Td.Api.ClosedVectorPath> contours);
+        UIComposition.CompositionPath GetEllipticalClip(Single width, Single height, Single radius, Single x, Single y);
+        UIComposition.CompositionPath GetReplyMarkupClip(Windows.Foundation.Collections.IVector<Windows.Foundation.Collections.IVector<Windows.Foundation.Rect> > buttons, Single bottomRightRadius, Single bottomLeftRadius);
+        UIComposition.CompositionPath GetVoiceNoteClip(byte[] waveform, Double waveformWidth);
+        UIComposition.CompositionPath GetRoundedPolygon(Windows.Foundation.Rect[] rects, Int32[] shapes);
+        UIComposition.CompositionPath GetTextOutline(String text, String fontFamily, Int32 fontWeight, Double fontSize, Double maxWidth, out Windows.Foundation.Numerics.Vector2 size);
+
+        void Encode(Windows.Storage.Streams.IBuffer source, Windows.Storage.Streams.IRandomAccessStream destination, Int32 width, Int32 height, Int32 rotation);
+
+        Windows.Foundation.IAsyncOperation<ChatBackgroundPattern> DrawSvgAsync(String path, Single intensity, Boolean negative, Double dpi, Single minimumHeight);
+        ChatBackgroundPattern DrawSvg(String path, Single intensity, Boolean negative, Double dpi, Single minimumHeight);
+
+        [default_overload]
+        Windows.Graphics.Imaging.SoftwareBitmap DrawBlurred(String fileName, Single blurAmount);
+        Windows.Graphics.Imaging.SoftwareBitmap DrawBlurred(byte[] bytes, Single blurAmount);
+
+        // Rotation is clockwise, in degrees: 0, 90, 180 or 270.
+        FrameSurface CreateFrameSurface(UIComposition.CompositionGraphicsDevice device, Int32 pixelWidth, Int32 pixelHeight, Int32 rotation);
+
+        // Until the compositor's next frame, or a 60th of a second before Windows 11.
+        void WaitForCompositorClock();
+
+        SurfaceImage Create(Int32 pixelWidth, Int32 pixelHeight);
+        void Invalidate(SurfaceImage imageSource, Windows.Storage.Streams.IBuffer buffer);
+
+        TextFormat CreateTextFormat2(String text, Windows.Foundation.Collections.IVector<TextStylePart> entities, Double fontSize, Double width);
+        DirectTextLayout CreateLayout();
+        void RenderMath(RichMathSurface math, Windows.Storage.Streams.IBuffer buffer, Double rasterizationScale, Windows.UI.Color foreground);
+
+        Windows.Foundation.Numerics.Vector2 ContentEnd(String text, Windows.Foundation.Collections.IVector<TextStylePart> entities, Double fontSize, Double width);
+        Windows.Foundation.Rect[] LineMetrics(String text, Windows.Foundation.Collections.IVector<TextStylePart> entities, Double fontSize, Double width, Boolean rtl);
+        Windows.Foundation.Rect[] RangeMetrics(String text, Int32 offset, Int32 length, Windows.Foundation.Collections.IVector<TextStylePart> entities, Double fontSize, Double width, Boolean rtl, Boolean wrap);
+        Windows.Foundation.Rect LayoutMetrics(String text, Int32 offset, Int32 length, Windows.Foundation.Collections.IVector<TextStylePart> entities, Double fontSize, Double width, Boolean rtl);
+        MaxLinesMetrics MaxLines(String text, Int32 offset, Int32 length, Windows.Foundation.Collections.IVector<TextStylePart> entities, Double fontSize, Double width, Boolean rtl, Int32 maxLines);
+        //Windows.Foundation.Collections.IVector<Windows.Foundation.Rect> EntityMetrics(String text, Windows.Foundation.Collections.IVector<TextStylePart> entities, Double fontSize, Double width, Boolean rtl);
+    }
+} // namespace Telegram.Native

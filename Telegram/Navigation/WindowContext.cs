@@ -1,0 +1,1953 @@
+﻿//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
+using Telegram.Common;
+using Telegram.Controls;
+using Telegram.Navigation.Services;
+using Telegram.Services;
+using Telegram.Services.Calls;
+using Telegram.Services.Keyboard;
+using Telegram.Services.Settings;
+using Telegram.Td.Api;
+using Telegram.Views;
+using Telegram.Views.Authorization;
+using Telegram.Views.Calls;
+using Telegram.Views.Host;
+using Telegram.Views.Popups;
+using Telegram.Views.Wallet;
+using Windows.ApplicationModel.Activation;
+using Windows.Foundation;
+using Windows.Storage;
+using Windows.System;
+using Windows.UI.Core;
+using Windows.UI.Core.Preview;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Input;
+using Windows.UI.Xaml.Media;
+
+namespace Telegram.Navigation
+{
+    public class PopupActivatedEventArgs : EventArgs
+    {
+        public bool IsActive { get; }
+
+        public PopupActivatedEventArgs(bool isActive)
+        {
+            IsActive = isActive;
+        }
+    }
+
+    /// <summary>
+    /// Raised by <see cref="WindowContext.Activated"/>. Deliberately not the UWP
+    /// <c>Windows.UI.Core.WindowActivatedEventArgs</c>: that one carries a
+    /// <c>CoreWindowActivationState</c>, and WinUI has no CoreWindow. Every consumer
+    /// only ever asked whether the state was Deactivated, so the args carry the answer.
+    /// </summary>
+    public class WindowActivatedEventArgs : EventArgs
+    {
+        public bool IsActive { get; }
+
+        public WindowActivatedEventArgs(bool isActive)
+        {
+            IsActive = isActive;
+        }
+    }
+
+    /// <summary>
+    /// The app's own <c>CoreWindowActivationMode</c>, without None. Only the UWP host can report
+    /// the middle state; the other two go straight between the outer ones.
+    /// </summary>
+    public enum WindowActivationMode
+    {
+        Deactivated,
+        ActivatedNotForeground,
+        ActivatedInForeground
+    }
+
+    public class WindowSizeChangedEventArgs : EventArgs
+    {
+        public Size Size { get; }
+
+        public WindowSizeChangedEventArgs(Size size)
+        {
+            Size = size;
+        }
+    }
+
+    public class WindowVisibilityEventArgs : EventArgs
+    {
+        public bool IsVisible { get; }
+
+        public WindowVisibilityEventArgs(bool isVisible)
+        {
+            IsVisible = isVisible;
+        }
+    }
+
+    /// <summary>
+    /// Raised by <see cref="WindowContext.CloseRequested"/>. Wraps the UWP args rather than
+    /// exposing them, so a handler only ever sees Handled and a deferral - the two things every
+    /// caller actually used, and the two WinUI can supply by other means.
+    /// </summary>
+    public class WindowCloseRequestedEventArgs : EventArgs
+    {
+        private readonly SystemNavigationCloseRequestedPreviewEventArgs _args;
+        private TaskCompletionSource<bool> _deferral;
+        private bool _handled;
+
+        internal WindowCloseRequestedEventArgs(SystemNavigationCloseRequestedPreviewEventArgs args)
+        {
+            _args = args;
+        }
+
+        /// <summary>
+        /// Raised by the app rather than by the system - the window's own close button, or an
+        /// island's WM_CLOSE. Handled is then just a bool, and the deferral has to be honoured by
+        /// whoever raised it.
+        /// </summary>
+        internal WindowCloseRequestedEventArgs()
+        {
+        }
+
+        public bool Handled
+        {
+            get => _args?.Handled ?? _handled;
+            set
+            {
+                if (_args != null)
+                {
+                    _args.Handled = value;
+                }
+                else
+                {
+                    _handled = value;
+                }
+            }
+        }
+
+        public Deferral GetDeferral()
+        {
+            if (_args != null)
+            {
+                return _args.GetDeferral();
+            }
+
+            // Allocated only when a handler actually asks to defer, which is the uncommon case.
+            _deferral ??= new TaskCompletionSource<bool>();
+            return new Deferral(CompleteDeferral);
+        }
+
+        private void CompleteDeferral()
+        {
+            _deferral.TrySetResult(true);
+        }
+
+        /// <summary>
+        /// Completes once every handler that took a deferral has released it. Only meaningful for
+        /// an app-raised request: the system waits on its own.
+        /// </summary>
+        internal Task WaitAsync()
+        {
+            return _deferral?.Task ?? Task.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// A key that reached the window before any control saw it.
+    /// </summary>
+    public class AcceleratorKeyActivatedEventArgs : EventArgs
+    {
+        public VirtualKey Key { get; }
+
+        public bool Handled { get; set; }
+
+        public AcceleratorKeyActivatedEventArgs(VirtualKey key)
+        {
+            Key = key;
+        }
+    }
+
+    /// <summary>
+    /// The cursors the app actually uses, so call sites do not name <c>CoreCursorType</c>.
+    /// <see cref="Hidden"/> is the gallery's chrome-less mode.
+    /// </summary>
+    public enum PointerCursorType
+    {
+        Arrow,
+        Hand,
+        IBeam,
+        SizeWestEast,
+        SizeNorthSouth,
+        SizeNorthwestSoutheast,
+        SizeNortheastSouthwest,
+        Hidden
+    }
+
+    /// <summary>
+    /// Which caption buttons the window draws for itself. Only None, Close and All mean anything
+    /// on both hosts: UWP can close a view but has no way to minimize or maximize one, so a
+    /// combination naming either of those is Win32 only.
+    ///
+    /// All is the default and means "whatever this host does normally" - on UWP that is the
+    /// shell's own caption, which is better than anything the app could draw: it minimizes, it
+    /// maximizes, it has the system menu. Anything less than All is the app taking it over.
+    /// </summary>
+    [Flags]
+    public enum CaptionButtons
+    {
+        None = 0,
+        Minimize = 1,
+        Maximize = 2,
+        Close = 4,
+
+        All = Minimize | Maximize | Close
+    }
+
+    public partial class WindowPresenter : ContentControl, IPopupHost
+    {
+        private readonly WindowContext _context;
+
+        private ContentPresenter ContentHost;
+        private StackPanel CaptionPanel;
+        private Button MinimizeButton;
+        private Button MaximizeButton;
+        private Button CloseButton;
+
+        public WindowPresenter(WindowContext window)
+        {
+            _context = window;
+            DefaultStyleKey = typeof(WindowPresenter);
+        }
+
+        ~WindowPresenter()
+        {
+            Logger.Info();
+        }
+
+        private CaptionButtons _buttons = CaptionButtons.All;
+        public CaptionButtons Buttons
+        {
+            get => _buttons;
+            set
+            {
+                if (_buttons != value)
+                {
+                    _buttons = value;
+                    ApplyCaptionButtons();
+                }
+            }
+        }
+
+        private bool _isMaximized;
+        /// <summary>
+        /// Drives the maximize button's glyph, which is a restore glyph while the window is
+        /// zoomed. Set by the host, because only the host knows.
+        /// </summary>
+        public bool IsMaximized
+        {
+            get => _isMaximized;
+            set
+            {
+                if (_isMaximized != value)
+                {
+                    _isMaximized = value;
+
+                    ApplyMaximizeGlyph();
+                }
+            }
+        }
+
+        private ElementTheme _captionTheme = ElementTheme.Default;
+        /// <summary>
+        /// The caption buttons follow the window's theme, except where something paints its own
+        /// colour behind them - a web app whose bot picked the header colour. Only the buttons,
+        /// not the content, which is why it is not just RequestedTheme.
+        /// </summary>
+        public ElementTheme CaptionTheme
+        {
+            get => _captionTheme;
+            set
+            {
+                _captionTheme = value;
+
+                if (CaptionPanel != null)
+                {
+                    CaptionPanel.RequestedTheme = value;
+                }
+            }
+        }
+
+        private CaptionButtons _hotButton;
+        private bool _hotPressed;
+
+        /// <summary>
+        /// Which caption button is lit, and whether it is held. Pushed in by the host rather than
+        /// read from the pointer: on Win32 the drag bar of gate 1.7 is the window under the
+        /// pointer, so the buttons themselves never see one. On UWP nothing calls this - the
+        /// buttons are ordinary buttons there.
+        /// </summary>
+        public void SetCaptionButtonState(CaptionButtons button, bool pressed)
+        {
+            if (_hotButton == button && _hotPressed == pressed)
+            {
+                return;
+            }
+
+            _hotButton = button;
+            _hotPressed = pressed;
+
+            ApplyCaptionButtonStates();
+        }
+
+        /// <summary>
+        /// The window's own caption buttons dim while it is not the active one, the way the shell's
+        /// do. Pushed in by the host: neither the buttons nor the presenter can see activation, and
+        /// on Win32 the pointer is over the drag bar rather than over them.
+        /// </summary>
+        private void GoToCaptionButtonState(Button button, CaptionButtons which, bool useTransitions = true)
+        {
+            if (button == null)
+            {
+                return;
+            }
+
+            var state = _hotButton != which
+                ? _isActive ? "Normal" : "Deactivated"
+                : _hotPressed ? "Pressed" : "PointerOver";
+
+            VisualStateManager.GoToState(button, state, useTransitions);
+        }
+
+        /// <summary>
+        /// Puts the caption buttons into the state the window is actually in.
+        /// </summary>
+        /// <remarks>
+        /// Called from the template as well as from the two pushes, because a template arrives with
+        /// no visual state applied and nothing else applied one: activation only reaches the buttons
+        /// when the value changes, and a window that is active from birth - the common case - never
+        /// changes it. The result was a window whose buttons looked dimmed until it was defocused
+        /// and focused again, which is the first moment <see cref="IsActive"/> actually moved.
+        /// </remarks>
+        /// <param name="useTransitions">False from the template, where there is no state to fade
+        /// from.</param>
+        private void ApplyCaptionButtonStates(bool useTransitions = true)
+        {
+            GoToCaptionButtonState(MinimizeButton, CaptionButtons.Minimize, useTransitions);
+            GoToCaptionButtonState(MaximizeButton, CaptionButtons.Maximize, useTransitions);
+            GoToCaptionButtonState(CloseButton, CaptionButtons.Close, useTransitions);
+        }
+
+        private bool _isActive = true;
+        /// <summary>
+        /// Whether the window is the active one. The system dims its caption glyphs when it is not,
+        /// and nothing about a button's own pointer state says so - the host has to tell us.
+        /// </summary>
+        public bool IsActive
+        {
+            get => _isActive;
+            set
+            {
+                if (_isActive != value)
+                {
+                    _isActive = value;
+
+                    ApplyCaptionButtonStates();
+                }
+            }
+        }
+
+        private void ApplyMaximizeGlyph()
+        {
+            if (MaximizeButton != null)
+            {
+                VisualStateManager.GoToState(MaximizeButton,
+                    _isMaximized ? "WindowStateMaximized" : "WindowStateNormal", false);
+            }
+        }
+
+        protected override void OnApplyTemplate()
+        {
+            if (CloseButton != null)
+            {
+                CloseButton.Click -= OnCloseButtonClick;
+            }
+
+            DetachCaptionRegions();
+
+            ContentHost = GetTemplateChild(nameof(ContentHost)) as ContentPresenter;
+            CaptionPanel = GetTemplateChild(nameof(CaptionPanel)) as StackPanel;
+            MinimizeButton = GetTemplateChild(nameof(MinimizeButton)) as Button;
+            MaximizeButton = GetTemplateChild(nameof(MaximizeButton)) as Button;
+            CloseButton = GetTemplateChild(nameof(CloseButton)) as Button;
+
+            // Only Close is wired, and only UWP clicks it: there it is the only one that can be
+            // drawn at all, and on Win32 and WinUI none of the three ever sees a pointer - the drag
+            // bar of gate 1.7, or the regions reported to the framework, answer the hit test and
+            // turn it into a WM_SYSCOMMAND, which is what earns the snap layouts flyout. The
+            // buttons are what the user sees; the host is what answers.
+            if (CloseButton != null)
+            {
+                CloseButton.Click += OnCloseButtonClick;
+            }
+
+            AttachCaptionRegions();
+
+            if (CaptionPanel != null)
+            {
+                CaptionPanel.RequestedTheme = _captionTheme;
+            }
+
+            // Only where nothing outside the content would take the tab: on UWP the CoreWindow
+            // wraps for us, and making the content a cycle region there turns every focus XAML
+            // has to re-resolve - a programmatic Focus, or the focused element leaving the tree -
+            // into the region's first tab stop.
+            if (ContentHost != null && !WindowContext.HasSystemTabNavigation)
+            {
+                ContentHost.TabFocusNavigation = KeyboardNavigationMode.Cycle;
+            }
+
+            // The window can already be maximized by the time the template arrives.
+            ApplyMaximizeGlyph();
+
+            ApplyCaptionButtons();
+
+            base.OnApplyTemplate();
+
+            // Once each button has a template of its own. GoToState does nothing to a control whose
+            // template has not been applied yet, and ours have not been at this point - so seeding
+            // here would silently do nothing, which is what left the buttons looking unfocused
+            // until the first real activation change.
+            SubscribeCaptionButton(MinimizeButton);
+            SubscribeCaptionButton(MaximizeButton);
+            SubscribeCaptionButton(CloseButton);
+        }
+
+        private void SubscribeCaptionButton(Button button)
+        {
+            if (button != null)
+            {
+                button.Loaded -= OnCaptionButtonLoaded;
+                button.Loaded += OnCaptionButtonLoaded;
+            }
+        }
+
+        private void OnCaptionButtonLoaded(object sender, RoutedEventArgs e)
+        {
+            if (sender is Button button)
+            {
+                // One shot: the pair for this subscription. OnApplyTemplate subscribes again if the
+                // template is ever replaced.
+                button.Loaded -= OnCaptionButtonLoaded;
+            }
+
+            ApplyCaptionButtonStates(false);
+        }
+
+        private void ApplyCaptionButtons()
+        {
+            if (CaptionPanel == null)
+            {
+                return;
+            }
+
+            // The rule that lets one setting serve both hosts: asking for every button is asking
+            // for an ordinary window, and an ordinary UWP window already has all three, drawn by
+            // the shell. Any subset is the app taking over, and then it draws them itself.
+            var mine = !WindowContext.HasSystemCaptionButtons || _buttons != CaptionButtons.All;
+
+            CaptionPanel.Visibility = mine && _buttons != CaptionButtons.None
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
+            if (MinimizeButton != null)
+            {
+                MinimizeButton.Visibility = mine && _buttons.HasFlag(CaptionButtons.Minimize)
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            }
+
+            if (MaximizeButton != null)
+            {
+                MaximizeButton.Visibility = mine && _buttons.HasFlag(CaptionButtons.Maximize)
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            }
+
+            if (CloseButton != null)
+            {
+                CloseButton.Visibility = mine && _buttons.HasFlag(CaptionButtons.Close)
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            }
+
+            UpdateCaptionRegions();
+        }
+
+        /// <summary>
+        /// Where the host has to be told where the buttons are, because it answers the hit test
+        /// for them rather than the buttons themselves. Called whenever their bounds may have
+        /// moved; the template's parts are attached and detached around a template change.
+        /// </summary>
+        partial void UpdateCaptionRegions();
+        partial void AttachCaptionRegions();
+        partial void DetachCaptionRegions();
+
+        /// <summary>
+        /// Through the window's close request rather than straight to WindowContext.Close: a
+        /// handler can have something to ask first - the web app window does - and that is the
+        /// same question the system asks when the window is closed any other way.
+        /// </summary>
+        private async void OnCloseButtonClick(object sender, RoutedEventArgs e)
+        {
+            if (!await _context.RequestCloseAsync())
+            {
+                return;
+            }
+
+            _context.Close();
+        }
+
+        // Counted rather than a flag, because popups nest: MessagePopup.ShowNestedAsync opens a
+        // ModalPopup over a ContentPopup that is still up - that is the whole reason the nested
+        // variants exist - and the inner one closing must not tell the window, or the page under
+        // it, that there is no popup any more. Only the outermost open and close are forwarded.
+        private int _popupDepth;
+
+        public void PopupOpened()
+        {
+            if (_popupDepth++ > 0)
+            {
+                return;
+            }
+
+            _context.RaisePopupActivated(true);
+
+            if (Content is IPopupHost content)
+            {
+                content.PopupOpened();
+            }
+        }
+
+        public void PopupClosed()
+        {
+            if (_popupDepth > 0)
+            {
+                _popupDepth--;
+            }
+
+            if (_popupDepth > 0)
+            {
+                return;
+            }
+
+            _context.RaisePopupActivated(false);
+
+            if (Content is IPopupHost content)
+            {
+                content.PopupClosed();
+            }
+        }
+
+        public void HideAllToasts()
+        {
+            HideAllToasts(true);
+        }
+
+        public void ClearAllToasts()
+        {
+            // Teardown, so nothing is animated: the completion would call back into a window
+            // that is on its way out.
+            HideAllToasts(false);
+        }
+
+        private void HideAllToasts(bool animate)
+        {
+            ToastPopup.HideAll(XamlRoot, animate);
+        }
+    }
+
+    /// <summary>
+    /// A control that re-renders when the window's rasterization scale changes. Raised by
+    /// <see cref="WindowContext"/> rather than subscribed per control - see the registration there.
+    /// </summary>
+    public partial class WindowContext
+    {
+        private readonly InputListener _inputListener;
+        public InputListener InputListener => _inputListener;
+
+        #region Pointer cursor
+
+#if !WINUI3
+        // One CoreCursor per type, shared. Every call site used to allocate a fresh one, and
+        // FormattedTextBlock does this at pointer sample rate; CoreCursor is immutable and its
+        // id argument only means anything for CoreCursorType.Custom, so sharing is safe.
+        // Indexed by PointerCursorType, which is why Hidden - the null cursor - is last.
+        private static readonly CoreCursor[] _cursors = new CoreCursor[(int)PointerCursorType.Hidden];
+
+        /// <summary>
+        /// GetForCurrentThread rather than Window.Current.CoreWindow, which is the same object on
+        /// UWP and one fewer Window.Current.
+        /// </summary>
+        public static void SetPointerCursor(PointerCursorType cursor)
+        {
+            CoreWindow.GetForCurrentThread().PointerCursor = GetPointerCursor(cursor);
+        }
+
+        private static CoreCursor GetPointerCursor(PointerCursorType cursor)
+        {
+            if (cursor == PointerCursorType.Hidden)
+            {
+                return null;
+            }
+
+            // UI thread only, so a lost race would just allocate one extra cursor.
+            return _cursors[(int)cursor] ??= new CoreCursor(cursor switch
+            {
+                PointerCursorType.Hand => CoreCursorType.Hand,
+                PointerCursorType.IBeam => CoreCursorType.IBeam,
+                PointerCursorType.SizeWestEast => CoreCursorType.SizeWestEast,
+                PointerCursorType.SizeNorthSouth => CoreCursorType.SizeNorthSouth,
+                PointerCursorType.SizeNorthwestSoutheast => CoreCursorType.SizeNorthwestSoutheast,
+                PointerCursorType.SizeNortheastSouthwest => CoreCursorType.SizeNortheastSouthwest,
+                _ => CoreCursorType.Arrow
+            }, 0);
+        }
+#endif
+
+        #endregion
+
+        public int Id { get; }
+
+        public Theme Theme => Theme.Current;
+
+        public ThemeParameters ThemeParameters => Theme.GetParameters(ActualTheme);
+
+        #region Chat theme
+
+        // The app theme is global and lives on Theme, merged app-wide so that popups resolve it.
+        // A chat override is not: two windows can show two chats, so each window recolours its
+        // own brushes, and Theme's pair stays as the default nothing has overridden.
+        public MessageBrushes Outgoing { get; } = new("Outgoing", ThemeOutgoing.DefaultLight, ThemeOutgoing.DefaultDark);
+
+        public MessageBrushes Incoming { get; } = new("Incoming", ThemeIncoming.DefaultLight, ThemeIncoming.DefaultDark);
+
+        private Background _lastBackground;
+
+        private ThemeSettings _lastLightSettings;
+        private ThemeSettings _lastDarkSettings;
+
+        private ChatBackground _lastChatBackground;
+        private ChatTheme _lastChatTheme;
+
+        public ThemeSettings LightSettings => _lastLightSettings;
+        public ThemeSettings DarkSettings => _lastDarkSettings;
+
+        public ChatBackground ChatBackground => _lastChatBackground;
+
+        public ChatTheme ChatTheme => _lastChatTheme;
+
+        /// <summary>
+        /// Re-applies this window's override after the app theme has been recomputed underneath
+        /// it, falling back to the app-wide chat theme when the window has none of its own.
+        /// </summary>
+        public void ReapplyChatTheme()
+        {
+            UpdateMessages(_lastLightSettings, _lastDarkSettings);
+        }
+
+        public bool UpdateChatTheme(ElementTheme elementTheme, ChatTheme theme, ThemeSettings lightSettings, ThemeSettings darkSettings, ChatBackground background)
+        {
+            var requested = elementTheme == ElementTheme.Dark ? TelegramTheme.Dark : TelegramTheme.Light;
+            var settings = requested == TelegramTheme.Light ? lightSettings : darkSettings;
+
+            // Both sides, because both have to be right before the base flips - the switch itself
+            // recolours nothing. Comparing both accents rather than the current one: two themes
+            // can share a light accent and differ in dark.
+            var changed = _lastLightSettings?.AccentColor != lightSettings?.AccentColor
+                || _lastDarkSettings?.AccentColor != darkSettings?.AccentColor;
+
+            _lastLightSettings = lightSettings;
+            _lastDarkSettings = darkSettings;
+            _lastChatTheme = settings != null ? theme : null;
+
+            if (changed)
+            {
+                UpdateMessages(lightSettings, darkSettings);
+            }
+
+            var nextBackground = background?.Background;
+            if (settings != null)
+            {
+                nextBackground ??= settings.Background;
+            }
+
+            var updated = !_lastBackground.AreTheSame(nextBackground);
+
+            _lastBackground = nextBackground;
+            _lastChatBackground = background;
+
+            return updated;
+        }
+
+        private void UpdateMessages(ThemeSettings lightSettings, ThemeSettings darkSettings)
+        {
+            Apply(TelegramTheme.Light, lightSettings);
+            Apply(TelegramTheme.Dark, darkSettings);
+
+            ChatThemeChanged?.Invoke(this, null);
+
+            void Apply(TelegramTheme requested, ThemeSettings settings)
+            {
+                // Parent, not requested: the base theme comes from the settings, so a light slot
+                // can resolve into the dark family.
+                var info = Theme.Resolve(requested, settings);
+
+                Outgoing.Update(info?.Parent ?? requested, info?.Values);
+                Incoming.Update(info?.Parent ?? requested, info?.Values);
+            }
+        }
+
+        public event EventHandler ChatThemeChanged;
+
+        #endregion
+
+#if NET9_0_OR_GREATER || true
+        // A stuck finalizer must not keep a closed window alive, so the drain is bounded.
+        private static readonly TimeSpan ShutdownDrainTimeout = TimeSpan.FromSeconds(10);
+
+        private Task _drain;
+        private Deferral _deferral;
+
+        private void OnShutdownStarting(DispatcherQueue sender, DispatcherQueueShutdownStartingEventArgs args)
+        {
+            sender.ShutdownStarting -= OnShutdownStarting;
+
+            // This view's RCWs are context bound. Released from the finalizer thread they marshal
+            // back here through IContextCallback, and once the XAML core is gone unparenting one
+            // faults on a null CCoreServices - the access violation seen a moment after closing a
+            // window that held a FormattedTextBlock, whose runs are XamlDirect objects.
+            //
+            // So collect while this thread still pumps and XAML is still up. The deferral is what
+            // keeps it pumping; the wait has to run off-thread, because blocking here would block
+            // the very apartment the finalizer needs to call into.
+            _deferral = args.GetDeferral();
+
+            // ShutdownStarting is raised before the Unloaded cascade that OnConsolidated queued
+            // when it dropped the content, so releasing here would hand disposed handles to
+            // handlers that have not run yet. Queue behind them instead - the deferral is what
+            // keeps the thread pumping long enough for that to be dispatched. If the queue will
+            // not take the work, release now anyway: a live handle past teardown is the crash
+            // this exists to prevent, and _released covers the handlers that follow.
+            if (!sender.TryEnqueue(DispatcherQueuePriority.Low, OnShutdownDrain))
+            {
+                Logger.Info("queue refused, releasing inline");
+                OnShutdownDrain();
+            }
+        }
+
+        private void OnShutdownDrain()
+        {
+            ReleaseNative();
+
+            _drain = Task.Run(Drain);
+
+            Task.WhenAny(_drain, Task.Delay(ShutdownDrainTimeout))
+                .ContinueWith(OnDrained, _deferral, TaskScheduler.Default);
+        }
+
+        private void ReleaseNative()
+        {
+#if NET9_0_OR_GREATER
+            FormattedTextBlock.ReleaseNative(_xamlRoot);
+            FormattedTextBlockRecyclePool.Release(_xamlRoot);
+#endif
+
+            AnimatedImageLoader.Release(_xamlRoot);
+
+            _content?.ClearAllToasts();
+        }
+
+        // DIAGNOSTIC: the releases still fault after this drain, and the two explanations want
+        // opposite fixes - either the drain lost its race against a few hundred blocking
+        // cross-apartment releases, or the peers were still reference-tracked by the native tree
+        // and there was nothing here to collect. A pass that finishes in milliseconds means the
+        // second; one that hits the timeout means the first. Logger's tail ships with the crash.
+        private static void Drain()
+        {
+            var started = Logger.TickCount;
+            var before = GC.GetTotalMemory(false);
+
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+
+            var first = Logger.TickCount - started;
+
+            // A release freed by the first pass can unroot the next wrapper along.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+
+            Logger.Info($"first pass {first}ms, second {Logger.TickCount - started - first}ms, heap {before >> 10}K -> {GC.GetTotalMemory(false) >> 10}K");
+        }
+
+        private void OnDrained(Task task, object state)
+        {
+            Logger.Info(_drain.IsCompleted ? "drained" : $"timed out after {ShutdownDrainTimeout.TotalMilliseconds}ms");
+
+            (state as Deferral)?.Complete();
+        }
+#endif
+
+        public bool IsInMainView { get; }
+
+        public bool IsCallInProgress { get; private set; }
+
+        public XamlRoot XamlRoot => _content?.XamlRoot;
+
+        private bool _contentMaterial;
+
+        private WindowPresenter _content;
+        /// <summary>
+        /// Characters typed into this window that nothing in the tree consumed. Raised from the
+        /// window's root element, so it replaces <c>CoreWindow.CharacterReceived</c> without
+        /// needing a CoreWindow - which WinUI does not have.
+        /// </summary>
+        public event TypedEventHandler<WindowContext, CharacterReceivedRoutedEventArgs> CharacterReceived;
+
+        private void OnContentCharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
+        {
+            if (args.OriginalSource is TextBox or RichEditBox)
+            {
+                return;
+            }
+
+            CharacterReceived?.Invoke(this, args);
+        }
+
+        private CaptionButtons _captionButtons = CaptionButtons.All;
+
+        /// <summary>
+        /// Which caption buttons this window draws for itself. Kept here rather than on the
+        /// presenter because a root sets it from its constructor, which is before there is a
+        /// presenter to set it on.
+        /// </summary>
+        public CaptionButtons CaptionButtons
+        {
+            get => _captionButtons;
+            set
+            {
+                _captionButtons = value;
+
+                if (_content != null)
+                {
+                    _content.Buttons = value;
+                }
+
+                SetHostCaptionButtons(value);
+            }
+        }
+
+        /// <summary>
+        /// What the host has to do about it: take the shell's own caption away on UWP, the
+        /// framework's caption on WinUI. Only called when a window asks for something other than
+        /// the default, so an ordinary window touches none of them.
+        /// </summary>
+        partial void SetHostCaptionButtons(CaptionButtons buttons);
+
+        /// <summary>
+        /// Only WinUI can refuse it: a UWP view is always resizable.
+        /// </summary>
+        public void SetResizable(bool resizable) => SetHostResizable(resizable);
+
+        partial void SetHostResizable(bool resizable);
+
+        private ElementTheme _captionTheme = ElementTheme.Default;
+
+        /// <summary>
+        /// The theme the caption buttons are drawn against, for a window that paints its own
+        /// colour behind them.
+        /// </summary>
+        public ElementTheme CaptionTheme
+        {
+            get => _captionTheme;
+            set
+            {
+                _captionTheme = value;
+
+                if (_content != null)
+                {
+                    _content.CaptionTheme = value;
+                }
+            }
+        }
+
+        public UIElement Content
+        {
+            get => _locked != null ? _lockedContent : _content?.Content as UIElement;
+            set
+            {
+                if (_locked != null)
+                {
+                    _lockedContent = value;
+                }
+                else
+                {
+                    SetContent(value);
+                }
+
+                IsCallInProgress = value is VoipWindow or GroupCallWindow or LiveStreamWindow;
+            }
+        }
+
+        /// <summary>
+        /// Hands the root element to whatever this host shows it in - a <c>Window</c> on UWP, a
+        /// <c>DesktopWindowXamlSource</c> on Win32.
+        /// </summary>
+        partial void SetHostContent(UIElement content);
+
+        partial void SetScreenCaptureEnabled(bool enabled);
+
+        /// <summary>
+        /// The window's own backdrop. WinUI 2's BackdropMaterial on UWP; the window's
+        /// SystemBackdrop on WinUI.
+        /// </summary>
+        partial void SetBackdropMaterial(WindowPresenter content);
+
+        private void SetContent(UIElement content)
+        {
+            if (_content != null)
+            {
+                _content.Content = content;
+            }
+            else
+            {
+                // Before the content exists, so ActualTheme comes from GetCalculatedElementTheme
+                // rather than from an element that is not in a tree yet and has nothing to
+                // inherit from.
+                ReapplyChatTheme();
+
+                _content = new WindowPresenter(this)
+                {
+                    RequestedTheme = NightModeService.Current.GetCalculatedElementTheme(),
+                    Buttons = _captionButtons,
+                    CaptionTheme = _captionTheme,
+                    Content = content,
+                    HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                    VerticalContentAlignment = VerticalAlignment.Stretch
+                };
+
+                _content.Loaded += OnLoaded;
+                _content.Unloaded += OnUnloaded;
+
+                // Deliberately +=, not AddHandler(handledEventsToo): a focused TextBox or
+                // RichEditBox marks the character handled, so it never reaches here - which is
+                // what the type-to-search sites used to approximate with a FocusManager check.
+                _content.CharacterReceived += OnContentCharacterReceived;
+
+                _content.Resources.MergedDictionaries.Add(Incoming.CreateDictionary());
+
+                SetHostContent(_content);
+
+                // XamlRoot becomes available instantly as the content is set to the Window - on
+                // UWP. WinUI 3 creates the content island later, so XamlRoot is still null here
+                // and the registration waits for Loaded, which is hooked above either way.
+                if (_content.XamlRoot != null)
+                {
+                    RegisterXamlRoot();
+                }
+            }
+
+            if (!_contentMaterial && content is RootWindow or StandaloneWindow or TabbedWindow or WalletWindow or RichTextWindow)
+            {
+                _contentMaterial = true;
+                SetBackdropMaterial(_content);
+            }
+        }
+
+        /// <summary>
+        /// The XamlRoot and everything keyed on it. Called from SetContent where the root is
+        /// already there, and from OnLoaded where it arrives later.
+        /// </summary>
+        private void RegisterXamlRoot()
+        {
+            lock (_allLock)
+            {
+                _xamlRoot = _content.XamlRoot;
+                _mapping.AddOrUpdate(_xamlRoot, this);
+            }
+        }
+
+        private void OnLoaded(object sender, RoutedEventArgs e)
+        {
+            if (sender is Control control)
+            {
+                control.Loaded -= OnLoaded;
+            }
+
+            // Where it lands on WinUI 3: the content island exists by the time the presenter is
+            // loaded, so this is the first moment there is a XamlRoot to register.
+            if (_xamlRoot == null && _content?.XamlRoot != null)
+            {
+                RegisterXamlRoot();
+            }
+
+            ViewService.OnWindowLoaded();
+        }
+
+        private void OnUnloaded(object sender, RoutedEventArgs e)
+        {
+            if (sender is Control control)
+            {
+                control.Unloaded -= OnUnloaded;
+            }
+
+#if NET9_0_OR_GREATER
+            ReleaseNative();
+#endif
+        }
+
+        /// <summary>
+        /// Drops everything the window owns that outlives its host: the XamlRoot mapping, the
+        /// navigation services and the content. Each host calls this from its own close path.
+        /// </summary>
+        private void Detach()
+        {
+            // Last moment this thread can walk its own tree: a closed view stops pumping, and from
+            // any other thread its controls can only be counted.
+            Instrumentation.Capture();
+
+            lock (_allLock)
+            {
+                if (_xamlRoot != null)
+                {
+                    _mapping.Remove(_xamlRoot);
+                }
+
+                All.Remove(this);
+
+                // Main is a window that can now be gone: a host where closing to the notification
+                // area icon really closes it has to be able to make another one, and
+                // ResolveWindowContext keys that off Main being null.
+                if (Main == this)
+                {
+                    Main = null;
+                }
+            }
+
+            // A window closed while it was up never sees a deactivation, so the count is taken
+            // back here rather than raised: the events themselves have no business firing at a
+            // window that is being torn down.
+            if (_countedActive)
+            {
+                _countedActive = false;
+                ActiveTime.Focused.Set(false);
+            }
+
+            if (_countedVisible)
+            {
+                _countedVisible = false;
+                ActiveTime.Visible.Set(false);
+            }
+
+            foreach (var service in GetNavigationServices())
+            {
+                service.Suspend();
+            }
+
+            _content = null;
+        }
+
+        public ElementTheme ActualTheme => _content?.ActualTheme ?? NightModeService.Current.GetCalculatedElementTheme();
+
+        public ElementTheme RequestedTheme
+        {
+            get => _content?.RequestedTheme ?? ElementTheme.Default;
+            set
+            {
+                if (_content?.RequestedTheme != value)
+                {
+                    _content?.RequestedTheme = value;
+                    ChatThemeChanged?.Invoke(this, null);
+                }
+            }
+        }
+
+        public double RasterizationScale => _content?.XamlRoot?.RasterizationScale ?? 1;
+
+        public bool IsPopupOpened { get; private set; }
+
+        public event EventHandler<PopupActivatedEventArgs> PopupActivated;
+
+        public void RaisePopupActivated(bool opened)
+        {
+            IsPopupOpened = opened;
+            PopupActivated?.Invoke(this, new PopupActivatedEventArgs(opened));
+        }
+
+        public event EventHandler<WindowActivatedEventArgs> Activated;
+
+        // Written by RaiseActivated and nothing else, so neither property below can disagree with
+        // the event that announced the change. UWP seeds it from its constructor too.
+        private WindowActivationMode _activationMode;
+
+        /// <summary>
+        /// The window is activated, foreground or not. Every caller of the old
+        /// <c>ActivationMode</c> but one was asking this.
+        /// </summary>
+        public bool IsActive => _activationMode != WindowActivationMode.Deactivated;
+
+        /// <summary>
+        /// Distinct from <see cref="IsActive"/> only on UWP, where a window can be activated without
+        /// being in the foreground; that middle state is deliberately neither - see
+        /// ChatView.Window_Activated, the only caller that needs the difference.
+        /// </summary>
+        public bool IsForeground => _activationMode == WindowActivationMode.ActivatedInForeground;
+
+        /// <summary>
+        /// Every host funnels through here, so the time the app spends in front of someone is
+        /// counted in one place. Idempotent on purpose: a host that raises the state it is already
+        /// in must not unbalance the count.
+        ///
+        /// The static Active goes with it: it is what NotificationsService asks which window to
+        /// show a toast over.
+        /// </summary>
+        private void RaiseActivated(WindowActivationMode mode)
+        {
+            _activationMode = mode;
+
+            var active = mode != WindowActivationMode.Deactivated;
+
+            if (_content != null)
+            {
+                _content.IsActive = active;
+            }
+
+            if (_countedActive != active)
+            {
+                _countedActive = active;
+                ActiveTime.Focused.Set(active);
+            }
+
+            Activated?.Invoke(this, new WindowActivatedEventArgs(active));
+
+            lock (_activeLock)
+            {
+                if (active)
+                {
+                    Active = this;
+                }
+                else if (Active == this)
+                {
+                    Active = null;
+                }
+            }
+        }
+
+        public event EventHandler<WindowVisibilityEventArgs> VisibilityChanged;
+
+        private void RaiseVisibilityChanged(bool visible)
+        {
+            if (_countedVisible != visible)
+            {
+                _countedVisible = visible;
+                ActiveTime.Visible.Set(visible);
+            }
+
+            VisibilityChanged?.Invoke(this, new WindowVisibilityEventArgs(visible));
+        }
+
+        // Only ever read by RaiseActivated and RaiseVisibilityChanged, which is why they are not
+        // IsActive and IsVisible: those answer what the window is doing now, these two remember
+        // what was counted, so that Detach can take it back off.
+        private bool _countedActive;
+        private bool _countedVisible;
+
+        public event EventHandler<WindowSizeChangedEventArgs> SizeChanged;
+
+        public event EventHandler<object> VisibleBoundsChanged;
+
+        private EventHandler<WindowCloseRequestedEventArgs> _closeRequested;
+
+        /// <summary>
+        /// Where a close request arrives, whoever asked: the system, the app's own caption
+        /// button.
+        ///
+        /// The system half is attached only while someone is listening. Registering with
+        /// SystemNavigationManagerPreview is what makes the shell ask this view before closing it,
+        /// and a window nobody is listening to has nothing to answer with.
+        /// </summary>
+        public event EventHandler<WindowCloseRequestedEventArgs> CloseRequested
+        {
+            add
+            {
+                if (_closeRequested == null)
+                {
+                    AttachCloseRequested();
+                }
+
+                _closeRequested += value;
+            }
+            remove
+            {
+                _closeRequested -= value;
+
+                if (_closeRequested == null)
+                {
+                    DetachCloseRequested();
+                }
+            }
+        }
+
+        // Implemented by whichever host has a system-level request to forward.
+        partial void AttachCloseRequested();
+
+        partial void DetachCloseRequested();
+
+        private void RaiseCloseRequested(WindowCloseRequestedEventArgs args)
+        {
+            _closeRequested?.Invoke(this, args);
+        }
+
+        /// <summary>
+        /// The app asking to close this window - the caption button - routed
+        /// into the same event the system's own request raises, so a handler has one place to
+        /// intercept a close whatever asked for it. Returns false when a handler refused.
+        ///
+        /// Awaited, because the answer can be a question: the web app window takes a deferral and
+        /// asks the user whether to discard the bot's changes.
+        /// </summary>
+        internal async Task<bool> RequestCloseAsync()
+        {
+            var args = new WindowCloseRequestedEventArgs();
+            RaiseCloseRequested(args);
+
+            await args.WaitAsync();
+
+            return !args.Handled;
+        }
+
+        public event EventHandler Closed;
+
+        /// <summary>
+        /// Before Detach, while the tree is still loaded: roots hear this through a subscription
+        /// their Unloaded removes.
+        /// </summary>
+        private void RaiseClosed()
+        {
+            // We forcefully close any ContentDialog still open.
+            if (_xamlRoot != null)
+            {
+                foreach (var popup in VisualTreeHelper.GetOpenPopupsForXamlRoot(_xamlRoot))
+                {
+                    if (popup.Child is ContentDialog dialog)
+                    {
+                        dialog.Hide();
+                    }
+                }
+            }
+
+            Closed?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// The system's caption buttons moved, appeared or went away over a window that draws its
+        /// own title bar: <see cref="SystemOverlayLeftInset"/> and its right twin are what changed.
+        /// </summary>
+        public event EventHandler<object> TitleBarChanged;
+
+        /// <summary>
+        /// A key, ahead of the focused control. UWP has CoreDispatcher.AcceleratorKeyActivated for
+        /// this and no other host does, so the input listeners raise it instead - which is also
+        /// what keeps a page from having to know which host it is running on.
+        /// </summary>
+        public event EventHandler<AcceleratorKeyActivatedEventArgs> AcceleratorKeyActivated;
+
+        internal bool RaiseAcceleratorKeyActivated(VirtualKey key)
+        {
+            var handler = AcceleratorKeyActivated;
+            if (handler == null)
+            {
+                return false;
+            }
+
+            var args = new AcceleratorKeyActivatedEventArgs(key);
+            handler(this, args);
+
+            return args.Handled;
+        }
+
+        public IDispatcherContext Dispatcher { get; }
+
+        /// <summary>
+        /// The service the window's content owns. Not the one GetNavigationService returns: that
+        /// is where navigation should go, which in the main window is MainPage's detail frame.
+        /// </summary>
+        public INavigationService RootNavigationService => (Content as INavigationHost)?.NavigationService;
+
+        /// <summary>
+        /// Outermost first: the service the content owns, then the one owned by the page that
+        /// service shows, and so on down.
+        /// </summary>
+        private List<INavigationService> GetNavigationServices()
+        {
+            var services = new List<INavigationService>(2);
+            var service = RootNavigationService;
+
+            while (service != null && !services.Contains(service))
+            {
+                services.Add(service);
+                service = (service.Frame?.Content as INavigationHost)?.NavigationService;
+            }
+
+            return services;
+        }
+
+        private static INavigationService ResolveNavigationService(UIElement content)
+        {
+            if (content is RootWindow rootPage && rootPage.NavigationService != null)
+            {
+                return rootPage.NavigationService;
+            }
+            else if (content is StandaloneWindow standalonePage && standalonePage.NavigationService != null)
+            {
+                return standalonePage.NavigationService;
+            }
+            else if (content is Page { DataContext: ViewModelBase viewModel })
+            {
+                return viewModel.NavigationService;
+            }
+
+            return null;
+        }
+
+        // Only the main window takes part. A secondary window cannot be dispatched into while the
+        // app suspends, and on Win32, where every window shares one thread, HasThreadAccess alone
+        // would let them all through.
+        public static void SuspendMain()
+        {
+            var window = Main;
+            if (window != null && window.Dispatcher.HasThreadAccess)
+            {
+                foreach (var service in window.GetNavigationServices())
+                {
+                    service.Suspend();
+                }
+            }
+        }
+
+        public static void ResumeMain()
+        {
+            var window = Main;
+            if (window != null && window.Dispatcher.HasThreadAccess)
+            {
+                foreach (var service in window.GetNavigationServices())
+                {
+                    service.Resume();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Brings the main window to the foreground, opening it again first where it was closed to
+        /// the notification area icon - which on the desktop hosts destroys it, leaving Main null.
+        /// </summary>
+        /// <returns>The main window, or null if it could not be opened.</returns>
+        public static async Task<WindowContext> SwitchToMainAsync()
+        {
+            if (Main == null)
+            {
+                BootStrapper.Current.ActivateFromNotifyIcon();
+            }
+
+            var window = Main;
+            if (window != null)
+            {
+                await window.SwitchToAsync();
+            }
+
+            return window;
+        }
+
+        public static INavigationService GetNavigationService(UIElement element)
+        {
+            var context = ForXamlRoot(element);
+            if (context != null)
+            {
+                return context.GetNavigationService();
+            }
+
+            return null;
+        }
+
+        public static INavigationService GetNavigationService(XamlRoot xamlRoot)
+        {
+            var context = ForXamlRoot(xamlRoot);
+            if (context != null)
+            {
+                return context.GetNavigationService();
+            }
+
+            return null;
+        }
+
+        #region Screen capture
+
+        private readonly HashSet<int> _screenCaptureDisabled = new();
+        private bool _screenCaptureEnabled = true;
+
+        public void DisableScreenCapture(int hash)
+        {
+            if (Constants.DEBUG)
+            {
+                return;
+            }
+
+            _screenCaptureDisabled.Add(hash);
+
+            if (_screenCaptureDisabled.Count == 1 && _screenCaptureEnabled)
+            {
+                _screenCaptureEnabled = false;
+                SetScreenCaptureEnabled(false);
+            }
+        }
+
+        public void EnableScreenCapture(int hash)
+        {
+            if (Constants.DEBUG)
+            {
+                return;
+            }
+
+            _screenCaptureDisabled.Remove(hash);
+
+            if (_screenCaptureDisabled.Count == 0 && !_screenCaptureEnabled)
+            {
+                _screenCaptureEnabled = true;
+                SetScreenCaptureEnabled(true);
+            }
+        }
+
+        #endregion
+
+        #region Lock
+
+        private UIElement _lockedContent;
+        private PasscodeWindow _locked;
+
+        public void Lock(bool biometrics)
+        {
+            if (_locked != null)
+            {
+                return;
+            }
+
+            if (_content?.Content is IPopupHost popupHost)
+            {
+                popupHost.PopupOpened();
+            }
+
+            Logger.Info("Showing passcode lock");
+
+            // TODO: Transition from splash screen to passcode
+            _locked = new PasscodeWindow(this, biometrics && IsInMainView);
+            _lockedContent = _content?.Content as UIElement;
+
+            SetContent(_locked);
+        }
+
+        public void Unlock()
+        {
+            if (_locked == null)
+            {
+                return;
+            }
+
+            Logger.Info("Hiding passcode lock");
+
+            SetContent(_lockedContent);
+
+            _locked = null;
+            _lockedContent = null;
+
+            if (_content.Content is IPopupHost popupHost)
+            {
+                popupHost.PopupClosed();
+            }
+
+            if (_content.Content is Control control)
+            {
+                control.Focus(FocusState.Programmatic);
+            }
+        }
+
+        #endregion
+
+        // Activation, and it is app logic rather than host plumbing: it switches on the
+        // authorization state and navigates. IActivatedEventArgs is a projection both hosts
+        // have - a packaged Win32 app is activated with the same args - so this is shared,
+        // and only the title bar it used to sit beside is per host.
+        #region Legacy code
+
+        public async void Activate(IActivatedEventArgs args, INavigationService service, AuthorizationState state)
+        {
+            try
+            {
+                switch (state)
+                {
+                    case AuthorizationStateReady:
+                        //App.Current.NavigationService.Navigate(typeof(Views.MainPage));
+                        Activate(args, service);
+                        break;
+                    case AuthorizationStateWaitPhoneNumber:
+                    case AuthorizationStateWaitOtherDeviceConfirmation:
+                        service.Navigate(typeof(AuthorizationPage));
+                        break;
+                    case AuthorizationStateWaitCode:
+                        service.Navigate(typeof(AuthorizationCodePage), navigationStackEnabled: false);
+                        break;
+                    case AuthorizationStateWaitEmailAddress:
+                        service.Navigate(typeof(AuthorizationEmailAddressPage), navigationStackEnabled: false);
+                        break;
+                    case AuthorizationStateWaitEmailCode:
+                        service.Navigate(typeof(AuthorizationEmailCodePage), navigationStackEnabled: false);
+                        break;
+                    case AuthorizationStateWaitRegistration:
+                        service.Navigate(typeof(AuthorizationRegistrationPage), navigationStackEnabled: false);
+                        break;
+                    case AuthorizationStateWaitPassword waitPassword:
+                        if (!string.IsNullOrEmpty(waitPassword.RecoveryEmailAddressPattern))
+                        {
+                            await service.ShowPopupAsync(string.Format(Strings.RestoreEmailSent, waitPassword.RecoveryEmailAddressPattern), Strings.AppName, Strings.OK);
+                        }
+
+                        service.Navigate(typeof(AuthorizationPasswordPage), navigationStackEnabled: false);
+                        break;
+                }
+            }
+            catch { }
+        }
+
+        private async void Activate(IActivatedEventArgs args, INavigationService service)
+        {
+            service ??= Current.RootNavigationService;
+
+            if (service == null || args == null)
+            {
+                return;
+            }
+
+            if (args is ShareTargetActivatedEventArgs share)
+            {
+            }
+            else if (args is IProtocolActivatedEventArgs protocol)
+            {
+                if (service?.Frame?.Content is MainPage page)
+                {
+                    page.Activate(protocol.Uri.ToString());
+                }
+                else
+                {
+                    service.NavigateToMain(protocol.Uri.ToString());
+                }
+            }
+            else if (args is FileActivatedEventArgs file)
+            {
+                if (service?.Frame?.Content is MainPage page)
+                {
+                    //page.Activate(launch);
+                }
+                else
+                {
+                    service.NavigateToMain(string.Empty);
+                }
+
+                if (file.Files[0] is StorageFile item)
+                {
+                    // TODO: WinUI - most likely XamlRoot is going to be null at this stage.
+                    // As well, Content may be null too.
+                    var clientService = service.Session.Resolve<IClientService>();
+                    var theme = await ThemeCustomInfo.FromFileAsync(clientService, item);
+                    if (theme != null)
+                    {
+                        _ = new ThemePreviewPopup(clientService, item, theme).ShowQueuedAsync(XamlRoot);
+                    }
+                }
+            }
+            else if (args is CommandLineActivatedEventArgs commandLine)
+            {
+                Activate(commandLine.Operation.Arguments, service);
+            }
+            else if (args is IToastNotificationActivatedEventArgs toastNotificationActivated)
+            {
+                Activate(toastNotificationActivated.Argument, service);
+            }
+            else
+            {
+                var launch = args as LaunchActivatedEventArgs;
+                Activate(launch?.Arguments, service);
+            }
+        }
+
+        private void Activate(string arguments, INavigationService service)
+        {
+            if (service?.Frame?.Content is MainPage page)
+            {
+                page.Activate(arguments);
+            }
+            else
+            {
+                service.NavigateToMain(arguments);
+            }
+        }
+
+        #endregion
+        #region Static code
+
+        // The actions walk a copy. Dispatching to a window from its own thread runs the action
+        // inline, and on a host where every window shares one thread that is every window: an
+        // action that closes its window then removes it from All while All is being walked.
+        private static WindowContext[] Snapshot()
+        {
+            lock (_allLock)
+            {
+                return All.ToArray();
+            }
+        }
+
+        public static void ForEach(Action<WindowContext> action)
+        {
+            foreach (var window in Snapshot())
+            {
+                window.Dispatcher.Dispatch(() => action(window));
+            }
+        }
+
+        public static Task ForEachAsync(Func<WindowContext, Task> action)
+        {
+            var windows = Snapshot();
+            var tasks = new Task[windows.Length];
+
+            for (int i = 0; i < windows.Length; i++)
+            {
+                var window = windows[i];
+                tasks[i] = window.Dispatcher.DispatchAsync(() => action(window));
+            }
+
+            return Task.WhenAll(tasks);
+        }
+
+        public static Task ForEachAsync(Action<WindowContext> action)
+        {
+            var windows = Snapshot();
+            var tasks = new Task[windows.Length];
+
+            for (int i = 0; i < windows.Length; i++)
+            {
+                var window = windows[i];
+                tasks[i] = window.Dispatcher.DispatchAsync(() => action(window));
+            }
+
+            return Task.WhenAll(tasks);
+        }
+
+        // Weak on the key, so a window that skips OnClosed cannot pin its own tree, and the
+        // entry a context holds back to its XamlRoot is what dependent handles exist for. Reads
+        // need no lock, which matters because every MessageBubble resolves its window through
+        // here as it loads.
+        private static readonly ConditionalWeakTable<XamlRoot, WindowContext> _mapping = new();
+        private XamlRoot _xamlRoot;
+
+        public static bool TryGetForXamlRoot(XamlRoot xamlRoot, out WindowContext context)
+        {
+            context = ForXamlRoot(xamlRoot);
+            return context != null;
+        }
+
+        public static WindowContext ForXamlRoot(XamlRoot xamlRoot)
+        {
+            if (xamlRoot != null && _mapping.TryGetValue(xamlRoot, out WindowContext context))
+            {
+                return context;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// The window handle behind a XamlRoot - a CoreWindow's on UWP, the window's HWND on WinUI.
+        /// <c>IntPtr.Zero</c> if the root belongs to no window this app knows about.
+        /// </summary>
+        public static IntPtr GetWindowHandle(XamlRoot xamlRoot)
+        {
+            var context = ForXamlRoot(xamlRoot);
+            return context != null ? (IntPtr)context.Handle : IntPtr.Zero;
+        }
+
+        public static WindowContext ForXamlRoot(UIElement element)
+        {
+            return ForXamlRoot(element?.XamlRoot);
+        }
+
+        private static readonly object _allLock = new();
+        public static readonly List<WindowContext> All = new();
+
+        private static readonly object _activeLock = new();
+        public static WindowContext Active;
+
+        public static WindowContext Main;
+
+        #endregion
+
+        #region Navigation
+
+        public bool RaiseShortcutInvoked(InvokedShortcut shortcut, VirtualKeyModifiers modifiers)
+        {
+            var args = new ShortcutInvokedEventArgs(shortcut, modifiers);
+            var services = GetNavigationServices();
+
+            for (int i = services.Count - 1; i >= 0; i--)
+            {
+                services[i].FrameFacade.RaiseShortcutInvoked(args);
+
+                if (args.Handled)
+                {
+                    return true;
+                }
+            }
+
+            foreach (var command in shortcut.Commands)
+            {
+                ProcessWindowCommands(command, args);
+
+                if (args.Handled)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Answers the commands that mean the same thing in every window.
+        /// </summary>
+        /// <remarks>
+        /// A fallback, not a competitor: the pages above get first refusal, and anything
+        /// context-sensitive - Search, the chat and folder commands - stays with them. This exists
+        /// because a window with no navigation service has no page to answer these at all, so a
+        /// call window used to drop Ctrl+Q entirely, and because two pages were otherwise carrying
+        /// the same arms.
+        /// </remarks>
+        private void ProcessWindowCommands(ShortcutCommand command, ShortcutInvokedEventArgs args)
+        {
+            switch (command)
+            {
+                // Neither of these marks the args handled, the same as before they moved here:
+                // the window is going away and nothing is left to route the key to.
+                case ShortcutCommand.Quit:
+                    _ = QuitAsync();
+                    break;
+                case ShortcutCommand.Close:
+                    _ = ConsolidateAsync();
+                    break;
+
+                case ShortcutCommand.Lock:
+                    LifetimeService.Current.Passcode.Lock(false);
+                    args.Handled = true;
+                    break;
+
+                case ShortcutCommand.MediaPlayPause:
+                case ShortcutCommand.MediaPrevious:
+                case ShortcutCommand.MediaNext:
+                    args.Handled = ProcessPlaybackCommand(command);
+                    break;
+                case ShortcutCommand.MediaStop:
+                    LifetimeService.Current.Playback.Clear();
+                    args.Handled = true;
+                    break;
+
+                // The coordinator is app-wide rather than per session, so a call ringing on an
+                // account other than the one on screen is answered too.
+                case ShortcutCommand.CallAccept:
+                    if (LifetimeService.Current.Voip.ActiveCall is VoipCall accept)
+                    {
+                        accept.Accept(false);
+                        args.Handled = true;
+                    }
+                    break;
+                case ShortcutCommand.CallReject:
+                    if (LifetimeService.Current.Voip.ActiveCall is VoipCall reject)
+                    {
+                        reject.Discard();
+                        args.Handled = true;
+                    }
+                    break;
+            }
+        }
+
+        private static async Task QuitAsync()
+        {
+            await SystemTray.HideAsync();
+            await BootStrapper.ConsolidateAsync();
+        }
+
+        /// <summary>
+        /// Runs a playback command, and reports whether there was anything to run it on.
+        /// </summary>
+        /// <remarks>
+        /// With nothing loaded the chord is left unhandled rather than swallowed: these arrive on
+        /// ordinary letter chords, not media keys, so something else may still want them.
+        /// </remarks>
+        private static bool ProcessPlaybackCommand(ShortcutCommand command)
+        {
+            var playback = LifetimeService.Current.Playback;
+
+            if (playback.CurrentItem == null)
+            {
+                return false;
+            }
+
+            if (command == ShortcutCommand.MediaNext)
+            {
+                playback.MoveNext();
+            }
+            else if (command == ShortcutCommand.MediaPrevious)
+            {
+                playback.MovePrevious();
+            }
+            else if (playback.PlaybackState == PlaybackState.Playing)
+            {
+                playback.Pause();
+            }
+            else
+            {
+                playback.Play();
+            }
+
+            return true;
+        }
+
+        public bool RaiseBackRequested(VirtualKey key = VirtualKey.GoBack)
+        {
+            var handled = false;
+            RaiseBackRequested(key, ref handled);
+            return handled;
+        }
+
+        /// <summary>
+        /// Default Hardware/Shell Back handler overrides standard Back behavior 
+        /// that navigates to previous app in the app stack to instead cause a backward page navigation.
+        /// Views or Viewodels can override this behavior by handling the BackRequested 
+        /// event and setting the Handled property of the BackRequestedEventArgs to true.
+        /// </summary>
+        private void RaiseBackRequested(VirtualKey key, ref bool handled)
+        {
+            Logger.Info();
+
+            var args = new BackRequestedRoutedEventArgs(key);
+            var popups = VisualTreeHelper.GetOpenPopupsForXamlRoot(XamlRoot);
+
+            foreach (var popup in popups)
+            {
+                if (popup.Child is INavigablePage page)
+                {
+                    page.OnBackRequested(args);
+
+                    if (handled = args.Handled)
+                    {
+                        return;
+                    }
+                }
+                else if (popup.Child is ContentDialog dialog)
+                {
+                    dialog.Hide();
+                    return;
+                }
+                else if (popup.Child is ToolTip toolTip)
+                {
+                    toolTip.IsOpen = false;
+                }
+                else if (popup.Child is ToastPopup toast)
+                {
+                    toast.IsOpen = false;
+                }
+                else if (popup.Child is ModalPopup modal)
+                {
+                    // Escape reaches a ContentDialog on its own, but a ModalPopup lives in a
+                    // popup of its own that no accelerator scope covers, so the window routes it.
+                    if (modal.CancelRequested())
+                    {
+                        handled = args.Handled = true;
+                        return;
+                    }
+                }
+                else if (key == VirtualKey.Escape)
+                {
+                    // TODO: what is this for? I have no clue anymore
+                    if (popup.Child is not Grid)
+                    {
+                        //handled = args.Handled = true;
+                        return;
+                    }
+                }
+            }
+
+            var services = GetNavigationServices();
+
+            for (int i = services.Count - 1; i >= 0; i--)
+            {
+                services[i].FrameFacade.RaiseBackRequested(args);
+
+                if (handled = args.Handled)
+                {
+                    return;
+                }
+            }
+
+            var navigationService = services.Count > 0 ? services[0] : null;
+            if (navigationService?.CanGoBack ?? false)
+            {
+                navigationService?.GoBack();
+                handled = true;
+            }
+        }
+
+        public bool RaiseForwardRequested()
+        {
+            Logger.Info();
+
+            var args = new HandledEventArgs();
+
+            var services = GetNavigationServices();
+
+            foreach (var service in services)
+            {
+                service.FrameFacade.RaiseForwardRequested(args);
+                if (args.Handled)
+                {
+                    return true;
+                }
+            }
+
+            var navigationService = services.Count > 0 ? services[0] : null;
+            if (navigationService?.CanGoForward ?? false)
+            {
+                navigationService?.GoForward();
+                return true;
+            }
+
+            return false;
+        }
+
+        #endregion
+    }
+}

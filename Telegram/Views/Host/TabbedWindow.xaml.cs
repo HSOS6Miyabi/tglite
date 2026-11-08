@@ -1,0 +1,156 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using Microsoft.UI.Xaml.Controls;
+using System;
+using Telegram.Common;
+using Telegram.Controls;
+using Telegram.Navigation;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+
+namespace Telegram.Views.Host
+{
+    // TODO: Inheriting from TabViewItem causes TabView to throw E_INVALIDARG in release.
+    //public partial class TabbedPageItem : TabViewItem
+    //{
+    //    private bool _isBackButtonVisible;
+    //    public bool IsBackButtonVisible
+    //    {
+    //        get => _isBackButtonVisible;
+    //        set
+    //        {
+    //            if (_isBackButtonVisible != value)
+    //            {
+    //                _isBackButtonVisible = value;
+    //                IsBackButtonVisibleChanged?.Invoke(this, EventArgs.Empty);
+    //            }
+    //        }
+    //    }
+
+    //    public event EventHandler IsBackButtonVisibleChanged;
+    //}
+
+    public sealed partial class TabbedWindow : WindowContent
+    {
+        private readonly bool _forWebApps;
+
+        public TabbedWindow(WindowContext context, TabViewItem newTab, bool forWebApps)
+            : base(context)
+        {
+            InitializeComponent();
+
+            Window.ExtendViewIntoTitleBar = true;
+
+            if (forWebApps)
+            {
+                //Navigation.IsAddTabButtonVisible = true;
+                //Navigation.AddTabButtonClick += Navigation_AddTabButtonClick;
+                Navigation.TabWidthMode = TabViewWidthMode.Compact;
+
+                Navigation.SelectionChanged += Navigation_SelectionChanged;
+
+                Footer.Width = 46;
+                MenuButton.Visibility = Visibility.Visible;
+                CloseButton.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                MenuButton.Visibility = Visibility.Collapsed;
+                CloseButton.Visibility = Visibility.Collapsed;
+            }
+
+            _forWebApps = forWebApps;
+
+            if (newTab != null)
+            {
+                Navigation.TabItems.Add(newTab);
+
+                //newTab.IsClosable = false;
+                //newTab.IsBackButtonVisibleChanged += OnIsBackButtonVisibleChanged;
+            }
+        }
+
+        protected override UIElement TitleBarElement => Footer;
+
+        private void Navigation_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            //if (e.RemovedItems?.Count > 0 && e.RemovedItems[0] is TabbedPageItem removedItem)
+            //{
+            //    removedItem.IsClosable = false;
+            //    removedItem.IsBackButtonVisibleChanged -= OnIsBackButtonVisibleChanged;
+            //}
+
+            //if (e.AddedItems?.Count > 0 && e.AddedItems[0] is TabbedPageItem addedItem)
+            //{
+            //    addedItem.IsClosable = false;
+            //    addedItem.IsBackButtonVisibleChanged += OnIsBackButtonVisibleChanged;
+
+            //    OnIsBackButtonVisibleChanged(addedItem, null);
+            //}
+        }
+
+        public void AddNewTab(TabViewItem newTab)
+        {
+            Navigation.TabItems.Insert(Math.Min(Navigation.SelectedIndex + 1, Navigation.TabItems.Count), newTab);
+            Navigation.SelectedIndex++;
+        }
+
+        protected override void OnWindowTitleBarChanged()
+        {
+            // Web apps give Footer a fixed width for their own menu and close buttons.
+            if (_forWebApps)
+            {
+                return;
+            }
+
+            var window = Window;
+            // To ensure that the tabs in the titlebar are not occluded by shell
+            // content, we must ensure that we account for left and right overlays.
+            // In LTR layouts, the right inset includes the caption buttons and the
+            // drag region, which is flipped in RTL. 
+
+            // The SystemOverlayLeftInset and SystemOverlayRightInset values are
+            // in terms of physical left and right. Therefore, we need to flip
+            // then when our flow direction is RTL.
+            if (Navigation.FlowDirection == FlowDirection.LeftToRight)
+            {
+                Footer.MinWidth = window.SystemOverlayRightInset;
+                Header.MinWidth = window.SystemOverlayLeftInset;
+            }
+            else
+            {
+                Footer.MinWidth = window.SystemOverlayLeftInset;
+                Header.MinWidth = window.SystemOverlayRightInset;
+            }
+
+            // Ensure that the height of the custom regions are the same as the titlebar.
+            Footer.Height = Header.Height = window.TitleBarHeight;
+        }
+
+        private void OnTabCloseRequested(TabView sender, TabViewTabCloseRequestedEventArgs args)
+        {
+            // On touch this arrives from inside the gesture engine's delayed pointer-up, on a nested
+            // dispatch, and mutating TabItems there fails the removal with E_INVALIDARG. Close on
+            // the next turn instead.
+            var tab = args.Tab;
+            this.PostOnUIThread(() => CloseTab(tab));
+        }
+
+        private void CloseTab(TabViewItem tab)
+        {
+            if (Navigation.TabItems.Count > 1)
+            {
+                Navigation.TabItems.Remove(tab);
+            }
+            else
+            {
+                _ = Window.ConsolidateAsync();
+            }
+        }
+    }
+}

@@ -1,0 +1,71 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+namespace Telegram.Services.Settings
+{
+    public partial class PlaybackSettings : SettingsServiceBase
+    {
+        public PlaybackSettings(ISettingsStore container)
+            : base(container)
+        {
+        }
+
+        private int? _repeatMode;
+        public PlaybackRepeatMode RepeatMode
+        {
+            get => (PlaybackRepeatMode)(_repeatMode ??= GetValueOrDefault("RepeatMode", 0));
+            set => AddOrUpdateValue(ref _repeatMode, "RepeatMode", (int)value);
+        }
+
+        private int? _orderMode;
+        public PlaybackOrderMode OrderMode
+        {
+            get => (PlaybackOrderMode)(_orderMode ??= GetValueOrDefault("OrderMode", 0));
+            set => AddOrUpdateValue(ref _orderMode, "OrderMode", (int)value);
+        }
+
+        private double? _audioSpeed;
+        public double AudioSpeed
+        {
+            get => _audioSpeed ??= GetValueOrDefault("PlaybackRate", 1.0);
+            set => AddOrUpdateValue(ref _audioSpeed, "PlaybackRate", value);
+        }
+
+        private double? _videoSpeed;
+        public double VideoSpeed
+        {
+            get => _videoSpeed ??= GetValueOrDefault("VideoSpeed", 1.0);
+            set => AddOrUpdateValue(ref _videoSpeed, "VideoSpeed", value);
+        }
+
+        private int? _videoQuality;
+        /// <summary>
+        /// The quality of the last video, by its short side: what automatic quality settled on, or
+        /// what was picked by hand when <see cref="VideoQualityManual"/> is set. Zero until the
+        /// first video with several qualities has played.
+        /// </summary>
+        public int VideoQuality
+        {
+            get => _videoQuality ??= GetValueOrDefault("VideoQuality", 0);
+            set => AddOrUpdateValue(ref _videoQuality, "VideoQuality", value);
+        }
+
+        private bool? _videoQualityManual;
+        public bool VideoQualityManual
+        {
+            get => _videoQualityManual ??= GetValueOrDefault("VideoQualityManual", false);
+            set => AddOrUpdateValue(ref _videoQualityManual, "VideoQualityManual", value);
+        }
+
+        private bool? _highQuality;
+        public bool HighQuality
+        {
+            get => _highQuality ??= GetValueOrDefault("HighQuality", true);
+            set => AddOrUpdateValue(ref _highQuality, "HighQuality", value);
+        }
+    }
+}

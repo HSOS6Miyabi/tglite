@@ -1,0 +1,4106 @@
+﻿//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using Microsoft.Graphics.Canvas.Effects;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Linq;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Telegram.Common;
+using Telegram.Native;
+using Telegram.Native.Controls;
+using Telegram.Navigation;
+using Telegram.Streams;
+using Telegram.Td.Api;
+using Windows.Foundation;
+using Windows.Graphics;
+using Windows.Graphics.Imaging;
+using Windows.Storage;
+using Windows.Storage.Streams;
+using Windows.System;
+using Windows.UI;
+using Windows.UI.Composition;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Media;
+using Windows.UI.Xaml.Media.Imaging;
+
+namespace Telegram.Controls
+{
+    public partial class AnimatedImagePositionChangedEventArgs : EventArgs
+    {
+        public double Position { get; set; }
+    }
+
+    public partial class AnimatedImageLoopCompletedEventArgs : CancelEventArgs
+    {
+        public int LoopCount { get; set; }
+    }
+
+    public enum AnimatedImageResizeMode
+    {
+        None,
+        Fit,
+        Fill
+    }
+
+    public partial class AnimatedImage : AnimatedImageBase, IPlayerView
+    {
+        enum PlayingState
+        {
+            None,
+            Playing,
+            Paused
+        }
+
+        private bool _templateApplied;
+
+        private PlayingState _state;
+        private bool _delayedPlay;
+
+        private double _rasterizationScale;
+
+        private AnimatedImagePresenter _presenter;
+        private int _suppressEvents;
+
+        private ShapeVisual _shimmer;
+
+        protected bool _clean = false;
+
+        public AnimatedImage()
+        {
+            DefaultStyleKey = typeof(AnimatedImage);
+
+#if INSTRUMENTATION
+            Interlocked.Increment(ref _created);
+#endif
+        }
+
+#if INSTRUMENTATION
+        private static int _created;
+        private static int _finalized;
+
+        // See AnimatedImagePresenter's pair: a control that is never finalized is one something is
+        // still holding, whether or not this analysis can name what.
+        ~AnimatedImage()
+        {
+            Interlocked.Increment(ref _finalized);
+        }
+
+        internal static int DebugFinalized => Volatile.Read(ref _finalized);
+
+        internal static string DebugCounters()
+        {
+            var created = Volatile.Read(ref _created);
+            var finalized = Volatile.Read(ref _finalized);
+
+            return string.Format("  AnimatedImage: created={0}, finalized={1}, alive={2}\n",
+                created, finalized, created - finalized);
+        }
+#endif
+
+        protected override void OnSizeChanged(Size oldSize, Size newSize)
+        {
+            if (ResizeMode != AnimatedImageResizeMode.None)
+            {
+                Load();
+            }
+
+            if (_frameRotation != 0)
+            {
+                UpdateRotation(_imageBrush);
+            }
+        }
+
+        public event EventHandler Ready;
+
+        // The presenter reports the position for every frame it shows, and with frames drawn off
+        // the UI thread each report is a dispatcher item. Forwarded only while something listens
+        // here, which almost no image has.
+        private EventHandler<AnimatedImagePositionChangedEventArgs> _positionChanged;
+
+        public event EventHandler<AnimatedImagePositionChangedEventArgs> PositionChanged
+        {
+            add
+            {
+                if (_positionChanged == null && _presenter != null)
+                {
+                    _presenter.PositionChanged += OnPositionChanged;
+                }
+
+                _positionChanged += value;
+            }
+            remove
+            {
+                _positionChanged -= value;
+
+                if (_positionChanged == null && _presenter != null)
+                {
+                    _presenter.PositionChanged -= OnPositionChanged;
+                }
+            }
+        }
+
+        public event EventHandler<AnimatedImageLoopCompletedEventArgs> LoopCompleted;
+        public event EventHandler Paused;
+
+        protected readonly struct SuppressEventsDisposable : IDisposable
+        {
+            private readonly AnimatedImage _owner;
+
+            public SuppressEventsDisposable(AnimatedImage owner)
+            {
+                _owner = owner;
+                ++_owner._suppressEvents;
+            }
+
+            public void Dispose()
+            {
+                --_owner._suppressEvents;
+                _owner.Load();
+            }
+        }
+
+        public IDisposable BeginBatchUpdate()
+        {
+            return new SuppressEventsDisposable(this);
+        }
+
+        protected override void OnLoaded()
+        {
+            // The scale a change made while this was unloaded, taken before the presentation is
+            // built from it. The arrange pass carries a change from here on, but this element
+            // may not be arranged again before it is drawn.
+            if (XamlRoot != null)
+            {
+                _rasterizationScale = XamlRoot.RasterizationScale;
+            }
+
+            Load();
+
+            ReplacementColor?.RegisterColorChangedCallback(OnReplacementColorChanged, ref _replacementColorToken);
+
+            if (Source != null)
+            {
+                if (IsOutlineEnabled)
+                {
+                    Source.OutlineChanged += OnOutlineChanged;
+                }
+
+                if (IsViewportAware && !_effectiveViewportRegistered)
+                {
+                    _effectiveViewportRegistered = true;
+                    RegisterViewportChanged();
+                }
+            }
+        }
+
+        protected override void OnUnloaded()
+        {
+            Unload();
+
+            ReplacementColor?.UnregisterColorChangedCallback(ref _replacementColorToken);
+
+            if (Source != null)
+            {
+                Source.OutlineChanged -= OnOutlineChanged;
+            }
+
+            if (_effectiveViewportRegistered)
+            {
+                _effectiveViewportRegistered = false;
+                UnregisterViewportChanged();
+            }
+        }
+
+        public bool IsPlaying => _delayedPlay || _state == PlayingState.Playing;
+
+        public void Play()
+        {
+            if (_presenter != null)
+            {
+                _delayedPlay = false;
+
+                if (_state != PlayingState.Playing)
+                {
+                    _state = PlayingState.Playing;
+                    _presenter.Play(this);
+                }
+            }
+            else
+            {
+                _delayedPlay = true;
+            }
+        }
+
+        public void Pause()
+        {
+            _delayedPlay = false;
+
+            if (_presenter != null)
+            {
+                if (_state == PlayingState.Playing)
+                {
+                    _state = PlayingState.Paused;
+                    _presenter.Pause();
+                }
+            }
+        }
+
+        public void Seek(string marker)
+        {
+            _presenter?.Seek(marker);
+        }
+
+        #region IsViewportAware
+
+        public bool IsViewportAware
+        {
+            get { return (bool)GetValue(IsViewportAwareProperty); }
+            set { SetValue(IsViewportAwareProperty, value); }
+        }
+
+        public static readonly DependencyProperty IsViewportAwareProperty =
+            DependencyProperty.Register("IsViewportAware", typeof(bool), typeof(AnimatedImage), new PropertyMetadata(false, OnViewportAwareChanged));
+
+        private static void OnViewportAwareChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((AnimatedImage)d).OnViewportAwareChanged((bool)e.NewValue, (bool)e.OldValue);
+        }
+
+        private void OnViewportAwareChanged(bool newValue, bool oldValue)
+        {
+            if (newValue && IsConnected && Source != null)
+            {
+                if (!_effectiveViewportRegistered)
+                {
+                    _effectiveViewportRegistered = true;
+                    RegisterViewportChanged();
+                }
+            }
+            else if (_effectiveViewportRegistered)
+            {
+                _effectiveViewportRegistered = false;
+                UnregisterViewportChanged();
+            }
+        }
+
+        protected override void OnViewportChanged(bool visible)
+        {
+            if (visible)
+            {
+                _withinViewport = true;
+                Play();
+
+                if (_shimmerPending)
+                {
+                    UpdateShimmer(Source);
+                }
+            }
+            else
+            {
+                _withinViewport = false;
+                Pause();
+            }
+        }
+
+        private bool _withinViewport;
+
+        // A shimmer was wanted while the control was off screen. Built when it arrives.
+        private bool _shimmerPending;
+
+        // TODO: a bit redunant now as it's already tracked internally
+        private bool _effectiveViewportRegistered;
+
+        public void ViewportChanged(bool within)
+        {
+            if (within && !_withinViewport)
+            {
+                _withinViewport = true;
+                Play();
+
+                if (_shimmerPending)
+                {
+                    UpdateShimmer(Source);
+                }
+            }
+            else if (_withinViewport && !within)
+            {
+                _withinViewport = false;
+                Pause();
+            }
+        }
+
+        //public bool IsDisabledByPolicy
+        //{
+        //    get => Type switch
+        //    {
+        //        AnimatedImageType.Sticker => !PowerSavingPolicy.AutoPlayStickers,
+        //        AnimatedImageType.Animation => !PowerSavingPolicy.AutoPlayAnimations,
+        //        AnimatedImageType.Emoji => !PowerSavingPolicy.AutoPlayEmoji,
+        //        _ => false
+        //    };
+        //}
+
+        #endregion
+
+        //#region Type
+
+        //public AnimatedImageType Type
+        //{
+        //    get { return (AnimatedImageType)GetValue(TypeProperty); }
+        //    set { SetValue(TypeProperty, value); }
+        //}
+
+        //public static readonly DependencyProperty TypeProperty =
+        //    DependencyProperty.Register("Type", typeof(AnimatedImageType), typeof(AnimatedImage), new PropertyMetadata(AnimatedImageType.Other));
+
+        //#endregion
+
+
+
+        #region Source
+
+        public AnimatedImageSource Source
+        {
+            get { return (AnimatedImageSource)GetValue(SourceProperty); }
+            set { SetValue(SourceProperty, value); }
+        }
+
+        public static readonly DependencyProperty SourceProperty =
+            DependencyProperty.Register("Source", typeof(AnimatedImageSource), typeof(AnimatedImage), new PropertyMetadata(null, OnPropertyChanged));
+
+        #endregion
+
+        #region LoopCount
+
+        public int LoopCount
+        {
+            get { return (int)GetValue(LoopCountProperty); }
+            set { SetValue(LoopCountProperty, value); }
+        }
+
+        public static readonly DependencyProperty LoopCountProperty =
+            DependencyProperty.Register("LoopCount", typeof(int), typeof(AnimatedImage), new PropertyMetadata(0, OnPropertyChanged));
+
+        #endregion
+
+        #region AutoPlay
+
+        public bool AutoPlay
+        {
+            get { return (bool)GetValue(AutoPlayProperty); }
+            set { SetValue(AutoPlayProperty, value); }
+        }
+
+        public static readonly DependencyProperty AutoPlayProperty =
+            DependencyProperty.Register("AutoPlay", typeof(bool), typeof(AnimatedImage), new PropertyMetadata(false, OnPropertyChanged));
+
+        #endregion
+
+        #region LimitFps
+
+        public bool LimitFps
+        {
+            get { return (bool)GetValue(LimitFpsProperty); }
+            set { SetValue(LimitFpsProperty, value); }
+        }
+
+        public static readonly DependencyProperty LimitFpsProperty =
+            DependencyProperty.Register("LimitFps", typeof(bool), typeof(AnimatedImage), new PropertyMetadata(false, OnPropertyChanged));
+
+        #endregion
+
+        #region IsCachingEnabled
+
+        public bool IsCachingEnabled
+        {
+            get => (bool)GetValue(IsCachingEnabledProperty);
+            set => SetValue(IsCachingEnabledProperty, value);
+        }
+
+        public static readonly DependencyProperty IsCachingEnabledProperty =
+            DependencyProperty.Register("IsCachingEnabled", typeof(bool), typeof(AnimatedImage), new PropertyMetadata(true, OnPropertyChanged));
+
+        #endregion
+
+        #region FrameSize
+
+        private Size _frameSize = new(256, 256);
+        public Size FrameSize
+        {
+            get => _frameSize;
+            set
+            {
+                if (_frameSize != value)
+                {
+                    _frameSize = value;
+                    Load();
+                }
+            }
+        }
+
+        #endregion
+
+        #region DecodeFrameType
+
+        private DecodePixelType _decodeFrameType = DecodePixelType.Physical;
+        public DecodePixelType DecodeFrameType
+        {
+            get => _decodeFrameType;
+            set
+            {
+                if (_decodeFrameType != value)
+                {
+                    _decodeFrameType = value;
+                    Load();
+                }
+            }
+        }
+
+        #endregion
+
+        #region ResizeMode
+
+        private AnimatedImageResizeMode _resizeMode = AnimatedImageResizeMode.None;
+        public AnimatedImageResizeMode ResizeMode
+        {
+            get => _resizeMode;
+            set
+            {
+                if (_resizeMode != value)
+                {
+                    _resizeMode = value;
+                    Load();
+                }
+            }
+        }
+
+        #endregion
+
+        #region Stretch
+
+        public Stretch Stretch
+        {
+            get { return (Stretch)GetValue(StretchProperty); }
+            set { SetValue(StretchProperty, value); }
+        }
+
+        public static readonly DependencyProperty StretchProperty =
+            DependencyProperty.Register("Stretch", typeof(Stretch), typeof(AnimatedImage), new PropertyMetadata(Stretch.Uniform));
+
+        #endregion
+
+        private AnimatedImagePresentation GetPresentation()
+        {
+            if (Source != null)
+            {
+                var resize = ResizeMode;
+                var width = resize != AnimatedImageResizeMode.None ? (int)ActualWidth : (int)FrameSize.Width;
+                var height = resize != AnimatedImageResizeMode.None ? (int)ActualHeight : (int)FrameSize.Height;
+                var scale = 1d;
+
+                if (DecodeFrameType == DecodePixelType.Logical)
+                {
+                    width = (int)(width * _rasterizationScale);
+                    height = (int)(height * _rasterizationScale);
+                    scale = _rasterizationScale;
+                }
+
+                if (resize != AnimatedImageResizeMode.None && (width <= 0 || height <= 0))
+                {
+                    return null;
+                }
+
+                return new AnimatedImagePresentation(Source, width, height, scale, LimitFps, LoopCount, AutoPlay, IsCachingEnabled, resize, VisualUtilities.IsInPopupTree(this));
+            }
+
+            return null;
+        }
+
+        private static void OnPropertyChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            if (e.Property == SourceProperty)
+            {
+                ((AnimatedImage)d).OnSourceChanged(e);
+            }
+
+            ((AnimatedImage)d).Load();
+        }
+
+        private void OnSourceChanged(DependencyPropertyChangedEventArgs e)
+        {
+            if (e.OldValue is AnimatedImageSource oldValue)
+            {
+                oldValue.OutlineChanged -= OnOutlineChanged;
+            }
+
+            if (e.NewValue is AnimatedImageSource newValue && IsConnected)
+            {
+                if (IsOutlineEnabled)
+                {
+                    newValue.OutlineChanged += OnOutlineChanged;
+                }
+
+                if (IsViewportAware && !_effectiveViewportRegistered)
+                {
+                    _effectiveViewportRegistered = true;
+                    RegisterViewportChanged();
+                }
+            }
+        }
+
+        private void OnOutlineChanged(object sender, EventArgs e)
+        {
+            this.BeginOnUIThread(() => UpdateShimmer(Source));
+        }
+
+        private void Load()
+        {
+            if (_suppressEvents > 0)
+            {
+                return;
+            }
+
+            if (_templateApplied && IsConnected)
+            {
+                var presentation = GetPresentation();
+                if (presentation != _presenter?.Presentation)
+                {
+                    if (_presenter != null)
+                    {
+                        _presenter.Unload(this, _state == PlayingState.Playing || _presenter.Presentation.AutoPlay);
+                        _presenter.LoopCompleted -= OnLoopCompleted;
+                        _presenter.PositionChanged -= OnPositionChanged;
+                        _presenter.Paused -= OnPaused;
+                        _presenter = null;
+                    }
+
+                    _delayedPlay |= _state == PlayingState.Playing;
+                    _delayedPlay |= presentation?.AutoPlay ?? false;
+                    _state = PlayingState.None;
+                    _clean = true;
+
+                    UpdateShimmer(presentation?.Source);
+
+                    if (presentation != null)
+                    {
+                        _presenter = AnimatedImageLoader.GetOrCreate(XamlRoot, presentation);
+                    }
+
+                    // CleanOnSourceChanged keeps the frame only for a new presenter to replace.
+                    if (_presenter == null)
+                    {
+                        LayoutRoot.Background = null;
+                        Show(null);
+                    }
+
+                    if (_presenter != null)
+                    {
+                        _presenter.LoopCompleted += OnLoopCompleted;
+                        _presenter.Paused += OnPaused;
+
+                        if (_positionChanged != null)
+                        {
+                            _presenter.PositionChanged += OnPositionChanged;
+                        }
+
+                        _presenter.Load(this);
+
+                        if (_delayedPlay)
+                        {
+                            Play();
+                        }
+                    }
+                }
+            }
+        }
+
+        private void UpdateShimmer(AnimatedImageSource source)
+        {
+            // TODO: Enable whenever IsDownloadCompleted == false
+            if (_clean is false || !IsConnected || !IsOutlineEnabled)
+            {
+                return;
+            }
+
+            // A list realizes well past what it shows, and a placeholder for something nobody is
+            // looking at covers nothing. Building it here costs the geometry, a dozen Composition
+            // objects and - when the outline is not known yet - a TDLib round trip, per item off
+            // screen. Deferred to the moment the control enters the viewport instead.
+            //
+            // AutoPlay carries the controls no viewport source reports: they show themselves as
+            // soon as they load, so there is nothing to wait for.
+            //
+            // If outline is animated we display the shimmer in any case
+            if (!AutoPlay && !_withinViewport && !IsOutlineAnimated)
+            {
+                _shimmerPending = true;
+                return;
+            }
+
+            _shimmerPending = false;
+
+            CompositionPathParser.StopThumbnail(_shimmer);
+
+            if (source is { Outline.IsReady: true })
+            {
+                CompositionPathParser.ParseThumbnail(source.Width, source.Height, source.Outline, out ShapeVisual visual, IsOutlineAnimated);
+                ElementCompositionPreview.SetElementChildVisual(LayoutRoot, visual);
+
+                _shimmer = visual;
+            }
+            else
+            {
+                _shimmer = null;
+                ElementCompositionPreview.SetElementChildVisual(LayoutRoot, null);
+
+                source?.RequestOutline();
+            }
+        }
+
+        private void Unload()
+        {
+            if (_presenter != null && !IsConnected)
+            {
+                _presenter.Unload(this, _state == PlayingState.Playing);
+                _presenter.LoopCompleted -= OnLoopCompleted;
+                _presenter.PositionChanged -= OnPositionChanged;
+                _presenter.Paused -= OnPaused;
+                _presenter = null;
+
+                LayoutRoot.Background = null;
+                Show(null);
+            }
+        }
+
+        private void OnLoopCompleted(object sender, AnimatedImageLoopCompletedEventArgs e)
+        {
+            LoopCompleted?.Invoke(this, e);
+        }
+
+        private void OnPositionChanged(object sender, AnimatedImagePositionChangedEventArgs e)
+        {
+            _positionChanged?.Invoke(this, e);
+        }
+
+        private void OnPaused(object sender, EventArgs e)
+        {
+            _delayedPlay = false;
+            _state = PlayingState.Paused;
+
+            Paused?.Invoke(this, e);
+        }
+
+        // The frame is the presenter's bitmap, painted as this element's background through a brush
+        // of its own, so that each image keeps its own Stretch.
+        private ImageBrush _imageBrush;
+        private AnimatedImageBitmap _shown;
+
+        // Fixed for the presentation, and kept for the rotation, which follows the element's size.
+        private int _frameWidth;
+        private int _frameHeight;
+        private int _frameRotation;
+
+        // A null bitmap is the presenter letting go of this image.
+        internal void Invalidate(AnimatedImageBitmap bitmap, int pixelWidth, int pixelHeight, int rotation)
+        {
+            if (IsDisconnected)
+            {
+                return;
+            }
+
+            if (bitmap == null)
+            {
+                if (CleanOnSourceChanged)
+                {
+                    LayoutRoot.Background = null;
+                    Show(null);
+                }
+
+                return;
+            }
+
+            if (!Show(bitmap))
+            {
+                return;
+            }
+
+            _frameWidth = pixelWidth;
+            _frameHeight = pixelHeight;
+            _frameRotation = rotation;
+
+            _imageBrush ??= new ImageBrush
+            {
+                AlignmentX = AlignmentX.Center,
+                AlignmentY = AlignmentY.Center
+            };
+
+            _imageBrush.ImageSource = bitmap.Bitmap;
+
+            if (rotation != 0)
+            {
+                _imageBrush.Transform = new CompositeTransform
+                {
+                    Rotation = rotation
+                };
+            }
+            else
+            {
+                _imageBrush.Transform = null;
+            }
+
+            // Turned, the transform scales the frame itself, and a Stretch would scale it again.
+            _imageBrush.Stretch = UpdateRotation(_imageBrush)
+                ? Stretch.None
+                : Stretch;
+
+            LayoutRoot.Background = _imageBrush;
+
+            if (_clean)
+            {
+                _clean = false;
+
+                CompositionPathParser.StopThumbnail(_shimmer);
+                _shimmer = null;
+                ElementCompositionPreview.SetElementChildVisual(LayoutRoot, null);
+
+                if (DominantColor is SolidColorBrush dominantColor)
+                {
+                    dominantColor.Color = GetDominantColor(bitmap.Bitmap.PixelBuffer, pixelWidth, pixelHeight);
+                }
+
+                Ready?.Invoke(this, EventArgs.Empty);
+
+                if (ReplacementColor != null)
+                {
+                    ReplacementColorChanged(true);
+                }
+            }
+        }
+
+        // Holds a reference on the bitmap on screen, so that it outlives its presenter for as long
+        // as this keeps showing it: with CleanOnSourceChanged off, until the next source draws.
+        private bool Show(AnimatedImageBitmap bitmap)
+        {
+            if (_shown == bitmap)
+            {
+                return true;
+            }
+
+            if (bitmap != null && !bitmap.TryAddRef())
+            {
+                return false;
+            }
+
+            _shown?.Release();
+            _shown = bitmap;
+            return true;
+        }
+
+        private bool UpdateRotation(ImageBrush brush)
+        {
+            if (_frameWidth == 0 || _frameHeight == 0 || brush?.Transform is not CompositeTransform composite)
+            {
+                return false;
+            }
+
+            double pixelWidth;
+            double pixelHeight;
+
+            if (_frameRotation is 90 or 270)
+            {
+                pixelWidth = _frameHeight;
+                pixelHeight = _frameWidth;
+            }
+            else
+            {
+                pixelWidth = _frameWidth;
+                pixelHeight = _frameHeight;
+            }
+
+            var scale = Math.Max(ActualWidth / pixelWidth, ActualHeight / pixelHeight);
+
+            composite.ScaleX = scale;
+            composite.ScaleY = scale;
+
+            composite.CenterX = ActualWidth / 2;
+            composite.CenterY = ActualHeight / 2;
+
+            return true;
+        }
+
+        private unsafe Color GetDominantColor(IBuffer frame, int width, int height)
+        {
+            if (frame == null || width <= 0 || height <= 0 || frame.Length < width * height * 4)
+            {
+                return Color.FromArgb(0x55, 0, 0, 0);
+            }
+
+            float stepH = (height - 1) / 10f;
+            float stepW = (width - 1) / 10f;
+
+            frame.Buffer(out byte* imageBytes);
+
+            int r = 0, g = 0, b = 0;
+            int amount = 0;
+            for (int i = 0; i < 10; i++)
+            {
+                for (int j = 0; j < 10; j++)
+                {
+                    int x = (int)(stepW * i);
+                    int y = (int)(stepH * j);
+                    int k = (y * width + x) * 4;
+
+                    byte alpha = imageBytes[k + 3];
+                    if (alpha > 200)
+                    {
+                        r += imageBytes[k + 2];
+                        g += imageBytes[k + 1];
+                        b += imageBytes[k + 0];
+                        amount++;
+                    }
+                }
+            }
+            if (amount == 0)
+            {
+                return Color.FromArgb(0x55, 0, 0, 0);
+            }
+
+            return Color.FromArgb(255, (byte)(r / amount), (byte)(g / amount), (byte)(b / amount));
+        }
+
+        public bool CleanOnSourceChanged { get; set; } = true;
+
+        private Border LayoutRoot;
+
+        protected override void OnApplyTemplate()
+        {
+            //Logger.Debug();
+            LayoutRoot = GetTemplateChild(nameof(LayoutRoot)) as Border;
+
+            _templateApplied = true;
+            _rasterizationScale = XamlRoot.RasterizationScale;
+
+            Load();
+            ReplacementColorChanged();
+            base.OnApplyTemplate();
+        }
+
+        protected override Size ArrangeOverride(Size finalSize)
+        {
+            // Where a scale change arrives: it makes the core call RecursiveInvalidateMeasure on
+            // the visual root, so every element is measured and arranged again. The frames were
+            // decoded for the scale, and the ones decoded for the other monitor are the wrong
+            // size - so they are decoded again.
+            //
+            // Not from in here, though. Load reaches Ready through the presenter, and a handler
+            // of that is app code that may change the tree - which a layout pass does not
+            // survive. Posted instead, which is no later than the callback this replaced.
+            if (_templateApplied && DecodeFrameType == DecodePixelType.Logical
+                && XamlRoot != null && _rasterizationScale != XamlRoot.RasterizationScale)
+            {
+                _rasterizationScale = XamlRoot.RasterizationScale;
+                this.BeginOnUIThread(Load);
+            }
+
+            return base.ArrangeOverride(finalSize);
+        }
+
+        #region ReplacementColor
+
+        private bool _needsBrushUpdate;
+        private long _replacementColorToken;
+
+        private Color _replacementColor;
+        private CompositionEffectBrush _effectBrush;
+
+        // Implemented as Brush so that we can receive Color changed updates
+        public Brush ReplacementColor
+        {
+            get { return (Brush)GetValue(ReplacementColorProperty); }
+            set { SetValue(ReplacementColorProperty, value); }
+        }
+
+        public static readonly DependencyProperty ReplacementColorProperty =
+            DependencyProperty.Register("ReplacementColor", typeof(Brush), typeof(AnimatedImage), new PropertyMetadata(null, OnReplacementColorChanged));
+
+        private static void OnReplacementColorChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((AnimatedImage)d).OnReplacementColorChanged(e.NewValue as SolidColorBrush, e.OldValue as SolidColorBrush);
+        }
+
+        private void OnReplacementColorChanged(SolidColorBrush newValue, SolidColorBrush oldValue)
+        {
+            oldValue?.UnregisterColorChangedCallback(ref _replacementColorToken);
+
+            if (IsConnected)
+            {
+                newValue?.RegisterColorChangedCallback(OnReplacementColorChanged, ref _replacementColorToken);
+                ReplacementColorChanged();
+            }
+        }
+
+        private void OnReplacementColorChanged(DependencyObject sender, DependencyProperty dp)
+        {
+            ReplacementColorChanged();
+        }
+
+        protected void ReplacementColorChanged(bool fast = false)
+        {
+            if (_needsBrushUpdate || (_presenter?.Presentation.Source.NeedsRepainting is not true && _effectBrush == null))
+            {
+                return;
+            }
+            else if (fast)
+            {
+                UpdateBrush();
+                return;
+            }
+
+            _needsBrushUpdate = true;
+            VisualUtilities.QueueCallbackForCompositionRendering(UpdateBrush);
+        }
+
+        private void UpdateBrush()
+        {
+            _needsBrushUpdate = false;
+
+            if (LayoutRoot == null)
+            {
+                return;
+            }
+
+            if (ReplacementColor is not SolidColorBrush replacement || _presenter?.Presentation.Source.NeedsRepainting is not true)
+            {
+                if (_effectBrush != null)
+                {
+                    LayoutRoot.Opacity = 1;
+                    ElementCompositionPreview.SetElementChildVisual(this, null);
+                }
+
+                _effectBrush = null;
+                return;
+            }
+
+            _replacementColor = replacement.Color;
+
+            if (_effectBrush != null)
+            {
+                try
+                {
+                    _effectBrush.Properties.InsertColor("Tint.Color", replacement.Color);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // If it throws, let's rebuild the brush
+                    Logger.Exception(ex);
+                }
+            }
+
+            try
+            {
+                var compositor = BootStrapper.Current.Compositor;
+
+                // Keeps the source's alpha and replaces its colour channels with the ReplacementColor's
+                // RGB, or shows it as it is when the ReplacementColor is transparent.
+                var colorMatrixEffect = new ColorMatrixEffect();
+                colorMatrixEffect.Source = new CompositionEffectSourceParameter("Source");
+                var colorMatrix = new Matrix5x4();
+
+                if (_replacementColor.A != 0)
+                {
+                    colorMatrix.M51 = colorMatrix.M52 = colorMatrix.M53 = colorMatrix.M44 = 1;
+                }
+                else
+                {
+                    colorMatrix.M11 = colorMatrix.M22 = colorMatrix.M33 = colorMatrix.M44 = 1;
+                }
+
+                colorMatrixEffect.ColorMatrix = colorMatrix;
+
+                var tintEffect = new TintEffect();
+                tintEffect.Name = "Tint";
+                tintEffect.Source = colorMatrixEffect;
+                tintEffect.Color = _replacementColor;
+
+                var effectFactory = compositor.CreateEffectFactory(tintEffect, new[] { "Tint.Color" });
+
+                var actualSize = new Vector2((float)FrameSize.Width, (float)FrameSize.Height);
+
+                // The element's own visual, through the effect, shown in its place.
+                var surfaceBrush = compositor.CreateSurfaceBrush();
+                surfaceBrush.Stretch = CompositionStretch.None;
+                var surface = compositor.CreateVisualSurface();
+
+                surface.SourceVisual = ElementComposition.GetElementVisual(LayoutRoot);
+                surface.SourceOffset = Vector2.Zero;
+                surface.SourceSize = actualSize;
+                surfaceBrush.Surface = surface;
+
+                _effectBrush = effectFactory.CreateBrush();
+                _effectBrush.SetSourceParameter("Source", surfaceBrush);
+
+                var visual = compositor.CreateSpriteVisual();
+                visual.Size = actualSize;
+                visual.Brush = _effectBrush;
+
+                LayoutRoot.Opacity = 0;
+                ElementCompositionPreview.SetElementChildVisual(this, visual);
+            }
+            catch (Exception ex)
+            {
+                Logger.Exception(ex);
+            }
+        }
+
+        #endregion
+
+        #region DominantColor
+
+        public SolidColorBrush DominantColor
+        {
+            get { return (SolidColorBrush)GetValue(DominantColorProperty); }
+            set { SetValue(DominantColorProperty, value); }
+        }
+
+        public static readonly DependencyProperty DominantColorProperty =
+            DependencyProperty.Register("DominantColor", typeof(SolidColorBrush), typeof(AnimatedImage), new PropertyMetadata(null));
+
+        #endregion
+
+        public bool IsOutlineEnabled { get; set; } = true;
+
+        public bool IsOutlineAnimated { get; set; } = false;
+    }
+
+    public partial class AnimatedImagePresenter
+    {
+        private static readonly FifoActionWorker _workerQueue = new();
+
+        private readonly AnimatedImagePresentation _presentation;
+        private readonly AnimatedImageLoader _loader;
+
+        private readonly DispatcherQueue _dispatcherQueue;
+
+        private readonly List<AnimatedImage> _images = new();
+
+        private volatile int _loaded;
+        private volatile int _playing;
+        private int _tracker;
+
+        private bool _idle = true;
+        private bool _dirty;
+        private bool _activated;
+
+        private volatile int _loopCount;
+
+        private int _timerSubscribed;
+
+        private AnimatedImageTask _task;
+        private bool _requested;
+
+        private volatile bool _ticking;
+        private volatile bool _disposing;
+        private volatile bool _disposed;
+
+        // Renders in flight, with the sign bit standing for "closed to new ones". One word rather
+        // than two, because taking a slot and finding the gate open has to be a single step: see
+        // NextFrame.
+        private int _borrows;
+
+        private const int BorrowsClosed = int.MinValue;
+
+        private AnimatedImageLoopCompletedEventArgs _prevCompleted;
+        private AnimatedImagePositionChangedEventArgs _prevPosition;
+        private double _nextPosition;
+
+        private string _nextMarker;
+
+        public AnimatedImagePresenter(AnimatedImageLoader loader, DispatcherQueue dispatcherQueue, AnimatedImagePresentation configuration)
+        {
+            _presentation = configuration;
+            _loader = loader;
+
+            _dispatcherQueue = dispatcherQueue;
+            _tracker++;
+
+#if INSTRUMENTATION
+            Interlocked.Increment(ref _created);
+#endif
+        }
+
+#if INSTRUMENTATION
+        private static int _created;
+        private static int _finalized;
+
+        // Counted rather than snapshotted, so the answer survives whatever the collector happens to
+        // have got to: created minus finalized is what is still alive. The finalizer touches one
+        // static int and nothing else, so it cannot resurrect anything or reach a torn-down object.
+        ~AnimatedImagePresenter()
+        {
+            Interlocked.Increment(ref _finalized);
+        }
+
+        internal static string DebugCounters()
+        {
+            var created = Volatile.Read(ref _created);
+            var finalized = Volatile.Read(ref _finalized);
+
+            return string.Format("  AnimatedImagePresenter: created={0}, finalized={1}, alive={2}\n",
+                created, finalized, created - finalized);
+        }
+#endif
+
+        public bool Increment()
+        {
+            if (_tracker > 0)
+            {
+                _tracker++;
+                return true;
+            }
+
+            return false;
+        }
+
+        public event EventHandler<AnimatedImagePositionChangedEventArgs> PositionChanged;
+        public event EventHandler<AnimatedImageLoopCompletedEventArgs> LoopCompleted;
+
+        public event EventHandler Paused;
+
+#if INSTRUMENTATION
+        // A presenter is shared and refcounted, so a flat presenter count says nothing about what
+        // has accumulated inside one. Every AnimatedImage bound to it subscribes these three and
+        // drops them in Unload(), which only runs when IsConnected has gone false - so a handler
+        // count that climbs with every panel open names both the leak and the control it holds.
+        internal int DebugHandlerCount()
+        {
+            return (PositionChanged?.GetInvocationList().Length ?? 0)
+                + (LoopCompleted?.GetInvocationList().Length ?? 0)
+                + (Paused?.GetInvocationList().Length ?? 0);
+        }
+#endif
+
+        public AnimatedImagePresentation Presentation => _presentation;
+
+        public int CorrelationId { get; set; }
+
+        public void Load(AnimatedImage canvas)
+        {
+            _images.Add(canvas);
+            LoadImpl();
+
+            var task = Volatile.Read(ref _task);
+            var bitmap = Volatile.Read(ref _bitmap);
+
+            if (_dirty && task != null && bitmap != null)
+            {
+                canvas.Invalidate(bitmap, task.PixelWidth, task.PixelHeight, task.Rotation);
+            }
+        }
+
+        public void Unload(AnimatedImage canvas, bool playing)
+        {
+            _images.Remove(canvas);
+            UnloadImpl(playing);
+
+            canvas.Invalidate(null, 0, 0, 0);
+        }
+
+        private void LoadImpl()
+        {
+            _loaded++;
+
+            if (_loaded == 1 && !_requested)
+            {
+                _requested = true;
+
+                if (_presentation.Source is DelayedFileSource delayed)
+                {
+                    // Subscribed before the ask, because the ask answers straight away when the
+                    // file is already there.
+                    delayed.Downloaded += OnDownloaded;
+                    delayed.DownloadFile(DelayedFileDownload.Loaded);
+                }
+                else
+                {
+                    _loader.Load(this);
+                }
+            }
+        }
+
+        private void OnDownloaded(object sender, EventArgs e)
+        {
+            UnsubscribeSource();
+
+            if (_loaded > 0)
+            {
+                _loader.Load(this);
+            }
+        }
+
+        /// <summary>
+        /// Drops the source subscription. Called from the two teardown points and not from Dispose,
+        /// which is only ever reached through one of them - and which two of UnloadImpl's three
+        /// teardown branches never reach at all.
+        /// </summary>
+        private void UnsubscribeSource()
+        {
+            if (_presentation.Source is DelayedFileSource delayed)
+            {
+                delayed.Downloaded -= OnDownloaded;
+            }
+        }
+
+        private void UnloadImpl(bool playing)
+        {
+            //Logger.Debug();
+
+            _loaded--;
+            _tracker--;
+
+            if (playing)
+            {
+                _playing--;
+            }
+
+            if (_loaded <= 0 && _tracker == 0)
+            {
+                UnsubscribeSource();
+
+                _loader.Activated -= OnActivated;
+                _loader.PopupActivated -= OnActivated;
+                _loader.Remove(_presentation);
+
+                var task = Volatile.Read(ref _task);
+                if (task != null)
+                {
+                    if (_ticking)
+                    {
+                        //Logger.Debug("Task exists, and timer is attached");
+                        _disposing = true;
+                        _ticking = false;
+                    }
+                    else
+                    {
+                        //Logger.Debug("Task exists, and timer is not attached");
+                        Dispose();
+                    }
+                }
+                else if (CorrelationId != 0)
+                {
+                    _loader.Remove(CorrelationId);
+                }
+                else if (_presentation.Source is DelayedFileSource delayed)
+                {
+                    delayed.Complete();
+                }
+            }
+        }
+
+        public void Play(AnimatedImage canvas)
+        {
+            PlayImpl();
+
+            var task = Volatile.Read(ref _task);
+            var bitmap = Volatile.Read(ref _bitmap);
+
+            if (_dirty && task != null && bitmap != null)
+            {
+                canvas.Invalidate(bitmap, task.PixelWidth, task.PixelHeight, task.Rotation);
+            }
+        }
+
+        public void Pause()
+        {
+            PauseImpl();
+        }
+
+        public void Seek(string marker)
+        {
+            SeekImpl(marker);
+        }
+
+        private void PlayImpl()
+        {
+            _playing++;
+            _idle = false;
+
+            if (_playing == 1 && !_ticking && _loopCount >= 0)
+            {
+                var task = Volatile.Read(ref _task);
+                if (task == null)
+                {
+                    // Asked again rather than only when the file is still missing: the source
+                    // answers an ask it can already satisfy, so a completion that arrived while
+                    // nothing was listening is recovered here instead of leaving this with no
+                    // branch to take and nothing that would ever come back to it.
+                    if (_presentation.Source is DelayedFileSource delayed)
+                    {
+                        delayed.DownloadFile(DelayedFileDownload.Playing);
+                    }
+                    else if (!_requested)
+                    {
+                        _loader.Load(this);
+                    }
+
+                    _requested = true;
+                    return;
+                }
+
+                if (_nextMarker != null)
+                {
+                    task.Seek(_nextMarker);
+                    _nextMarker = null;
+                }
+
+                _ticking = _activated;
+
+                if (_ticking)
+                {
+                    if (Interlocked.CompareExchange(ref _timerSubscribed, 1, 0) == 0)
+                    {
+                        _loader.Flusher.Subscribe(this);
+                    }
+                }
+                else
+                {
+                    _workerQueue.Run(RenderNextFrame);
+                }
+            }
+        }
+
+        private void PauseImpl()
+        {
+            _playing--;
+            _idle = false;
+
+            if (_playing == 0)
+            {
+                _ticking = false;
+
+                var task = Volatile.Read(ref _task);
+                if (task == null && _requested)
+                {
+                    if (_presentation.Source is DelayedFileSource delayed && !delayed.IsDownloadingCompleted)
+                    {
+                        delayed.DownloadFile(DelayedFileDownload.Unloaded);
+                    }
+                }
+            }
+        }
+
+        private void SeekImpl(string marker)
+        {
+            var pause = _playing > 0;
+
+            _nextMarker = marker;
+            Interlocked.Exchange(ref _loopCount, 0);
+
+            if (pause)
+            {
+                PauseImpl();
+            }
+
+            PlayImpl();
+        }
+
+        public void Ready(AnimatedImageTask task)
+        {
+            _dispatcherQueue.TryEnqueue(() => ReadyImpl(task));
+        }
+
+        private void ReadyImpl(AnimatedImageTask task)
+        {
+            if (_loaded > 0)
+            {
+                Volatile.Write(ref _task, task);
+                FrameRate = task.FrameRate;
+
+                CreateResources();
+
+                _ticking = (_idle && _presentation.AutoPlay) || (_playing > 0 && (_activated || _presentation.LoopCount > 0));
+                _idle = false;
+
+                if (_ticking)
+                {
+                    if (Interlocked.CompareExchange(ref _timerSubscribed, 1, 0) == 0)
+                    {
+                        _loader.Flusher.Subscribe(this);
+                    }
+                }
+                else
+                {
+                    _workerQueue.Run(RenderNextFrame);
+                }
+            }
+            else if (_tracker == 0)
+            {
+                UnsubscribeSource();
+
+                _loader.Activated -= OnActivated;
+                _loader.PopupActivated -= OnActivated;
+                _loader.Remove(_presentation);
+
+                // Ticking should be always false here
+                if (_ticking)
+                {
+                    //Logger.Debug("Task exists, and timer is attached");
+                    _disposing = true;
+                    _ticking = false;
+                }
+                else
+                {
+                    //Logger.Debug("Task exists, and timer is not attached");
+                    Dispose();
+                }
+            }
+        }
+
+        #region Resources
+
+        private IBuffer _foregroundNext;
+        private IBuffer _backgroundNext;
+
+        // The one decode buffer, which the two above pass between the worker and the flush, held
+        // apart so that it goes back to the pool whichever of them it happens to be in. One is
+        // enough because the frame on screen is the bitmap's own copy: the worker decodes the next
+        // one while it shows.
+        private IBuffer _buffer;
+
+        private AnimatedImageBitmap _bitmap;
+        private volatile bool _bitmapShown;
+
+        // On the UI thread, from the frame loop's tick, because the bitmap belongs to it.
+        // Returns false when the frame has to be drawn again later; drawn says whether anything was.
+        internal bool FlushFrame(ref bool drawn)
+        {
+            var next = Interlocked.Exchange(ref _foregroundNext, null);
+            if (next == null)
+            {
+                return true;
+            }
+
+            var bitmap = Volatile.Read(ref _bitmap);
+
+            if (_disposed || bitmap == null)
+            {
+                Interlocked.Exchange(ref _backgroundNext, next);
+                return true;
+            }
+
+            bitmap.Write(next);
+            Interlocked.Exchange(ref _backgroundNext, next);
+
+            // Not for the bitmap, which XAML takes on its next frame, but for the clock: it stops
+            // while commits go unconfirmed, and that is what stops decoding in a minimized window.
+            drawn = true;
+
+            if (!_bitmapShown || PositionChanged != null)
+            {
+                BitmapUpdated();
+            }
+
+            return true;
+        }
+
+        private void BitmapUpdated()
+        {
+            var bitmap = Volatile.Read(ref _bitmap);
+            if (bitmap == null || _disposed)
+            {
+                return;
+            }
+
+            if (_dirty is false)
+            {
+                var task = Volatile.Read(ref _task);
+
+                foreach (var image in _images)
+                {
+                    image.Invalidate(bitmap, task?.PixelWidth ?? 0, task?.PixelHeight ?? 0, task?.Rotation ?? 0);
+                }
+
+                _dirty = true;
+                _bitmapShown = true;
+            }
+
+            var position = Volatile.Read(ref _nextPosition);
+            if (_prevPosition?.Position != position && PositionChanged != null)
+            {
+                _prevPosition ??= new AnimatedImagePositionChangedEventArgs();
+                _prevPosition.Position = position;
+
+                PositionChanged.Invoke(this, _prevPosition);
+            }
+        }
+
+        private readonly SemaphoreSlim _pausedLock = new(0, 1);
+
+        private void CreateResources()
+        {
+            var task = Volatile.Read(ref _task);
+            if (task == null)
+            {
+                return;
+            }
+
+            var width = task.PixelWidth;
+            var height = task.PixelHeight;
+
+            _buffer = _loader.Buffers.Rent(width, height);
+            _backgroundNext = _buffer;
+
+            if (_bitmap == null)
+            {
+                Volatile.Write(ref _bitmap, new AnimatedImageBitmap(_loader.Bitmaps, width, height));
+            }
+
+            _activated = _loader.Window.IsActive;
+
+            // Automatically pause only if looping
+            if (_presentation.LoopCount != 1)
+            {
+                _activated = true;
+                _loader.Activated += OnActivated;
+                _loader.PopupActivated += OnActivated;
+            }
+        }
+
+        private void InvokePaused()
+        {
+            Paused?.Invoke(this, EventArgs.Empty);
+
+            _playing = 0;
+            _pausedLock.Release();
+        }
+
+        private void OnActivated(object sender, PopupActivatedEventArgs args)
+        {
+            if (_presentation.IsPopup)
+            {
+                OnActivated(_loader.Window.IsActive);
+            }
+            else
+            {
+                OnActivated(_loader.Window.IsActive && !args.IsActive);
+            }
+        }
+
+        private void OnActivated(object sender, WindowActivatedEventArgs args)
+        {
+            if (_presentation.IsPopup)
+            {
+                OnActivated(args.IsActive);
+            }
+            else
+            {
+                OnActivated(args.IsActive && !_loader.Window.IsPopupOpened);
+            }
+        }
+
+        private void OnActivated(bool activated)
+        {
+            if (_disposed)
+            {
+                //UnregisterEvents();
+
+                _loader.Activated -= OnActivated;
+                _loader.PopupActivated -= OnActivated;
+                return;
+            }
+
+            Activated(activated);
+        }
+
+        public bool Activated(bool active)
+        {
+            if (_activated != active)
+            {
+                _activated = active;
+
+                if (_playing > 0 && !active)
+                {
+                    _ticking = false;
+                }
+                else if (Volatile.Read(ref _task) != null && _playing > 0 && !_ticking && _loopCount >= 0 && active)
+                {
+                    _ticking = true;
+
+                    if (Interlocked.CompareExchange(ref _timerSubscribed, 1, 0) == 0)
+                    {
+                        _loader.Flusher.Subscribe(this);
+                    }
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        #endregion
+
+        /// <summary>How often the task asks to be polled, which is not the rate it plays at.</summary>
+        public double FrameRate { get; private set; }
+
+        // The frame loop's, on its thread: when this is next due a poll.
+        private long _nextPoll;
+
+        // Set by the frame loop when it queues a decode, cleared once the decode has run, so a decode
+        // that outlasts a frame is not queued a second time on top of itself.
+        private int _decoding;
+
+        /// <summary>
+        /// Whether to queue a decode for the vblank at <paramref name="time"/>, on the frame loop's
+        /// thread. Polled at the task's rate rather than every vblank: Particles steps once per call,
+        /// and LimitFps is a poll rate.
+        /// </summary>
+        internal bool TryBeginDecode(long time)
+        {
+            if (Volatile.Read(ref _decoding) != 0)
+            {
+                return false;
+            }
+
+            var rate = FrameRate;
+            if (rate > 0)
+            {
+                // A quarter of a frame early still counts, or a 60 Hz poll on a 60 Hz clock would
+                // miss whenever the two drift a hair apart.
+                var interval = (long)(Stopwatch.Frequency / rate);
+                if (time + interval / 4 < _nextPoll)
+                {
+                    return false;
+                }
+
+                // Re-anchored after a gap rather than polled in a burst to catch up.
+                _nextPoll = time - _nextPoll > interval
+                    ? time + interval
+                    : _nextPoll + interval;
+            }
+
+            Volatile.Write(ref _decoding, 1);
+            return true;
+        }
+
+        /// <summary>A decode queued by <see cref="TryBeginDecode"/>, on a thread-pool thread.</summary>
+        internal void Decode(long time)
+        {
+            try
+            {
+                RenderNextFrame(time);
+            }
+            finally
+            {
+                Volatile.Write(ref _decoding, 0);
+            }
+        }
+
+        public void RenderNextFrame()
+        {
+            RenderNextFrame(Stopwatch.GetTimestamp());
+        }
+
+        private void RenderNextFrame(long time)
+        {
+            if (_loaded > 0 && !_disposing && !_disposed)
+            {
+                NextFrame(time);
+            }
+
+            if (!_ticking)
+            {
+                //Logger.Debug("-=");
+                if (Interlocked.CompareExchange(ref _timerSubscribed, 0, 1) == 1)
+                {
+                    _loader.Flusher.Unsubscribe(this);
+                }
+
+                if (_disposing)
+                {
+                    Dispose();
+                }
+            }
+        }
+
+        #region Next frame
+
+        private void NextFrame(long time)
+        {
+            var frame = Interlocked.Exchange(ref _backgroundNext, null);
+            if (frame != null)
+            {
+                bool rendered;
+
+                try
+                {
+                    rendered = NextFrame(frame, time);
+                }
+                catch
+                {
+                    // Put back, or the presenter never has a free buffer again and stops for good.
+                    Interlocked.Exchange(ref _backgroundNext, frame);
+                    throw;
+                }
+
+                if (rendered)
+                {
+                    var dropped = Interlocked.Exchange(ref _foregroundNext, frame);
+                    if (dropped != null)
+                    {
+                        Interlocked.Exchange(ref _backgroundNext, dropped);
+                    }
+
+                    _loader.Flusher.Request(this);
+                }
+                else
+                {
+                    Interlocked.Exchange(ref _backgroundNext, frame);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Shuts the gate, and closes the task and lets go of the buffers once nobody is inside a
+        /// frame. Called by <see cref="Dispose"/> and by the last borrow to end, whichever happens
+        /// second, so exactly one of them does the work.
+        /// </summary>
+        private void DisposeTask()
+        {
+            int borrows;
+
+            do
+            {
+                borrows = Volatile.Read(ref _borrows);
+
+                if (borrows < 0)
+                {
+                    return;
+                }
+            }
+            while (Interlocked.CompareExchange(ref _borrows, borrows | BorrowsClosed, borrows) != borrows);
+
+            // A render already inside the decoder cannot be waited for - this runs on the UI thread -
+            // so the last one out closes instead. Nothing new can join: the gate is shut above.
+            if (borrows == 0)
+            {
+                CloseTask();
+            }
+        }
+
+        private void CloseTask()
+        {
+            Interlocked.Exchange(ref _task, null)?.Dispose();
+
+            // Here and not in Dispose: a render still inside the gate is writing into one of the
+            // buffers, and given back any earlier it would be rented by another presenter, or
+            // freed by the pool, underneath that render.
+            ReleaseVisual();
+        }
+
+        private bool NextFrame(IBuffer frame, long time)
+        {
+            // The borrow. Dispose can run on the UI thread while this is inside the native renderer,
+            // and closing the animation underneath it would be a use-after-free. Reading the count
+            // and then dropping the task was not enough: a render starting between those two steps
+            // was invisible to the close and went on into a decoder that was being freed. Claiming
+            // a slot and finding the gate open is one interlocked step, so a close either sees this
+            // render or is refused by it, never neither.
+            int borrows;
+
+            do
+            {
+                borrows = Volatile.Read(ref _borrows);
+
+                if (borrows < 0)
+                {
+                    return false;
+                }
+            }
+            while (Interlocked.CompareExchange(ref _borrows, borrows + 1, borrows) != borrows);
+
+            try
+            {
+                return NextFrameCore(frame, time);
+            }
+            finally
+            {
+                // Only when the gate shut while this render was running, and this is the last one
+                // out: the closer is long gone and left the teardown here.
+                if (Interlocked.Decrement(ref _borrows) == BorrowsClosed)
+                {
+                    CloseTask();
+                }
+            }
+        }
+
+        private bool NextFrameCore(IBuffer frame, long time)
+        {
+            var task = Volatile.Read(ref _task);
+            if (task == null)
+            {
+                return false;
+            }
+
+            // A task that has stopped has no second frame to give - it is a still, and the bitmap
+            // it drew is still on screen. PlayImpl checks the same thing before queueing, but it
+            // cannot catch this on its own: the stop is only recorded once the render below has
+            // run, so two renders queued before the first one executes both pass that check.
+            if (_loopCount < 0)
+            {
+                return false;
+            }
+
+            // Into a local: the UI thread reads _nextPosition, and every task zeroes its out
+            // parameter on entry, so a Skip would publish position 0 between two real frames.
+            var state = task.Render(frame, time, out double position);
+            if (state != AnimatedImageTaskState.Skip)
+            {
+                Volatile.Write(ref _nextPosition, position);
+            }
+
+            if (state == AnimatedImageTaskState.Stop)
+            {
+                _ticking = false;
+                Interlocked.Exchange(ref _loopCount, -1);
+            }
+            else if (state == AnimatedImageTaskState.Loop)
+            {
+                _prevCompleted ??= new AnimatedImageLoopCompletedEventArgs();
+                _prevCompleted.Cancel = false;
+                _prevCompleted.LoopCount = Interlocked.Increment(ref _loopCount);
+
+                LoopCompleted?.Invoke(this, _prevCompleted);
+
+                if (_prevCompleted.Cancel || (_loopCount >= _presentation.LoopCount && _presentation.LoopCount > 0))
+                {
+                    _ticking = false;
+                    Interlocked.Exchange(ref _loopCount, 0);
+
+                    _dispatcherQueue.TryEnqueue(InvokePaused);
+                    _pausedLock.Wait();
+                }
+            }
+
+            return state != AnimatedImageTaskState.Skip;
+        }
+
+        #endregion
+
+        private void Dispose()
+        {
+            //Logger.Debug();
+            //Debug.Assert(_images.Count == 0);
+
+            //_dispatcherQueue.TryEnqueue(UnregisterEvents);
+
+            _disposing = false;
+            _disposed = true;
+
+            DisposeTask();
+
+            Interlocked.Exchange(ref _foregroundNext, null);
+            Interlocked.Exchange(ref _backgroundNext, null);
+
+            _loader.Activated -= OnActivated;
+            _loader.PopupActivated -= OnActivated;
+            _loader.Remove(_presentation);
+        }
+
+        /// <summary>
+        /// The half of teardown that belongs to the UI thread. CloseTask runs on whichever thread
+        /// closes the gate last - the UI thread, the scheduler one whenever UnloadImpl deferred
+        /// while ticking, or a decode that was still inside a frame - and both pools live on the UI
+        /// thread, so the buffer and the bitmap are posted back to it.
+        /// </summary>
+        private void ReleaseVisual()
+        {
+            var buffer = Interlocked.Exchange(ref _buffer, null);
+            var bitmap = Interlocked.Exchange(ref _bitmap, null);
+
+            _bitmapShown = false;
+
+            if (buffer == null && bitmap == null)
+            {
+                return;
+            }
+
+            var pool = _loader.Buffers;
+
+            if (_dispatcherQueue.HasThreadAccess)
+            {
+                ReleaseVisual(pool, buffer, bitmap);
+            }
+            else
+            {
+                // A failed enqueue means the dispatcher is going away, and both pools live on it -
+                // there is nothing left to return them to.
+                _dispatcherQueue.TryEnqueue(() => ReleaseVisual(pool, buffer, bitmap));
+            }
+        }
+
+        private static void ReleaseVisual(AnimatedImageLoader.BufferRecyclePool pool, IBuffer buffer, AnimatedImageBitmap bitmap)
+        {
+            bitmap?.Release();
+            pool.Return(buffer);
+        }
+    }
+
+    /// <summary>
+    /// The bitmap a presenter copies its frames into, shared with the images showing it. The last
+    /// of them to let go returns it to the pool, so an image that keeps its frame across a source
+    /// change does not go blank while the next source loads. UI thread only, like the bitmap.
+    /// </summary>
+    public sealed unsafe partial class AnimatedImageBitmap
+    {
+        private readonly AnimatedImageLoader.BitmapRecyclePool _pool;
+
+        // Fixed for the bitmap's lifetime, so taken once rather than on every frame.
+        private readonly byte* _pixels;
+        private readonly int _length;
+
+        private int _references = 1;
+
+        public AnimatedImageBitmap(AnimatedImageLoader.BitmapRecyclePool pool, int width, int height)
+        {
+            _pool = pool;
+            _length = width * height * 4;
+
+            Bitmap = pool.Rent(width, height);
+            Bitmap.Buffer(out _pixels);
+        }
+
+        public WriteableBitmap Bitmap { get; }
+
+        // The frame may be longer than the bitmap: the buffer pool hands out any that is long enough.
+        public void Write(IBuffer frame)
+        {
+            frame.Buffer(out byte* source);
+            System.Buffer.MemoryCopy(source, _pixels, _length, _length);
+
+            Bitmap.Invalidate();
+        }
+
+        public bool TryAddRef()
+        {
+            if (_references == 0)
+            {
+                return false;
+            }
+
+            _references++;
+            return true;
+        }
+
+        public void Release()
+        {
+            if (--_references == 0)
+            {
+                _pool.Return(Bitmap);
+            }
+        }
+    }
+
+    public enum AnimatedImageTaskState
+    {
+        // All good
+        None,
+
+        // Buffer was not updated
+        Skip,
+
+        // Animation must stop right away
+        Stop,
+
+        // A cycle was completed
+        Loop,
+    }
+
+    public partial class LottieAnimatedImageTask : AnimatedImageTask
+    {
+        private readonly LottieAnimation _animation;
+        private readonly bool _shouldStop;
+
+        private readonly HashSet<int> _markers;
+
+        public LottieAnimatedImageTask(LottieAnimation animation, AnimatedImagePresentation presentation)
+            : base(presentation)
+        {
+            _animation = animation;
+            _shouldStop = !presentation.Source.IsAnimated;
+
+            _markers = presentation.Source.Markers?.Values.ToHashSet();
+
+            PixelWidth = presentation.PixelWidth; //animation.PixelWidth;
+            PixelHeight = presentation.PixelHeight; //animation.PixelHeight;
+
+            // The poll rate only: LimitFps polls a 60 fps animation at 30, and the clock then picks
+            // every other frame.
+            var frameRate = Math.Clamp(animation.FrameRate, 30, presentation.LimitFps ? 30 : 60);
+            var interval = TimeSpan.FromMilliseconds(Math.Floor(1000 / frameRate));
+
+            Interval = interval;
+            FrameRate = frameRate;
+
+            _frameRate = animation.FrameRate > 0 ? animation.FrameRate : 60;
+        }
+
+        private readonly double _frameRate;
+
+        // The next frame to render, one past the last one rendered.
+        private int _index;
+
+        public override AnimatedImageTaskState NextFrame(IBuffer frame, out double position)
+        {
+            position = 0;
+
+            // Held, not rendered, while this animation's own cache is building: a cold panel is
+            // hundreds of these at once, and rendering them live is the cost the cache exists to
+            // avoid. The first frame is already on screen, so it holds rather than blanks.
+            if (_animation.IsCaching)
+            {
+                return AnimatedImageTaskState.Skip;
+            }
+            else if (_markers != null && _markers.Contains(_index))
+            {
+                return AnimatedImageTaskState.Stop;
+            }
+
+            var total = _animation.TotalFrame;
+            var clock = Advance(_index / _frameRate);
+
+            // The nearest frame, not the last one to have started. Polls land on vblanks, and when an
+            // animation at the display's rate has its frame boundaries there too, a millisecond of
+            // jitter either side repeated a frame and then skipped one; rounding puts the boundaries
+            // half a frame away.
+            var due = (int)Math.Floor(clock * _frameRate + 0.5);
+            if (due < _index)
+            {
+                return AnimatedImageTaskState.Skip;
+            }
+
+            // Behind, the frames in between are skipped - but never the last one, which is what
+            // reports the loop, and never past a marker, which stops on the frame before it.
+            var target = Math.Max(0, Math.Min(due, total - 1));
+
+            if (_markers != null)
+            {
+                foreach (var marker in _markers)
+                {
+                    if (marker > _index && marker <= target)
+                    {
+                        target = marker - 1;
+                    }
+                }
+            }
+
+            _animation.RenderSync(frame, target);
+
+            _index = target + 1;
+
+            if (total == 1 || _shouldStop)
+            {
+                _index = 0;
+                return AnimatedImageTaskState.Stop;
+            }
+            else if (_index >= total)
+            {
+                // What the clock ran past the end is carried into the next loop, or every loop
+                // would lose it.
+                _index = 0;
+                SetClock(clock - total / _frameRate);
+
+                return AnimatedImageTaskState.Loop;
+            }
+
+            position = _index;
+            return AnimatedImageTaskState.None;
+        }
+
+        public override void Seek(string marker)
+        {
+            if (_presentation.Source.Markers.TryGetValue(marker, out int index))
+            {
+                _index = index + 1;
+                SetClock(_index / _frameRate);
+            }
+        }
+
+        public override void Dispose()
+        {
+            _animation.Dispose();
+        }
+    }
+
+    public partial class VideoAnimatedImageTask : AnimatedImageTask
+    {
+        private readonly CachedVideoAnimation _animation;
+        private readonly bool _shouldStop;
+
+        public VideoAnimatedImageTask(CachedVideoAnimation animation, AnimatedImagePresentation presentation)
+            : base(presentation)
+        {
+            _animation = animation;
+            _shouldStop = !presentation.Source.IsAnimated;
+
+            PixelWidth = animation.PixelWidth;
+            PixelHeight = animation.PixelHeight;
+            Rotation = animation.Rotation;
+
+            // Only how often the task is polled: the frames carry their own timestamps and
+            // NextFrame skips until the one it holds is due.
+            var frameRate = Math.Clamp(animation.FrameRate, 1, 60 /*presentation.LimitFps ? 30 : 60*/);
+            var interval = TimeSpan.FromMilliseconds(Math.Floor(1000 / frameRate));
+
+            Interval = interval;
+            FrameRate = frameRate;
+
+            _pollInterval = 1 / frameRate;
+            Rewind();
+        }
+
+        private int _index;
+
+        private readonly double _pollInterval;
+
+        // The timestamp of the frame on screen, and the gap before it. A frame's own length is not
+        // known, so that gap is what a loop's last frame is held for.
+        private double _lastPosition;
+        private double _frameDuration;
+
+        // The cache reports the end of a loop on its last frame, so the frame after the one on
+        // screen is the next loop's first.
+        private bool _loopEnded;
+
+        // A decoded frame waiting for its own timestamp, in the buffer it was decoded into. Each
+        // frame is shown at its timestamp, which is only known once it is decoded: holding the one
+        // on screen for the gap before it instead puts a variable frame rate's long holds after
+        // the wrong frames. The presenter has a single decode buffer and hands it back untouched on
+        // a Skip, so the frame is still in it on the next poll; anything else drops the frame.
+        private IBuffer _pending;
+        private double _pendingDue;
+        private double _pendingSeconds;
+        private bool _pendingCompleted;
+        private bool _pendingWrapped;
+
+        public override AnimatedImageTaskState NextFrame(IBuffer frame, out double position)
+        {
+            position = 0;
+
+            // Still asked, and only here: a video's cache build walks the same decoder this would
+            // decode from, so it has to stand aside until the build is done. Lottie has random
+            // access and does not.
+            if (_animation.IsCaching)
+            {
+                return AnimatedImageTaskState.Skip;
+            }
+
+            if (_pending != frame)
+            {
+                _pending = null;
+            }
+
+            var clock = Advance(_pending != null ? _pendingDue : _lastPosition + _frameDuration);
+
+            if (_pending == null)
+            {
+                clock = Decode(frame, clock);
+            }
+
+            // Half a poll early counts, for the reason LottieAnimatedImageTask rounds: a deadline
+            // that falls on a vblank is otherwise met or missed by jitter.
+            if (clock + _pollInterval / 2 < _pendingDue)
+            {
+                return AnimatedImageTaskState.Skip;
+            }
+
+            var seconds = _pendingSeconds;
+            var completed = _pendingCompleted;
+
+            _pending = null;
+            _lastPosition = seconds;
+            _index++;
+
+            // completed is authoritative, and TotalFrame deliberately is not: it is 0 until a
+            // cache exists, because a video producer cannot know its length in advance. Comparing
+            // it against _index used to be a second opinion on where the end is, and the two
+            // disagreed the moment a cache was adopted part-way through - TotalFrame jumped to the
+            // real count while _index was mid-loop. _index now only distinguishes a video whose
+            // first frame is also its last.
+            if (_shouldStop || (completed && _index == 1))
+            {
+                _index = 0;
+                Rewind();
+                return AnimatedImageTaskState.Stop;
+            }
+            else if (completed)
+            {
+                _index = 0;
+                _loopEnded = !_pendingWrapped;
+
+                return AnimatedImageTaskState.Loop;
+            }
+
+            position = seconds;
+            return AnimatedImageTaskState.None;
+        }
+
+        // Returns the clock, moved back by the loop's length when the frame starts the next loop.
+        private double Decode(IBuffer frame, double clock)
+        {
+            var previous = _lastPosition;
+
+            if (_loopEnded)
+            {
+                _loopEnded = false;
+                clock = NextLoop(clock, ref previous);
+            }
+
+            // Within a frame and a half of the clock the next frame is on time. Further behind, the
+            // frames before the clock are passed over rather than every one of them shown late.
+            var behind = clock - (previous + _frameDuration) > _frameDuration * 1.5;
+
+            _animation.RenderSync(frame, behind ? clock - _frameDuration : 0, out double seconds, out bool completed);
+
+            // Live decoding seeks back and decodes on in the same call, so it reports the end of a
+            // loop on the next loop's first frame: the timestamp going back tells it apart from
+            // the cache's report on the last frame.
+            var wrapped = completed && seconds < previous;
+            if (wrapped)
+            {
+                clock = NextLoop(clock, ref previous);
+            }
+
+            // A gap that spans skipped frames is not a frame's length, so it is only measured on
+            // time. A timestamp that did not move forward means the frame was not rendered at all,
+            // and is shown at once rather than paced off.
+            if (seconds > previous)
+            {
+                if (!behind)
+                {
+                    _frameDuration = seconds - previous;
+                }
+
+                _pendingDue = seconds;
+            }
+            else
+            {
+                _pendingDue = clock;
+            }
+
+            _pending = frame;
+            _pendingSeconds = seconds;
+            _pendingCompleted = completed;
+            _pendingWrapped = wrapped;
+
+            return clock;
+        }
+
+        // As though the loop's last frame had been held for its length, and with what the clock ran
+        // past that carried into the next one.
+        private double NextLoop(double clock, ref double previous)
+        {
+            clock -= previous + _frameDuration;
+            SetClock(clock);
+
+            previous = -_frameDuration;
+            return clock;
+        }
+
+        private void Rewind()
+        {
+            SetClock(0);
+
+            // One poll behind zero, so the first decode is not taken for one that fell behind.
+            _frameDuration = _pollInterval;
+            _lastPosition = -_pollInterval;
+
+            _loopEnded = false;
+            _pending = null;
+        }
+
+        public override void Dispose()
+        {
+            _animation.Dispose();
+
+            if (_presentation.Source is RemoteFileSource remote)
+            {
+                remote.Close();
+            }
+        }
+    }
+
+    public partial class WebpAnimatedImageTask : AnimatedImageTask
+    {
+        // Dropped as soon as it has been handed over. A still is decoded once on the loader queue
+        // and copied into the presenter's bitmap, which then owns those pixels - holding them here
+        // as well is a second copy of every static sticker on screen, and a panel has hundreds.
+        private IBuffer _animation;
+
+        public WebpAnimatedImageTask(IBuffer animation, int pixelWidth, int pixelHeight, AnimatedImagePresentation presentation)
+            : base(presentation)
+        {
+            _animation = animation;
+
+            PixelWidth = pixelWidth;
+            PixelHeight = pixelHeight;
+
+            Interval = TimeSpan.FromMilliseconds(1000d / 30);
+            FrameRate = 30;
+        }
+
+        public override AnimatedImageTaskState NextFrame(IBuffer frame, out double position)
+        {
+            position = 0;
+
+            var animation = _animation;
+            _animation = null;
+
+            // Stop is returned below, so there is no second frame to serve and nothing to decode
+            // it from. Reaching here twice means something drove a stopped task.
+            Debug.Assert(animation != null, "WebpAnimatedImageTask rendered twice");
+
+            if (animation != null)
+            {
+                BufferSurface.Copy(animation, frame);
+            }
+
+            return AnimatedImageTaskState.Stop;
+        }
+    }
+
+    public partial class ParticlesAnimatedImageTask : AnimatedImageTask
+    {
+        private readonly ParticlesAnimation _animation;
+
+        public ParticlesAnimatedImageTask(ParticlesAnimation animation, AnimatedImagePresentation presentation)
+            : base(presentation)
+        {
+            _animation = animation;
+
+            PixelWidth = animation.PixelWidth;
+            PixelHeight = animation.PixelHeight;
+
+            Interval = TimeSpan.FromMilliseconds(Math.Floor(1000d / 30));
+            FrameRate = 30;
+        }
+
+        public override AnimatedImageTaskState NextFrame(IBuffer frame, out double position)
+        {
+            _animation.RenderSync(frame);
+
+            position = 0;
+            return AnimatedImageTaskState.None;
+        }
+    }
+
+    /// <summary>
+    /// A dice: up to three lottie layers stacked into one frame, and the switch from the state it
+    /// rolls on to the state it lands on.
+    /// </summary>
+    /// <remarks>
+    /// The switch lives here rather than in a change of the control's <see cref="AnimatedImage.Source"/>
+    /// because it has to happen on a loop boundary and not before the next animation is loaded -
+    /// two moments, on two threads. Replacing the source would tear the presenter down between
+    /// them and blank the message; swapping a field inside the running task cannot.
+    /// </remarks>
+    public partial class DiceAnimatedImageTask : AnimatedImageTask
+    {
+        private readonly DiceFileSource _source;
+
+        // Slot machine only. The chrome is a still, so it is rendered once and copied under every
+        // frame rather than re-rendered as one - the cheapest layer should not be the dearest.
+        private readonly IBuffer _backdrop;
+        private readonly LottieAnimation _lever;
+
+        private LottieAnimation _reels;
+
+        // The final state, loaded while the initial one is still looping. Published by the thread
+        // that built it and taken by the render thread at a loop boundary, the one point where
+        // exchanging it does not show.
+        private LottieAnimation _next;
+        private int _preparing;
+        private volatile bool _disposed;
+
+        private int _index;
+        private int _leverIndex;
+
+        // The initial state loops for as long as the message takes to send; the final one plays
+        // once and is done.
+        private bool _looping;
+        private bool _completed;
+
+        public DiceAnimatedImageTask(DiceFileSource source, LottieAnimation reels, IBuffer backdrop, LottieAnimation lever, bool looping, AnimatedImagePresentation presentation)
+            : base(presentation)
+        {
+            _source = source;
+            _reels = reels;
+            _backdrop = backdrop;
+            _lever = lever;
+            _looping = looping;
+
+            // A result that has already been seen opens on its last frame. Re-rolling it every time
+            // the message scrolls back into view would be a lie about when it happened.
+            _index = looping || source.IsContentUnread ? 0 : reels.TotalFrame - 1;
+
+            PixelWidth = presentation.PixelWidth;
+            PixelHeight = presentation.PixelHeight;
+
+            var frameRate = Math.Clamp(reels.FrameRate, 30, presentation.LimitFps ? 30 : 60);
+
+            Interval = TimeSpan.FromMilliseconds(Math.Floor(1000 / frameRate));
+            FrameRate = frameRate;
+
+            // The initial state's, kept for the final one: the clock is counted in frames, and both
+            // states come from the same set.
+            _frameRate = reels.FrameRate > 0 ? reels.FrameRate : 60;
+        }
+
+        private readonly double _frameRate;
+
+        // The frame the clock was on at the last render, counted from the start and never wrapped.
+        private int _frame = -1;
+
+        public override AnimatedImageTaskState NextFrame(IBuffer frame, out double position)
+        {
+            position = 0;
+
+            var reels = _reels;
+            if (reels == null)
+            {
+                return AnimatedImageTaskState.Skip;
+            }
+
+            var clock = Advance((_frame + 1) / _frameRate);
+            // The nearest frame, as in LottieAnimatedImageTask.
+            var due = (int)Math.Floor(clock * _frameRate + 0.5);
+
+            if (due <= _frame)
+            {
+                return AnimatedImageTaskState.Skip;
+            }
+
+            // Frames to skip on top of the next one, when behind.
+            var extra = due - _frame - 1;
+            _frame = due;
+
+            // The result is taken at frame zero, which is the loop boundary and also the state a
+            // task that has not played yet is in. One rule covers both: a dice whose result arrives
+            // while it is still rolling waits for the roll to come round, and one whose result
+            // arrives before anything started moves to it now rather than rolling once for nothing.
+            if (_looping)
+            {
+                LottieAnimation next = null;
+
+                if (_index == 0)
+                {
+                    next = Interlocked.Exchange(ref _next, null);
+                }
+
+                if (next != null)
+                {
+                    reels.Dispose();
+
+                    reels = _reels = next;
+                    _looping = false;
+                }
+                else
+                {
+                    // Asked on every frame, and not only on the boundary the swap happens on. The
+                    // roll is a placeholder for a result that is still coming, so the load has to
+                    // start the moment it can: asking once a turn spent one whole turn noticing the
+                    // result and another loading it, and swapped on the third.
+                    Prepare();
+                }
+            }
+
+            // Not past the end of a roll, the boundary the result is taken up on.
+            if (extra > 0)
+            {
+                _index = Math.Min(_index + extra, reels.TotalFrame - 1);
+
+                if (_lever != null)
+                {
+                    _leverIndex = Math.Max(_leverIndex, Math.Min(_leverIndex + extra, _lever.TotalFrame - 1));
+                }
+            }
+
+            // Bottom to top into the one buffer: the first layer replaces what the buffer held, and
+            // everything above it composites over what is already there.
+            if (_backdrop != null)
+            {
+                BufferSurface.Copy(_backdrop, frame);
+                reels.RenderSync(frame, _index, false);
+            }
+            else
+            {
+                reels.RenderSync(frame, _index, true);
+            }
+
+            if (_lever != null)
+            {
+                _lever.RenderSync(frame, _leverIndex, false);
+            }
+
+            // Pulled once, and left down for every roll after it.
+            if (_lever != null && _leverIndex + 1 < _lever.TotalFrame)
+            {
+                _leverIndex++;
+            }
+
+            // Only the final state reports its frames. A caller watching for one particular frame
+            // of the result - the point a win throws confetti - would otherwise see the initial
+            // state come round on it again and again.
+            position = _looping ? 0 : _index;
+
+            if (_index + 1 < reels.TotalFrame)
+            {
+                _index++;
+                return AnimatedImageTaskState.None;
+            }
+
+            if (!_looping)
+            {
+                // Loop once to say the result has played out, and Stop on the tick after it so that
+                // nothing drives this again. Two ticks rather than one because Stop hands its
+                // buffer forward like any other frame, and a buffer nothing wrote into holds the
+                // frame before last. The index is left at the end, so both draw the result.
+                if (_completed)
+                {
+                    return AnimatedImageTaskState.Stop;
+                }
+
+                _completed = true;
+                return AnimatedImageTaskState.Loop;
+            }
+
+            // Round again, and the top of the next frame is where the result is taken up if it has
+            // arrived. Not Loop: that is what tells the presenter the result has played out, and
+            // what stops it - a roll coming round has done neither.
+            _index = 0;
+
+            return AnimatedImageTaskState.None;
+        }
+
+        /// <summary>
+        /// Starts loading the final state, if the server has named it and its files have arrived.
+        /// Asked on every frame of the initial state, which is what that state is waiting for.
+        /// </summary>
+        /// <remarks>
+        /// Ordered so that the frames with nothing to do - every frame until the result lands - cost
+        /// a volatile read and a handful of field reads, and allocate nothing. The interlocked gate
+        /// is reached only by the one frame that starts the load, and is never given back: a result
+        /// is loaded once, and a file that would not parse will not parse on the next frame either.
+        /// </remarks>
+        private void Prepare()
+        {
+            if (Volatile.Read(ref _preparing) != 0)
+            {
+                return;
+            }
+
+            var state = _source.FinalState;
+            if (state == null || !state.IsDownloadingCompleted())
+            {
+                return;
+            }
+
+            if (Interlocked.Exchange(ref _preparing, 1) != 0)
+            {
+                return;
+            }
+
+            var width = _presentation.PixelWidth;
+            var height = _presentation.PixelHeight;
+
+            // Off this thread: merging three reels is a gzip and three JSON documents, and the
+            // scheduler that calls NextFrame is shared with every other animation on screen.
+            Task.Run(() =>
+            {
+                var animation = DiceFileSource.CreateReels(state, width, height);
+                if (animation is not { TotalFrame: > 0 })
+                {
+                    // Nothing to swap to. The initial state carries on looping, which is a better
+                    // answer than a frame of whatever the buffer happened to hold.
+                    animation?.Dispose();
+                    return;
+                }
+
+                Interlocked.Exchange(ref _next, animation)?.Dispose();
+
+                // Disposed while this was loading: nothing will ever come to take it, and it holds
+                // a parsed document and its buffers until something does.
+                if (_disposed)
+                {
+                    Interlocked.Exchange(ref _next, null)?.Dispose();
+                }
+            });
+        }
+
+        public override void Dispose()
+        {
+            _disposed = true;
+
+            // No lock against NextFrame: the presenter holds this off until no render is in flight,
+            // which is the same guarantee every other task relies on.
+            _reels?.Dispose();
+            _lever?.Dispose();
+
+            Interlocked.Exchange(ref _next, null)?.Dispose();
+        }
+    }
+
+    public abstract class AnimatedImageTask
+    {
+        protected readonly AnimatedImagePresentation _presentation;
+
+        protected AnimatedImageTask(AnimatedImagePresentation presentation)
+        {
+            _presentation = presentation;
+        }
+
+        public int PixelWidth { get; init; }
+        public int PixelHeight { get; init; }
+
+        public int Rotation { get; init; }
+
+        public TimeSpan Interval { get; init; }
+
+        /// <summary>How often the task is polled, which is not the rate it plays at.</summary>
+        public double FrameRate { get; init; }
+
+        private long _time;
+        private long _lastTick;
+        private double _clock;
+
+        /// <summary>
+        /// Renders the frame for <paramref name="time"/>, a <see cref="Stopwatch"/> timestamp: the
+        /// vblank the frame loop queued this for, or now for a render outside it.
+        /// </summary>
+        public AnimatedImageTaskState Render(IBuffer frame, long time, out double position)
+        {
+            _time = time;
+            return NextFrame(frame, out position);
+        }
+
+        /// <summary>
+        /// Playback time in seconds, advanced by the time since the previous call. Frames are chosen
+        /// from it rather than one per call, because a call is a decode and a decode that misses its
+        /// vblank is skipped, not waited for.
+        /// </summary>
+        /// <param name="resume">
+        /// Where to pick up after a gap of more than four polls - paused, starved behind a stalled UI
+        /// thread, waiting for a cache build: the frame that was next, so a stall plays as a pause and
+        /// not as a jump. Shorter shortfalls are left on the clock, for the caller to catch up on.
+        /// </param>
+        protected double Advance(double resume)
+        {
+            var now = _time;
+
+            // Not backwards: a render outside the loop, stamped now, can run before a loop decode
+            // stamped with the vblank before it.
+            if (now <= _lastTick)
+            {
+                return _clock;
+            }
+
+            if (_lastTick != 0)
+            {
+                var elapsed = (now - _lastTick) / (double)Stopwatch.Frequency;
+
+                _clock = elapsed > 4 / FrameRate
+                    ? resume
+                    : _clock + elapsed;
+            }
+
+            _lastTick = now;
+            return _clock;
+        }
+
+        protected void SetClock(double clock)
+        {
+            _clock = clock;
+        }
+
+        public abstract AnimatedImageTaskState NextFrame(IBuffer frame, out double position);
+
+        /// <summary>
+        /// Closes the native animation. Dropping the reference is not enough: it holds a decoder,
+        /// a cache file handle and its buffers, and nothing else releases them deterministically.
+        /// </summary>
+        public virtual void Dispose()
+        {
+
+        }
+
+        public virtual void Seek(string marker)
+        {
+
+        }
+    }
+
+    public record AnimatedImagePresentation(AnimatedImageSource Source, int PixelWidth, int PixelHeight, double RasterizationScale, bool LimitFps, int LoopCount, bool AutoPlay, bool IsCachingEnabled, AnimatedImageResizeMode ResizeMode, bool IsPopup);
+
+    public partial class AnimatedImageLoader
+    {
+        private readonly DispatcherQueue _dispatcherQueue;
+        private readonly WindowContext _window;
+        private readonly Direct2DDevice _device;
+
+        public WindowContext Window => _window;
+
+        public Direct2DDevice Device
+        {
+            get
+            {
+                _device.HandleDeviceLost();
+                return _device;
+            }
+        }
+
+        private AnimatedImageLoader(WindowContext window)
+        {
+            _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
+            _window = window;
+
+            // Taken here because Direct2D.Current is per view thread, and the clock's thread has none.
+            _device = Direct2D.Current;
+
+            Flusher = new FrameFlusher(Device, BootStrapper.Current.Compositor, _dispatcherQueue);
+
+            Debug.Assert(_dispatcherQueue != null);
+        }
+
+        public FrameFlusher Flusher { get; }
+
+        /// <summary>
+        /// The frame clock of the window <paramref name="xamlRoot"/> is in, for anything else that
+        /// draws per frame on the UI thread. Null outside a window.
+        /// </summary>
+        public static FrameFlusher GetFlusher(XamlRoot xamlRoot)
+        {
+            var window = xamlRoot != null ? WindowContext.ForXamlRoot(xamlRoot) : null;
+            if (window != null)
+            {
+                return _loaders.GetOrAdd(xamlRoot, x => new AnimatedImageLoader(window)).Flusher;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Called by <see cref="FrameFlusher"/> on the UI thread on every tick while subscribed,
+        /// before the tick's frames are drawn.
+        /// </summary>
+        public interface IFrameTarget
+        {
+            /// <param name="time">The tick's vblank, in <see cref="Stopwatch"/> ticks.</param>
+            /// <returns>Whether it drew into a composition surface, which the tick then commits.</returns>
+            bool OnFrame(long time);
+        }
+
+        /// <summary>
+        /// The window's frame loop. Its thread only keeps time: on each 60 Hz tick of the compositor
+        /// clock that has work, it posts one item to the UI thread, which draws every presenter's
+        /// pending frame into its bitmap, asks for one commit, and queues the decodes for the next
+        /// tick. Not CompositionTarget.Rendering, which makes XAML run a frame on every vblank of a
+        /// 240 Hz display for content that needs 60 at most.
+        /// </summary>
+        /// <remarks>
+        /// Drawing and the commit request belong to the UI thread. RequestCommitAsync from any other
+        /// thread wakes it inside whatever synchronous COM call it is making, and a XAML timer that
+        /// runs there under an event handler fails fast in OnReentrancyProtectedWindowMessage - 13.1
+        /// crashed on link clicks this way. A surface drawn from another thread is held by DComp
+        /// until a commit takes it, and a stalled UI thread takes none.
+        /// </remarks>
+        public sealed class FrameFlusher
+        {
+            private readonly object _lock = new();
+            private readonly HashSet<AnimatedImagePresenter> _pending = new();
+            private readonly HashSet<AnimatedImagePresenter> _playing = new();
+            private readonly HashSet<IFrameTarget> _targets = new();
+            private readonly AutoResetEvent _signal = new(false);
+            private readonly Direct2DDevice _device;
+            private readonly Compositor _compositor;
+            private readonly DispatcherQueue _dispatcherQueue;
+            private readonly DispatcherQueueHandler _tick;
+            private Thread _thread;
+            private volatile bool _closed;
+
+            // A tick's worth of frames each. DComp keeps every surface update until a commit takes
+            // it, and a minimized window takes none, so the clock stops posting while this many are
+            // unconfirmed. Not 1: a release build confirms a commit 22-42 ms after the request, and
+            // waiting for each one halved the frame rate.
+            private const int CommitsInFlight = 3;
+
+            // Presenters per thread-pool work item: a panel is a handful of items a frame, and one
+            // slow decode holds up few others.
+            private const int DecodeBatchSize = 16;
+
+            private static readonly WaitCallback _decode = Decode;
+
+            // Not in use, handed back by the pool threads that ran them.
+            private readonly Stack<DecodeBatch> _batches = new();
+
+            // The UI thread's, reused by every tick.
+            private readonly List<AnimatedImagePresenter> _batch = new();
+            private readonly List<AnimatedImagePresenter> _retry = new();
+            private readonly List<AnimatedImagePresenter> _due = new();
+            private readonly List<IFrameTarget> _ticking = new();
+
+            // The vblank the posted tick plans for, and whether that tick has yet to run: at most one
+            // is ever queued, so a stalled UI thread finds one item waiting, not a backlog.
+            private long _time;
+            private int _posted;
+
+            public FrameFlusher(Direct2DDevice device, Compositor compositor, DispatcherQueue dispatcherQueue)
+            {
+                _device = device;
+                _compositor = compositor;
+                _dispatcherQueue = dispatcherQueue;
+                _tick = Tick;
+
+                for (int i = 0; i < _waiters.Length; i++)
+                {
+                    _waiters[i] = new CommitWaiter(this);
+                }
+            }
+
+            /// <summary>Draws the presenter's pending frame on the next pass.</summary>
+            public void Request(AnimatedImagePresenter presenter)
+            {
+                lock (_lock)
+                {
+                    if (_closed || !_pending.Add(presenter))
+                    {
+                        return;
+                    }
+
+                    Start();
+                }
+
+                _signal.Set();
+            }
+
+            /// <summary>Polls the presenter for a frame after every pass, at its task's rate.</summary>
+            public void Subscribe(AnimatedImagePresenter presenter)
+            {
+                lock (_lock)
+                {
+                    if (_closed || !_playing.Add(presenter))
+                    {
+                        return;
+                    }
+
+                    Start();
+                }
+
+                _signal.Set();
+            }
+
+            public void Unsubscribe(AnimatedImagePresenter presenter)
+            {
+                lock (_lock)
+                {
+                    _playing.Remove(presenter);
+                }
+            }
+
+            /// <summary>Calls the target on every pass until it unsubscribes.</summary>
+            public void Subscribe(IFrameTarget target)
+            {
+                lock (_lock)
+                {
+                    if (_closed || !_targets.Add(target))
+                    {
+                        return;
+                    }
+
+                    Start();
+                }
+
+                _signal.Set();
+            }
+
+            public void Unsubscribe(IFrameTarget target)
+            {
+                lock (_lock)
+                {
+                    _targets.Remove(target);
+                }
+            }
+
+            private void Start()
+            {
+                if (_thread == null)
+                {
+                    _thread = new Thread(Run) { IsBackground = true, Name = "AnimatedImage flush" };
+                    _thread.Start();
+                }
+            }
+
+            public void Close()
+            {
+                _closed = true;
+                _signal.Set();
+            }
+
+            private void Run()
+            {
+                var interval = Stopwatch.Frequency / 60;
+                var next = 0L;
+                var stuck = 0L;
+
+                while (!_closed)
+                {
+                    bool idle;
+
+                    lock (_lock)
+                    {
+                        idle = _pending.Count == 0 && _playing.Count == 0 && _targets.Count == 0;
+                    }
+
+                    // Asleep only while nothing plays: a playing presenter is polled every tick,
+                    // whether or not it had a frame for the last one.
+                    if (idle)
+                    {
+                        _signal.WaitOne();
+                        continue;
+                    }
+
+                    _device.WaitForCompositorClock();
+
+                    // The vblank the decodes queued by the tick render for.
+                    var time = Stopwatch.GetTimestamp();
+
+                    // 60 a second at most, whatever the display's rate. A quarter of a tick early
+                    // still counts, or a 60 Hz clock that drifts a hair from this one would miss.
+                    if (time + interval / 4 < next)
+                    {
+                        continue;
+                    }
+
+                    next = time - next > interval
+                        ? time + interval
+                        : next + interval;
+
+                    if (Volatile.Read(ref _posted) != 0)
+                    {
+                        continue;
+                    }
+
+                    if (InFlight >= CommitsInFlight)
+                    {
+                        // A completion can be lost - those for commits requested as the system went
+                        // to sleep never arrive - so a quarter of a second in, a tick goes anyway to
+                        // ask for an empty commit, whose completion accounts for them.
+                        if (stuck == 0)
+                        {
+                            stuck = time;
+                        }
+                        else if (time - stuck > Stopwatch.Frequency / 4)
+                        {
+                            stuck = time;
+                            Post(time);
+                        }
+
+                        continue;
+                    }
+
+                    stuck = 0;
+                    Post(time);
+                }
+
+                Drain();
+            }
+
+            private void Post(long time)
+            {
+                Volatile.Write(ref _time, time);
+                Volatile.Write(ref _posted, 1);
+
+                try
+                {
+                    if (_dispatcherQueue.TryEnqueue(_tick))
+                    {
+                        return;
+                    }
+                }
+                catch
+                {
+                    // The thread is going away with its window.
+                }
+
+                Volatile.Write(ref _posted, 0);
+            }
+
+            private void Tick()
+            {
+                try
+                {
+                    TickCore();
+                }
+                finally
+                {
+                    Volatile.Write(ref _posted, 0);
+                }
+            }
+
+            private void TickCore()
+            {
+                if (_closed)
+                {
+                    return;
+                }
+
+                if (InFlight >= CommitsInFlight)
+                {
+                    // Posted only to find out about lost completions, one empty request at a time.
+                    // A compositor that is not committing at all - a minimized window - leaves it
+                    // waiting with the rest.
+                    if (Volatile.Read(ref _taken) >= _probe)
+                    {
+                        RequestCommit();
+                        _probe = _requested;
+                    }
+
+                    return;
+                }
+
+                var time = Volatile.Read(ref _time);
+
+                lock (_lock)
+                {
+                    _batch.AddRange(_pending);
+                    _pending.Clear();
+
+                    foreach (var presenter in _playing)
+                    {
+                        _due.Add(presenter);
+                    }
+
+                    // A copy, because a target unsubscribes from inside its own call.
+                    foreach (var target in _targets)
+                    {
+                        _ticking.Add(target);
+                    }
+                }
+
+                var drawn = false;
+
+                foreach (var target in _ticking)
+                {
+                    try
+                    {
+                        drawn |= target.OnFrame(time);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Info($"Frame target threw exception: {ex.Message}");
+                    }
+                }
+
+                _ticking.Clear();
+
+                foreach (var presenter in _batch)
+                {
+                    try
+                    {
+                        if (!presenter.FlushFrame(ref drawn))
+                        {
+                            _retry.Add(presenter);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // One presenter's failure is not the tick's.
+                        Logger.Info($"Animation threw exception: {ex.Message}");
+                    }
+                }
+
+                _batch.Clear();
+
+                // All of the tick's updates in one commit.
+                if (drawn)
+                {
+                    RequestCommit();
+                }
+
+                if (_retry.Count > 0)
+                {
+                    // A draw fails while the device is being replaced: the next tick tries again.
+                    lock (_lock)
+                    {
+                        foreach (var presenter in _retry)
+                        {
+                            _pending.Add(presenter);
+                        }
+                    }
+
+                    _retry.Clear();
+                }
+
+                // After drawing, which is what handed each presenter its free buffer back. The
+                // decodes then have most of a tick to finish before the next one draws them.
+                Queue(_due, time);
+                _due.Clear();
+            }
+
+            #region Commits
+
+            // Sequence numbers rather than a count. Commits are taken in order, so a completion also
+            // accounts for the requests before it, including any whose own completion never arrives:
+            // those made as the system went to sleep did not, and counting them shut the gate for good.
+            // _requested and _probe are written on the UI thread only.
+            private long _requested;
+            private long _taken;
+            private long _probe;
+
+            private readonly CommitWaiter[] _waiters = new CommitWaiter[16];
+
+            private long InFlight => Volatile.Read(ref _requested) - Volatile.Read(ref _taken);
+
+            private void RequestCommit()
+            {
+                var sequence = _requested + 1;
+
+                try
+                {
+                    var action = _compositor.RequestCommitAsync();
+                    var waiter = _waiters[sequence % _waiters.Length];
+
+                    waiter.Sequence = sequence;
+                    Volatile.Write(ref _requested, sequence);
+
+                    action.Completed = waiter.Handler;
+                }
+                catch
+                {
+                    // The compositor is going away with its window, and there is nothing to wait for.
+                }
+            }
+
+            private void Take(long sequence)
+            {
+                var taken = Volatile.Read(ref _taken);
+
+                while (taken < sequence)
+                {
+                    var seen = Interlocked.CompareExchange(ref _taken, sequence, taken);
+                    if (seen == taken)
+                    {
+                        break;
+                    }
+
+                    taken = seen;
+                }
+            }
+
+            /// <summary>
+            /// The completion of one commit request, reused round-robin so that a request allocates no
+            /// handler. A waiter is rewritten 16 requests after its last one, and with at most
+            /// CommitsInFlight unconfirmed only a completion that was lost can still be attached to
+            /// it: should that one arrive after all, it reports a later sequence than its own, which
+            /// lets at most one commit too many through.
+            /// </summary>
+            private sealed class CommitWaiter
+            {
+                private readonly FrameFlusher _owner;
+
+                public CommitWaiter(FrameFlusher owner)
+                {
+                    _owner = owner;
+                    Handler = OnCompleted;
+                }
+
+                public long Sequence;
+
+                public AsyncActionCompletedHandler Handler { get; }
+
+                private void OnCompleted(IAsyncAction action, AsyncStatus status)
+                {
+                    _owner.Take(Volatile.Read(ref Sequence));
+                }
+            }
+
+            #endregion
+
+            private void Queue(List<AnimatedImagePresenter> playing, long time)
+            {
+                DecodeBatch batch = null;
+
+                foreach (var presenter in playing)
+                {
+                    if (!presenter.TryBeginDecode(time))
+                    {
+                        continue;
+                    }
+
+                    batch ??= Rent(time);
+                    batch.Presenters.Add(presenter);
+
+                    if (batch.Presenters.Count == DecodeBatchSize)
+                    {
+                        ThreadPool.QueueUserWorkItem(_decode, batch);
+                        batch = null;
+                    }
+                }
+
+                if (batch != null)
+                {
+                    ThreadPool.QueueUserWorkItem(_decode, batch);
+                }
+            }
+
+            private DecodeBatch Rent(long time)
+            {
+                DecodeBatch batch = null;
+
+                lock (_batches)
+                {
+                    if (_batches.Count > 0)
+                    {
+                        batch = _batches.Pop();
+                    }
+                }
+
+                batch ??= new DecodeBatch(this);
+                batch.Time = time;
+
+                return batch;
+            }
+
+            private static void Decode(object state)
+            {
+                var batch = (DecodeBatch)state;
+
+                foreach (var presenter in batch.Presenters)
+                {
+                    try
+                    {
+                        presenter.Decode(batch.Time);
+                    }
+                    catch (Exception ex)
+                    {
+                        // One presenter's failure is not the batch's.
+                        Logger.Info($"Animation threw exception: {ex.Message}");
+                    }
+                }
+
+                batch.Presenters.Clear();
+
+                lock (batch.Owner._batches)
+                {
+                    batch.Owner._batches.Push(batch);
+                }
+            }
+
+            /// <summary>
+            /// After Close. A presenter unloaded while it plays leaves its Dispose to its next poll
+            /// (UnloadImpl), and the window closes this straight after its Unloaded cascade, so
+            /// without a last round of polls those presenters would keep their decoders.
+            /// </summary>
+            private void Drain()
+            {
+                var playing = new List<AnimatedImagePresenter>();
+
+                // About a second and a half, for decodes still in flight to finish.
+                for (int attempt = 0; attempt < 100; attempt++)
+                {
+                    lock (_lock)
+                    {
+                        foreach (var presenter in _playing)
+                        {
+                            playing.Add(presenter);
+                        }
+                    }
+
+                    if (playing.Count == 0)
+                    {
+                        return;
+                    }
+
+                    var time = Stopwatch.GetTimestamp();
+
+                    foreach (var presenter in playing)
+                    {
+                        if (presenter.TryBeginDecode(time))
+                        {
+                            try
+                            {
+                                presenter.Decode(time);
+                            }
+                            catch (Exception ex)
+                            {
+                                Logger.Info($"Animation threw exception: {ex.Message}");
+                            }
+                        }
+                    }
+
+                    playing.Clear();
+                    Thread.Sleep(16);
+                }
+            }
+
+            private sealed class DecodeBatch
+            {
+                public DecodeBatch(FrameFlusher owner)
+                {
+                    Owner = owner;
+                }
+
+                public FrameFlusher Owner { get; }
+
+                public List<AnimatedImagePresenter> Presenters { get; } = new(DecodeBatchSize);
+
+                public long Time;
+            }
+        }
+
+        public static void Release(XamlRoot xamlRoot)
+        {
+            if (xamlRoot != null && _loaders.TryGetValue(xamlRoot, out var loader))
+            {
+                loader.ReleaseImpl(xamlRoot);
+            }
+        }
+
+        private void ReleaseImpl(XamlRoot xamlRoot)
+        {
+            Flusher.Close();
+
+            if (_window.XamlRoot != null)
+            {
+                _loaders.Remove(_window.XamlRoot);
+            }
+
+            Buffers.Clear();
+            Bitmaps.Clear();
+        }
+
+        /// <summary>The bitmaps this window's presenters copy their frames into.</summary>
+        public BitmapRecyclePool Bitmaps { get; } = new();
+
+        /// <summary>
+        /// Recycles the bitmap every presenter shows its frames in, so a panel scroll reuses a
+        /// bounded set instead of allocating one per sticker.
+        /// </summary>
+        /// <remarks>
+        /// One per <see cref="XamlRoot"/>, because it lives on the loader, and that is not an
+        /// arrangement of convenience: a WriteableBitmap belongs to the thread that created it, so
+        /// a pool shared between windows would hand one window's bitmap to another. It also makes
+        /// every member single-threaded - Rent comes from ReadyImpl and Return from
+        /// AnimatedImageBitmap.Release, both on this loader's dispatcher - which is why nothing
+        /// here locks.
+        /// </remarks>
+        public sealed class BitmapRecyclePool
+        {
+            // Long enough to survive a scroll that turns straight back, short enough that a panel
+            // the user has left does not sit on its bitmaps.
+            private const ulong Expiration = 5000;
+
+            private readonly Dictionary<SizeInt32, List<Entry>> _bitmaps = new();
+
+            // Reused by the sweep so a tick allocates nothing.
+            private readonly List<SizeInt32> _emptied = new();
+
+            private DispatcherTimer _timer;
+            private int _count;
+
+            private bool _closed;
+
+            private readonly record struct Entry(WriteableBitmap Bitmap, ulong Expires);
+
+            public WriteableBitmap Rent(int width, int height)
+            {
+                var size = new SizeInt32 { Width = width, Height = height };
+
+                if (_bitmaps.TryGetValue(size, out var value) && value.Count > 0)
+                {
+                    // From the end: the newest is the one most likely still in cache, and it saves
+                    // shuffling the rest down.
+                    var last = value.Count - 1;
+                    var bitmap = value[last].Bitmap;
+
+                    value.RemoveAt(last);
+                    _count--;
+
+                    if (value.Count == 0)
+                    {
+                        _bitmaps.Remove(size);
+                    }
+
+                    // Not cleared: the presenter copies a whole frame into it before it is shown,
+                    // so clearing would be a memset per realization for nothing.
+                    return bitmap;
+                }
+
+                return new WriteableBitmap(width, height);
+            }
+
+            public void Return(WriteableBitmap bitmap)
+            {
+                if (bitmap == null || _closed)
+                {
+                    return;
+                }
+
+                var size = new SizeInt32 { Width = bitmap.PixelWidth, Height = bitmap.PixelHeight };
+                var entry = new Entry(bitmap, Logger.TickCount + Expiration);
+
+                if (_bitmaps.TryGetValue(size, out var value))
+                {
+                    value.Add(entry);
+                }
+                else
+                {
+                    _bitmaps[size] = [entry];
+                }
+
+                _count++;
+
+                _timer ??= CreateTimer();
+
+                if (!_timer.IsEnabled)
+                {
+                    _timer.Start();
+                }
+            }
+
+            /// <summary>Drops everything at once, for a window that is going away.</summary>
+            public void Clear()
+            {
+                _closed = true;
+
+                _bitmaps.Clear();
+                _count = 0;
+
+                _timer?.Stop();
+            }
+
+            private DispatcherTimer CreateTimer()
+            {
+                var timer = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromSeconds(1)
+                };
+
+                timer.Tick += OnTick;
+                return timer;
+            }
+
+            private void OnTick(object sender, object e)
+            {
+                var now = Logger.TickCount;
+
+                _emptied.Clear();
+
+                foreach (var pair in _bitmaps)
+                {
+                    var value = pair.Value;
+
+                    for (int i = value.Count - 1; i >= 0; i--)
+                    {
+                        if (now > value[i].Expires)
+                        {
+                            value.RemoveAt(i);
+                            _count--;
+                        }
+                    }
+
+                    if (value.Count == 0)
+                    {
+                        _emptied.Add(pair.Key);
+                    }
+                }
+
+                // A size the panel has stopped using should not keep an empty list forever. The
+                // churn is a List per size per idle period, which is nothing next to the bitmaps.
+                for (int i = 0; i < _emptied.Count; i++)
+                {
+                    _bitmaps.Remove(_emptied[i]);
+                }
+
+                _emptied.Clear();
+
+                if (_count == 0)
+                {
+                    _timer.Stop();
+                }
+            }
+        }
+
+        /// <summary>The frame buffers this window's presenters decode into.</summary>
+        public BufferRecyclePool Buffers { get; } = new();
+
+        /// <summary>
+        /// Recycles the buffer every presenter decodes into, so a panel scroll reuses a bounded set
+        /// instead of allocating one per sticker.
+        /// </summary>
+        /// <remarks>
+        /// One per <see cref="XamlRoot"/>, because it lives on the loader. That makes every member
+        /// single-threaded - Rent comes from ReadyImpl and Return from
+        /// AnimatedImagePresenter.ReleaseVisual, both on this loader's dispatcher - which is why
+        /// nothing here locks. Anything that starts calling it from elsewhere has to revisit that.
+        /// </remarks>
+        public sealed class BufferRecyclePool
+        {
+            // Long enough to survive a scroll that turns straight back, short enough that a panel
+            // the user has left does not sit on its buffers.
+            private const ulong Expiration = 5000;
+
+            // A frame only needs its own bytes from the start of the buffer, so any buffer at
+            // least that long will do - but the presenter keeps it for as long as it lives, and a
+            // panel sticker's would otherwise end up behind every custom emoji after it.
+            private const uint MaxWaste = 2;
+
+            // Few enough, a panel's worth at most, that a scan is cheaper than keeping them sorted.
+            private readonly List<Entry> _buffers = new();
+
+            private DispatcherTimer _timer;
+
+            private bool _closed;
+
+            private readonly record struct Entry(IBuffer Buffer, uint Length, ulong Expires);
+
+            public IBuffer Rent(int width, int height)
+            {
+                var size = (uint)(width * height * 4);
+                var best = -1;
+
+                // From the end and keeping the first of equals: the newest is the one most likely
+                // still in cache.
+                for (int i = _buffers.Count - 1; i >= 0; i--)
+                {
+                    var length = _buffers[i].Length;
+
+                    if (length >= size && length / MaxWaste <= size && (best == -1 || length < _buffers[best].Length))
+                    {
+                        best = i;
+
+                        if (length == size)
+                        {
+                            break;
+                        }
+                    }
+                }
+
+                if (best != -1)
+                {
+                    var buffer = _buffers[best].Buffer;
+                    _buffers.RemoveAt(best);
+
+                    // Not cleared: the caller renders a whole frame into it before it is shown, so
+                    // clearing would be a memset per realization for nothing.
+                    return buffer;
+                }
+
+                return BufferSurface.Create(size);
+            }
+
+            public void Return(IBuffer buffer)
+            {
+                if (buffer == null)
+                {
+                    return;
+                }
+                else if (_closed)
+                {
+                    Close(buffer);
+                    return;
+                }
+
+                _buffers.Add(new Entry(buffer, buffer.Length, Logger.TickCount + Expiration));
+
+                _timer ??= CreateTimer();
+
+                if (!_timer.IsEnabled)
+                {
+                    _timer.Start();
+                }
+            }
+
+            /// <summary>
+            /// Frees everything at once, for a window that is going away. Presenters still alive
+            /// return theirs later, and those are freed as they arrive.
+            /// </summary>
+            public void Clear()
+            {
+                _closed = true;
+
+                foreach (var entry in _buffers)
+                {
+                    Close(entry.Buffer);
+                }
+
+                _buffers.Clear();
+                _timer?.Stop();
+            }
+
+            // Every buffer this drops is closed rather than let go: the memory behind it is
+            // native, so the collector neither sees it nor hurries to finalize the small wrapper.
+            private static void Close(IBuffer buffer)
+            {
+                if (buffer is IDisposable disposable)
+                {
+                    disposable.Dispose();
+                }
+            }
+
+            private DispatcherTimer CreateTimer()
+            {
+                var timer = new DispatcherTimer
+                {
+                    Interval = TimeSpan.FromSeconds(1)
+                };
+
+                timer.Tick += OnTick;
+                return timer;
+            }
+
+            private void OnTick(object sender, object e)
+            {
+                var now = Logger.TickCount;
+
+                for (int i = _buffers.Count - 1; i >= 0; i--)
+                {
+                    if (now > _buffers[i].Expires)
+                    {
+                        Close(_buffers[i].Buffer);
+                        _buffers.RemoveAt(i);
+                    }
+                }
+
+                if (_buffers.Count == 0)
+                {
+                    _timer.Stop();
+                }
+            }
+        }
+
+        public event EventHandler<WindowActivatedEventArgs> Activated
+        {
+            add => _window.Activated += value;
+            remove => _window.Activated -= value;
+        }
+
+        public event EventHandler<PopupActivatedEventArgs> PopupActivated
+        {
+            add => _window.PopupActivated += value;
+            remove => _window.PopupActivated -= value;
+        }
+
+        private readonly ParallelActionWorker _workQueue = new(Math.Clamp(Environment.ProcessorCount / 2, 2, 4));
+
+        private readonly ConcurrentDictionary<int, WeakReference<AnimatedImagePresenter>> _delegates = new();
+        private readonly Dictionary<AnimatedImagePresentation, AnimatedImagePresenter> _presenters = new();
+        private readonly object _presentersLock = new();
+
+        // Unique per thread
+        private int _indexer;
+
+        private static readonly ConditionalWeakTable<XamlRoot, AnimatedImageLoader> _loaders = new();
+
+        public static AnimatedImagePresenter GetOrCreate(XamlRoot xamlRoot, AnimatedImagePresentation configuration)
+        {
+            Debug.Assert(xamlRoot != null);
+
+            var window = WindowContext.ForXamlRoot(xamlRoot);
+            if (window != null)
+            {
+                var loader = _loaders.GetOrAdd(xamlRoot, x => new AnimatedImageLoader(window));
+                return loader.GetOrCreate(configuration);
+            }
+
+            return null;
+        }
+
+        public AnimatedImagePresenter GetOrCreate(AnimatedImagePresentation configuration)
+        {
+            lock (_presentersLock)
+            {
+                if (_presenters.TryGetValue(configuration, out var presenter) && presenter.Increment())
+                {
+                    return presenter;
+                }
+
+                presenter = new AnimatedImagePresenter(this, _dispatcherQueue, configuration);
+                _presenters[configuration] = presenter;
+
+                return presenter;
+            }
+        }
+
+        public void Remove(AnimatedImagePresentation configuration)
+        {
+            lock (_presentersLock)
+            {
+                _presenters.Remove(configuration);
+            }
+        }
+
+        public void Remove(int correlationId)
+        {
+            _delegates.TryRemove(correlationId, out _);
+        }
+
+#if INSTRUMENTATION
+        // Counts, not roots. _presenters is a strong table that lives as long as the window, keyed
+        // by a record whose equality runs through AnimatedImageSource.Equals - so a count that
+        // climbs with every panel open and never comes back down is the leak itself, whatever it
+        // turns out to be holding at the other end.
+        public static string DebugReport()
+        {
+            var report = AnimatedImage.DebugCounters() + AnimatedImagePresenter.DebugCounters();
+
+            foreach (var pair in _loaders)
+            {
+                var loader = pair.Value;
+
+                lock (loader._presentersLock)
+                {
+                    var handlers = 0;
+                    var worst = 0;
+
+                    foreach (var presenter in loader._presenters.Values)
+                    {
+                        var count = presenter.DebugHandlerCount();
+
+                        handlers += count;
+                        worst = Math.Max(worst, count);
+                    }
+
+                    report += string.Format("  AnimatedImageLoader: presenters={0}, queued={1}, handlers={2} (worst {3})\n",
+                        loader._presenters.Count, loader._delegates.Count, handlers, worst);
+                }
+            }
+
+            return report;
+        }
+#endif
+
+        public void Load(AnimatedImagePresenter sender)
+        {
+            if (sender.CorrelationId != 0 && _delegates.ContainsKey(sender.CorrelationId))
+            {
+                // Already queued, don't enqueue again
+                return;
+            }
+
+            var correlationId = ++_indexer;
+
+            sender.CorrelationId = correlationId;
+
+            _delegates[correlationId] = new WeakReference<AnimatedImagePresenter>(sender);
+
+            // Hoisted: capturing sender would root the presenter for as long as the item sits in
+            // the queue, which is exactly what the WeakReference above exists to avoid - and the
+            // queue is longest when a cache-building scroll is under way.
+            var presentation = sender.Presentation;
+            _workQueue.Run(() => Work(new WorkItem(correlationId, presentation)));
+        }
+
+        private void Work(WorkItem work)
+        {
+            if (!_delegates.TryRemove(work.CorrelationId, out var weakDelegate))
+            {
+                return;
+            }
+
+            try
+            {
+                if (work.Presentation.Source is DiceFileSource dice)
+                {
+                    LoadDice(weakDelegate, work, dice);
+                }
+                else if (work.Presentation.Source is LocalFileSource local)
+                {
+                    if (local.Format is StickerFormatTgs)
+                    {
+                        LoadLottie(weakDelegate, work, local);
+                    }
+                    else if (local.Format is StickerFormatWebp)
+                    {
+                        LoadWebP(weakDelegate, work, local);
+                    }
+                    else if (local.Format is StickerFormatWebm)
+                    {
+                        LoadCachedVideo(weakDelegate, work);
+                    }
+                    else
+                    {
+                        if (local.FilePath.HasExtension(".tgs", ".json"))
+                        {
+                            LoadLottie(weakDelegate, work, local);
+                        }
+                        else if (local.FilePath.HasExtension(".webp"))
+                        {
+                            LoadWebP(weakDelegate, work, local);
+                        }
+                        else
+                        {
+                            LoadCachedVideo(weakDelegate, work);
+                        }
+                    }
+                }
+                else if (work.Presentation.Source is ParticlesImageSource particles)
+                {
+                    LoadParticles(weakDelegate, work, particles);
+                }
+                else
+                {
+                    LoadCachedVideo(weakDelegate, work);
+                }
+            }
+            catch
+            {
+                // Shit happens...
+                NotifyDelegate(weakDelegate, null, null);
+            }
+        }
+
+        private void LoadDice(WeakReference<AnimatedImagePresenter> weakDelegate, WorkItem work, DiceFileSource dice)
+        {
+            var width = work.Presentation.PixelWidth;
+            var height = work.Presentation.PixelHeight;
+
+            var state = dice.StartState;
+
+            // TotalFrame and not null: LoadFromFile hands back an animation before it has parsed
+            // anything, so this is the first point at which the file is known to be renderable. The
+            // reels draw the whole frame, and a refused render would leave the recycled bitmap
+            // showing whatever the last animation to use it drew.
+            var reels = DiceFileSource.CreateReels(state, width, height);
+            if (reels is not { TotalFrame: > 0 })
+            {
+                reels?.Dispose();
+
+                NotifyDelegate(weakDelegate, null, null);
+                return;
+            }
+
+            IBuffer backdrop = null;
+
+            using (var background = DiceFileSource.CreateBackground(state, width, height))
+            {
+                // TotalFrame parses the file, so it is also the answer to whether there is one to
+                // draw: it comes back 0 for anything the renderer refused.
+                var total = background?.TotalFrame ?? 0;
+
+                if (total > 0)
+                {
+                    // The chrome is a still, drawn once and copied under every frame of the reels
+                    // rather than re-rendered as one. Frame 1 where there is one, because that is
+                    // what this has always drawn.
+                    //
+                    // Zeroed, and not BufferSurface.Create(size), which mallocs: RenderSync says
+                    // nothing about whether it wrote anything, and an out-of-range frame or a file
+                    // it cannot parse leaves the buffer exactly as it found it. Uninitialised, that
+                    // is a solid block of heap under the whole message.
+                    backdrop = BufferSurface.Create(new byte[width * height * 4]);
+                    background.RenderSync(backdrop, Math.Min(1, total - 1));
+                }
+            }
+
+            var lever = DiceFileSource.CreateLever(state, width, height);
+
+            if (lever is not { TotalFrame: > 0 })
+            {
+                lever?.Dispose();
+                lever = null;
+            }
+
+            // Disposed by hand rather than through NotifyDelegate's disposable, which takes one
+            // object: a dice holds up to three animations, and only the task knows about all of
+            // them.
+            var task = new DiceAnimatedImageTask(dice, reels, backdrop, lever, dice.IsLooping, work.Presentation);
+
+            if (!NotifyDelegate(weakDelegate, null, task))
+            {
+                task.Dispose();
+            }
+        }
+
+        private void LoadParticles(WeakReference<AnimatedImagePresenter> weakDelegate, WorkItem work, ParticlesImageSource particles)
+        {
+            var animation = new ParticlesAnimation(work.Presentation.PixelWidth, work.Presentation.PixelHeight, work.Presentation.RasterizationScale, particles.Type, particles.Foreground, particles.Background);
+            NotifyDelegate(weakDelegate, null, new ParticlesAnimatedImageTask(animation, work.Presentation));
+        }
+
+        private void LoadLottie(WeakReference<AnimatedImagePresenter> weakDelegate, WorkItem work, LocalFileSource local)
+        {
+            static bool IsValid(AnimatedImagePresentation presentation)
+            {
+                // TODO: check if animation is valid
+                // Width, height, frame rate...
+                return presentation.PixelWidth > 0
+                    && presentation.PixelHeight > 0;
+            }
+
+            var animation = LottieAnimation.LoadFromFile(local.FilePath, work.Presentation.PixelWidth, work.Presentation.PixelHeight, work.Presentation.IsCachingEnabled, work.Presentation.Source.ColorReplacements, work.Presentation.Source.FitzModifier);
+            if (animation != null)
+            {
+                if (IsValid(work.Presentation))
+                {
+                    NotifyDelegate(weakDelegate, animation, new LottieAnimatedImageTask(animation, work.Presentation));
+                }
+                else
+                {
+                    animation.Dispose();
+                }
+            }
+        }
+
+        private void LoadCachedVideo(WeakReference<AnimatedImagePresenter> weakDelegate, WorkItem work)
+        {
+            static bool IsValid(CachedVideoAnimation animation)
+            {
+                // TODO: check if animation is valid
+                // Width, height, frame rate...
+                return animation.PixelWidth > 0
+                    && animation.PixelHeight > 0
+                    && !double.IsNaN(animation.FrameRate);
+            }
+
+            // A remote source downloads only between Open and Close, which the task owns from here.
+            var remote = work.Presentation.Source as RemoteFileSource;
+            remote?.Open();
+
+            var animation = CachedVideoAnimation.LoadFromFile(work.Presentation.Source, work.Presentation.PixelWidth, work.Presentation.PixelHeight, work.Presentation.ResizeMode == AnimatedImageResizeMode.Fit, work.Presentation.IsCachingEnabled, work.Presentation.LimitFps);
+            if (animation != null)
+            {
+                if (IsValid(animation))
+                {
+                    if (work.Presentation.Source.SeekToSeconds != 0)
+                    {
+                        animation.Seek(work.Presentation.Source.SeekToSeconds);
+                    }
+
+                    if (NotifyDelegate(weakDelegate, animation, new VideoAnimatedImageTask(animation, work.Presentation)))
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    animation.Dispose();
+                }
+            }
+
+            remote?.Close();
+        }
+
+        private async void LoadWebP(WeakReference<AnimatedImagePresenter> weakDelegate, WorkItem work, LocalFileSource local)
+        {
+            static bool IsValid(IBuffer animation, int pixelWidth, int pixelHeight)
+            {
+                // TODO: check if animation is valid
+                // Width, height, frame rate...
+                return pixelWidth > 0
+                    && pixelHeight > 0
+                    && animation.Length == pixelWidth * pixelHeight * 4;
+            }
+
+            var animation = Direct2DDevice.DrawWebP(local.FilePath, work.Presentation.PixelWidth, out int pixelWidth, out int pixelHeight);
+            if (animation != null)
+            {
+                if (IsValid(animation, pixelWidth, pixelHeight))
+                {
+                    NotifyDelegate(weakDelegate, null, new WebpAnimatedImageTask(animation, pixelWidth, pixelHeight, work.Presentation));
+                }
+            }
+            else
+            {
+                try
+                {
+                    // If the image fails to decode as WebP, we try to decode it again using system image decoders.
+                    var file = await StorageFile.GetFileFromPathAsync(local.FilePath);
+
+                    using var stream = await file.OpenReadAsync();
+                    var decoder = await BitmapDecoder.CreateAsync(stream);
+                    var transform = new BitmapTransform();
+
+                    if (decoder.PixelWidth > work.Presentation.PixelWidth || decoder.PixelHeight > work.Presentation.PixelWidth)
+                    {
+                        var ratioX = (double)work.Presentation.PixelWidth / decoder.PixelWidth;
+                        var ratioY = (double)work.Presentation.PixelWidth / decoder.PixelHeight;
+                        var ratio = Math.Min(ratioX, ratioY);
+
+                        transform.ScaledWidth = (uint)(decoder.PixelWidth * ratio);
+                        transform.ScaledHeight = (uint)(decoder.PixelHeight * ratio);
+
+                        pixelWidth = (int)transform.ScaledWidth;
+                        pixelHeight = (int)transform.ScaledHeight;
+                    }
+                    else
+                    {
+                        pixelWidth = (int)decoder.PixelWidth;
+                        pixelHeight = (int)decoder.PixelHeight;
+                    }
+
+                    var pixels = await decoder.GetPixelDataAsync(BitmapPixelFormat.Bgra8, BitmapAlphaMode.Premultiplied, transform, ExifOrientationMode.IgnoreExifOrientation, ColorManagementMode.DoNotColorManage);
+                    var bytes = pixels.DetachPixelData();
+
+                    animation = BufferSurface.Create(bytes);
+
+                    if (IsValid(animation, pixelWidth, pixelHeight))
+                    {
+                        NotifyDelegate(weakDelegate, null, new WebpAnimatedImageTask(animation, pixelWidth, pixelHeight, work.Presentation));
+                    }
+                }
+                catch
+                {
+                    // All the remote procedure calls must be wrapped in a try-catch block
+                    NotifyDelegate(weakDelegate, null, null);
+                }
+            }
+        }
+
+        private bool NotifyDelegate(WeakReference<AnimatedImagePresenter> weakDelegate, IDisposable disposable, AnimatedImageTask task)
+        {
+            static bool IsValid(AnimatedImageTask task)
+            {
+                // TODO: check if animation is valid
+                // Width, height, frame rate...
+                return task != null
+                    && task.PixelWidth > 0
+                    && task.PixelHeight > 0;
+            }
+
+            if (TryGetDelegate(weakDelegate, out var target) && IsValid(task))
+            {
+                target.Ready(task);
+                return true;
+            }
+
+            disposable?.Dispose();
+            return false;
+        }
+
+        private bool TryGetDelegate(WeakReference<AnimatedImagePresenter> weakDelegate, out AnimatedImagePresenter target)
+        {
+            if (weakDelegate.TryGetTarget(out target))
+            {
+                return true;
+            }
+
+            target = null;
+            return false;
+        }
+
+        record WorkItem(int CorrelationId, AnimatedImagePresentation Presentation);
+    }
+}

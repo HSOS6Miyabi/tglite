@@ -1,0 +1,509 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Threading.Tasks;
+using Telegram.Common;
+using Telegram.Navigation;
+using Telegram.Navigation.Services;
+using Telegram.Services;
+using Telegram.Services.Updates;
+using Telegram.ViewModels;
+using Telegram.ViewModels.Authorization;
+using Telegram.ViewModels.Business;
+using Telegram.ViewModels.Chats;
+using Telegram.ViewModels.Create;
+using Telegram.ViewModels.Delegates;
+using Telegram.ViewModels.Folders;
+using Telegram.ViewModels.Grams;
+using Telegram.ViewModels.Payments;
+using Telegram.ViewModels.Premium;
+using Telegram.ViewModels.Settings;
+using Telegram.ViewModels.Settings.Privacy;
+using Telegram.ViewModels.Stars;
+using Telegram.ViewModels.Supergroups;
+using Telegram.ViewModels.Users;
+using Telegram.Views;
+using Telegram.Views.Authorization;
+using Telegram.Views.Business;
+using Telegram.Views.Chats;
+using Telegram.Views.Create;
+using Telegram.Views.Folders;
+using Telegram.Views.Folders.Popups;
+using Telegram.Views.Grams;
+using Telegram.Views.Host;
+using Telegram.Views.Payments;
+using Telegram.Views.Popups;
+using Telegram.Views.Premium.Popups;
+using Telegram.Views.Settings;
+using Telegram.Views.Settings.Popups;
+using Telegram.Views.Settings.Privacy;
+using Telegram.Views.Stars;
+using Telegram.Views.Stars.Popups;
+using Telegram.Views.Stories.Popups;
+using Telegram.Views.Supergroups;
+using Telegram.Views.Supergroups.Popups;
+using Telegram.Views.Users;
+using Windows.ApplicationModel;
+using Windows.ApplicationModel.Activation;
+using Windows.ApplicationModel.AppService;
+using Windows.ApplicationModel.ExtendedExecution;
+using Windows.UI.Notifications;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+
+namespace Telegram
+{
+    sealed partial class App : BootStrapper
+    {
+        private static ExtendedExecutionSession _extendedSession;
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="App"/> class.
+        /// Initializes the singleton application object.  This is the first line of authored code
+        /// executed, and as such is the logical equivalent of main() or WinMain().
+        /// </summary>
+        public App()
+        {
+            AppSettings.Initialize();
+#if !NET9_0_OR_GREATER
+            Native.GarbageCollectionMonitor.Initialize(GC.Collect, AppSettings.Diagnostics.DisableXamlGcCollect, AppSettings.Diagnostics.DisableMemoryPressure);
+#endif
+            WatchDog.Initialize();
+            LifetimeService.Initialize();
+
+            SetApplicationTheme(NightModeService.Current.GetCalculatedApplicationTheme());
+            InitializeComponent();
+        }
+
+        protected override void OnWindowActivated(WindowContext window, bool active)
+        {
+            NightModeService.Current.UpdateTimer();
+
+#if UNPACKAGED
+            TaskbarButton.OnWindowActivated(window, active);
+#endif
+
+            var navigation = window.GetNavigationService();
+            if (navigation != null)
+            {
+                var aggregator = navigation.Session.Resolve<IEventAggregator>();
+                aggregator?.Publish(new UpdateWindowActivated(active));
+
+                var clientService = navigation.Session.Resolve<IClientService>();
+                clientService?.Options.Online = active;
+            }
+        }
+
+        // Microsoft.UI.Xaml.Application has no OnBackgroundActivated: a packaged desktop app is
+        // handed a background activation through AppInstance like every other kind, and it cannot
+        // host the in-process app service this reads either - which is why Package.Win32.xslt,
+        // shared with the WinUI flavour, deletes the windows.appService extension outright. The
+        // toast half still has to be re-hung somewhere.
+#if !WINUI3
+        protected override async void OnBackgroundActivated(BackgroundActivatedEventArgs args)
+        {
+            base.OnBackgroundActivated(args);
+
+            if (args.TaskInstance.TriggerDetails is AppServiceTriggerDetails appService && string.Equals(appService.CallerPackageFamilyName, AppIdentity.FamilyName))
+            {
+                BridgeApplicationContext.Connect(appService.AppServiceConnection, args.TaskInstance);
+            }
+            else
+            {
+                var deferral = args.TaskInstance.GetDeferral();
+
+                if (args.TaskInstance.TriggerDetails is ToastNotificationActionTriggerDetail triggerDetail)
+                {
+                    var data = Toast.GetData(triggerDetail);
+                    if (data == null)
+                    {
+                        deferral.Complete();
+                        return;
+                    }
+
+                    await Toast.ProcessAsync(data);
+                }
+
+                deferral.Complete();
+            }
+        }
+#endif
+
+        public override void OnInitialize(IActivatedEventArgs args)
+        {
+            //Locator.Configure();
+            //UnigramContainer.Current.ResolveType<IGenerationService>();
+
+            if (LifetimeService.Current.Passcode.IsEnabled)
+            {
+                LifetimeService.Current.Passcode.Lock(true);
+                InactivityHelper.Initialize(LifetimeService.Current.Passcode.AutolockTimeout);
+            }
+        }
+
+        public override async void OnStart(WindowContext window, StartKind startKind, IActivatedEventArgs args)
+        {
+#if DEBUG
+            DebugSettings.EnableFrameRateCounter = false;
+#endif
+
+            if (startKind == StartKind.Activate)
+            {
+                var sessionId = Toast.GetSession(args);
+                if (sessionId != null)
+                {
+                    if (LifetimeService.Current.ActiveItem.Id != sessionId && LifetimeService.Current.TryResolve(sessionId.Value, out ISession session))
+                    {
+                        LifetimeService.Current.ActiveItem = session;
+
+                        if (window.Content is RootWindow root)
+                        {
+                            root.Switch(LifetimeService.Current.ActiveItem);
+                        }
+                    }
+                }
+            }
+
+            var activeSession = LifetimeService.Current.ActiveItem;
+            var navigation = window.RootNavigationService;
+
+            var update = activeSession.Resolve<ICloudUpdateService>();
+            var service = activeSession.Resolve<IClientService>();
+
+            var state = await service.GetAuthorizationStateAsync();
+
+            if (args is not ShareTargetActivatedEventArgs share)
+            {
+                window.Activate(args, navigation, state);
+
+                _ = Task.Run(() => OnStartSync(startKind, update));
+
+                if (startKind != StartKind.Launch && window.IsInMainView)
+                {
+                    await window.TryShowAsStandaloneAsync();
+                    //window.TryResizeView(window.Bounds.ToSize());
+                }
+            }
+            else if (window.Content is ShareWindow sharePage)
+            {
+                sharePage.Activate(share, navigation, state);
+            }
+        }
+
+#if WINUI3
+        protected override void OnStartInBackground()
+        {
+            var update = LifetimeService.Current.ActiveItem.Resolve<ICloudUpdateService>();
+            _ = Task.Run(() => OnStartSync(StartKind.Activate, update));
+        }
+#endif
+
+        public override UIElement CreateRootElement(IActivatedEventArgs args, WindowContext window)
+        {
+            var sessionId = Toast.GetSession(args);
+            if (sessionId != null)
+            {
+                if (LifetimeService.Current.ActiveItem.Id != sessionId && LifetimeService.Current.TryResolve(sessionId.Value, out ISession session))
+                {
+                    LifetimeService.Current.ActiveItem = session;
+                }
+            }
+
+            var activeSession = LifetimeService.Current.ActiveItem;
+            var navigationService = NavigationServiceFactory(activeSession, window, BackButton.Ignore, $"{activeSession.Id}", true) as NavigationService;
+
+            if (args is ShareTargetActivatedEventArgs)
+            {
+                return new ShareWindow(window, activeSession, navigationService)
+                {
+                    FlowDirection = LocaleService.Current.FlowDirection
+                };
+            }
+
+            return new RootWindow(window, navigationService)
+            {
+                FlowDirection = LocaleService.Current.FlowDirection
+            };
+        }
+
+        public override UIElement CreateRootElement(INavigationService navigationService)
+        {
+            return new StandaloneWindow(navigationService)
+            {
+                FlowDirection = LocaleService.Current.FlowDirection
+            };
+        }
+
+        protected override INavigationService CreateNavigationService(ISession session, WindowContext window, Frame frame, string id, bool root)
+        {
+            if (root)
+            {
+                return new TLRootNavigationService(session, window, frame, id);
+            }
+
+            return new TLNavigationService(session, window, frame, id);
+        }
+
+        private async void OnStartSync(StartKind startKind, ICloudUpdateService updateService = null)
+        {
+            await RequestExtendedExecutionSessionAsync();
+            await Toast.RegisterBackgroundTasks();
+
+            // The tile is the package's own, so there is nothing to clear where there is no package.
+            if (ApiInfo.HasPackageIdentity)
+            {
+                try
+                {
+                    TileUpdateManager.CreateTileUpdaterForApplication("App").Clear();
+                }
+                catch { }
+            }
+
+            if (Toast.ApplicationId is string applicationId)
+            {
+                try
+                {
+                    ToastNotificationManager.History.Clear(applicationId);
+                }
+                catch { }
+            }
+
+            if (Constants.RELEASE && startKind == StartKind.Launch)
+            {
+                if (await CloudUpdateService.LaunchAsync(true))
+                {
+                    return;
+                }
+            }
+
+            if (AppSettings.IsTrayVisible)
+            {
+                await SystemTray.ShowAsync();
+            }
+            else if (Constants.RELEASE && startKind == StartKind.Launch)
+            {
+                await BridgeApplicationContext.AddLoopbackExemptionAsync();
+            }
+
+#if !WINUI3
+            // Nothing prelaunches a desktop process, and CoreApplication throws in one.
+            Windows.ApplicationModel.Core.CoreApplication.EnablePrelaunch(true);
+#endif
+
+#if UNPACKAGED
+            // Here rather than in LaunchAsync above: an unpackaged start is always an activation.
+            UnpackagedUpdates.RemoveLeftovers();
+#endif
+
+            if (updateService != null)
+            {
+                await updateService.UpdateAsync(false);
+            }
+        }
+
+        private async Task RequestExtendedExecutionSessionAsync()
+        {
+            // The session keeps a suspended app running, and only the app model suspends one: an
+            // unpackaged host is an ordinary process that nothing is going to stop.
+            if (_extendedSession == null && ApiInfo.IsDesktop && ApiInfo.HasPackageIdentity)
+            {
+                var session = new ExtendedExecutionSession();
+                session.Reason = ExtendedExecutionReason.Unspecified;
+                session.Revoked += ExtendedExecutionSession_Revoked;
+
+                var result = await session.RequestExtensionAsync();
+                if (result == ExtendedExecutionResult.Allowed)
+                {
+                    _extendedSession = session;
+
+                    Logger.Info("ExtendedExecutionResult.Allowed");
+                }
+                else
+                {
+                    session.Revoked -= ExtendedExecutionSession_Revoked;
+                    session.Dispose();
+
+                    Logger.Warning("ExtendedExecutionResult.Denied");
+                }
+            }
+        }
+
+        private void ExtendedExecutionSession_Revoked(object sender, ExtendedExecutionRevokedEventArgs args)
+        {
+            Logger.Warning(args.Reason);
+            _extendedSession?.Dispose();
+            _extendedSession = null;
+        }
+
+        public override void OnResuming(object s, object e, AppExecutionState previousExecutionState)
+        {
+            Logger.Info("OnResuming");
+
+            // #1225: Will this work? No one knows.
+            foreach (var network in LifetimeService.Current.ResolveAll<INetworkService>())
+            {
+                network.Reconnect();
+            }
+
+            //foreach (var client in TLContainer.Current.ResolveAll<IClientService>())
+            //{
+            //    client.TryInitialize();
+            //}
+
+            // #2034: Will this work? No one knows.
+            NightModeService.Current.Update(null);
+
+            OnStartSync(StartKind.Activate);
+        }
+
+        public override Task OnSuspendingAsync(object s, SuspendingEventArgs e)
+        {
+            Logger.Info("OnSuspendingAsync");
+
+            LifetimeService.Current.Passcode.CloseTime = DateTime.UtcNow;
+
+            //return Task.WhenAll(LifetimeService.Current.ResolveAll<IVoipService>().Select(x => x.DiscardAsync()));
+            //await Task.WhenAll(LifetimeService.Current.ResolveAll<IClientService>().Select(x => x.CloseAsync()));
+            return Task.CompletedTask;
+        }
+
+        public override ViewModelBase ViewModelForPage(UIElement page, ISession session)
+        {
+            var sessionId = session.Id;
+            return page switch
+            {
+                DiagnosticsPage => session.Resolve<DiagnosticsViewModel>(),
+                LogOutPopup => session.Resolve<LogOutViewModel>(),
+                ProfilePage profile => session.Resolve<ProfileViewModel, IProfileDelegate>(profile),
+                InstantPage => session.Resolve<InstantViewModel>(),
+                //
+                SettingsPage settings => session.Resolve<SettingsViewModel, ISettingsDelegate>(settings),
+                NewContactPopup => session.Resolve<NewContactViewModel>(),
+                NewChannelPopup => session.Resolve<NewChannelViewModel>(),
+                NewGroupPopup => session.Resolve<NewGroupViewModel>(),
+                NewBotPopup => session.Resolve<NewBotViewModel>(),
+                UserEditPage userEdit => session.Resolve<UserEditViewModel, IUserDelegate>(userEdit),
+                UserAffiliatePage => session.Resolve<UserAffiliateViewModel>(),
+                //
+                SupergroupChooseMemberPopup => session.Resolve<SupergroupChooseMemberViewModel>(),
+                SupergroupAdministratorsPage supergroupAdministrators => session.Resolve<SupergroupAdministratorsViewModel, ISupergroupMembersDelegate>(supergroupAdministrators),
+                SupergroupBannedPage supergroupBanned => session.Resolve<SupergroupBannedViewModel, ISupergroupMembersDelegate>(supergroupBanned),
+                SupergroupEditAdministratorPopup supergroupEditAdministrator => session.Resolve<SupergroupEditAdministratorViewModel, IMemberPopupDelegate>(supergroupEditAdministrator),
+                SupergroupEditLinkedChatPage supergroupEditLinkedChat => session.Resolve<SupergroupEditLinkedChatViewModel, ISupergroupDelegate>(supergroupEditLinkedChat),
+                SupergroupEditRestrictedPopup supergroupEditRestricted => session.Resolve<SupergroupEditRestrictedViewModel, IMemberPopupDelegate>(supergroupEditRestricted),
+                SupergroupEditStickerSetPopup => session.Resolve<SupergroupEditStickerSetViewModel>(),
+                SupergroupEditTypePage supergroupEditType => session.Resolve<SupergroupEditTypeViewModel, ISupergroupEditDelegate>(supergroupEditType),
+                SupergroupEditPage supergroupEdit => session.Resolve<SupergroupEditViewModel, ISupergroupEditDelegate>(supergroupEdit),
+                SupergroupMembersPage supergroupMembers => session.Resolve<SupergroupMembersViewModel, ISupergroupMembersDelegate>(supergroupMembers),
+                SupergroupPermissionsPage supergroupPermissions => session.Resolve<SupergroupPermissionsViewModel, ISupergroupMembersDelegate>(supergroupPermissions),
+                SupergroupTopicsPage => session.Resolve<SupergroupTopicsViewModel>(),
+                SupergroupDirectMessagesPage => session.Resolve<SupergroupDirectMessagesViewModel>(),
+                SupergroupReactionsPopup => session.Resolve<SupergroupReactionsViewModel>(),
+                SupergroupProfileColorPage => session.Resolve<SupergroupProfileColorViewModel>(),
+                ChatBoostsPage => session.Resolve<ChatBoostsViewModel>(),
+                ChatAffiliatePage => session.Resolve<ChatAffiliateViewModel>(),
+                //
+                AuthorizationRecoveryPage => session.Resolve<AuthorizationRecoveryViewModel>(),
+                AuthorizationRegistrationPage => session.Resolve<AuthorizationRegistrationViewModel>(),
+                AuthorizationPasswordPage => session.Resolve<AuthorizationPasswordViewModel>(),
+                AuthorizationCodePage => session.Resolve<AuthorizationCodeViewModel>(),
+                AuthorizationEmailAddressPage => session.Resolve<AuthorizationEmailAddressViewModel>(),
+                AuthorizationEmailCodePage => session.Resolve<AuthorizationEmailCodeViewModel>(),
+                AuthorizationPage signIn => session.Resolve<AuthorizationViewModel, ISignInDelegate>(signIn),
+                //
+                FoldersPage => session.Resolve<FoldersViewModel>(),
+                FolderPage => session.Resolve<FolderViewModel>(),
+                ShareFolderPopup => session.Resolve<ShareFolderViewModel>(),
+                AddFolderPopup => session.Resolve<AddFolderViewModel>(),
+                RemoveFolderPopup => session.Resolve<RemoveFolderViewModel>(),
+                //
+                SettingsBlockedChatsPage => session.Resolve<SettingsBlockedChatsViewModel>(),
+                SettingsStickersPage => session.Resolve<SettingsStickersViewModel>(),
+                //
+                SettingsThemePage => session.Resolve<SettingsThemeViewModel>(),
+                //
+                SettingsAdvancedPage => session.Resolve<SettingsAdvancedViewModel>(),
+                SettingsAppearancePage => session.Resolve<SettingsAppearanceViewModel>(),
+                SettingsAutoDeletePage => session.Resolve<SettingsAutoDeleteViewModel>(),
+                SettingsBackgroundsPage => session.Resolve<SettingsBackgroundsViewModel>(),
+                SettingsDataAndStoragePage => session.Resolve<SettingsDataAndStorageViewModel>(),
+                SettingsLanguagePage => session.Resolve<SettingsLanguageViewModel>(),
+                SettingsNetworkPage => session.Resolve<SettingsNetworkViewModel>(),
+                SettingsNightModePage => session.Resolve<SettingsNightModeViewModel>(),
+                SettingsNotificationsExceptionsPage => session.Resolve<SettingsNotificationsExceptionsViewModel>(),
+                SettingsPasscodePage => session.Resolve<SettingsPasscodeViewModel>(),
+                SettingsPasswordPage => session.Resolve<SettingsPasswordViewModel>(),
+                SettingsPasskeysPage => session.Resolve<SettingsPasskeysViewModel>(),
+                SettingsPrivacyAndSecurityPage => session.Resolve<SettingsPrivacyAndSecurityViewModel>(),
+                SettingsProxyPage => session.Resolve<SettingsProxyViewModel>(),
+                SettingsProxyPopup => session.Resolve<SettingsProxyViewModel>(),
+                SettingsShortcutsPage => session.Resolve<SettingsShortcutsViewModel>(),
+                SettingsThemesPage => session.Resolve<SettingsThemesViewModel>(),
+                SettingsWebSessionsPage => session.Resolve<SettingsWebSessionsViewModel>(),
+                SettingsNotificationsPage => session.Resolve<SettingsNotificationsViewModel>(),
+                SettingsSessionsPage => session.Resolve<SettingsSessionsViewModel>(),
+                SettingsStoragePage => session.Resolve<SettingsStorageViewModel>(),
+                SettingsProfilePage settingsProfilePage => session.Resolve<SettingsProfileViewModel, IUserDelegate>(settingsProfilePage),
+                SettingsProfileColorPage => session.Resolve<SettingsProfileColorViewModel>(),
+                SettingsPowerSavingPage => session.Resolve<SettingsPowerSavingViewModel>(),
+                SettingsPrivacyAllowCallsPage => session.Resolve<SettingsPrivacyAllowCallsViewModel>(),
+                SettingsPrivacyAllowChatInvitesPage => session.Resolve<SettingsPrivacyAllowChatInvitesViewModel>(),
+                SettingsPrivacyAllowP2PCallsPage => session.Resolve<SettingsPrivacyAllowP2PCallsViewModel>(),
+                SettingsPrivacyAllowPrivateVoiceAndVideoNoteMessagesPage => session.Resolve<SettingsPrivacyAllowPrivateVoiceAndVideoNoteMessagesViewModel>(),
+                SettingsPrivacyShowForwardedPage => session.Resolve<SettingsPrivacyShowForwardedViewModel>(),
+                SettingsPrivacyPhonePage => session.Resolve<SettingsPrivacyPhoneViewModel>(),
+                SettingsPrivacyShowPhotoPage privacyShowPhotoPage => session.Resolve<SettingsPrivacyShowPhotoViewModel, IUserDelegate>(privacyShowPhotoPage),
+                SettingsPrivacyShowProfileAudioPage privacyShowProfileAudioPage => session.Resolve<SettingsPrivacyShowProfileAudioViewModel>(),
+                SettingsPrivacyShowStatusPage => session.Resolve<SettingsPrivacyShowStatusViewModel>(),
+                SettingsPrivacyShowBioPage => session.Resolve<SettingsPrivacyShowBioViewModel>(),
+                SettingsPrivacyShowBirthdatePage => session.Resolve<SettingsPrivacyShowBirthdateViewModel>(),
+                SettingsPrivacyNewChatPage => session.Resolve<SettingsPrivacyNewChatViewModel>(),
+                SettingsPrivacyAutosaveGiftsPage => session.Resolve<SettingsPrivacyAutosaveGiftsViewModel>(),
+
+                BusinessPage => session.Resolve<BusinessViewModel>(),
+                BusinessLocationPage => session.Resolve<BusinessLocationViewModel>(),
+                BusinessHoursPage => session.Resolve<BusinessHoursViewModel>(),
+                BusinessRepliesPage businessRepliesPage => session.Resolve<BusinessRepliesViewModel, IBusinessRepliesDelegate>(businessRepliesPage),
+                BusinessGreetPage => session.Resolve<BusinessGreetViewModel>(),
+                BusinessAwayPage => session.Resolve<BusinessAwayViewModel>(),
+                BusinessBotsPage => session.Resolve<BusinessBotsViewModel>(),
+                BusinessIntroPage => session.Resolve<BusinessIntroViewModel>(),
+                BusinessChatLinksPage businessChatLinksPage => session.Resolve<BusinessChatLinksViewModel, IBusinessChatLinksDelegate>(businessChatLinksPage),
+
+                RevenuePage => session.Resolve<RevenueViewModel>(),
+
+                PaymentFormPage => session.Resolve<PaymentFormViewModel>(),
+                MessageStatisticsPage => session.Resolve<MessageStatisticsViewModel>(),
+                ChatInviteLinksPage => session.Resolve<ChatInviteLinksViewModel>(),
+                ChatStatisticsPage => session.Resolve<ChatStatisticsViewModel>(),
+                ChatRevenuePage => session.Resolve<ChatRevenueViewModel>(),
+                ChatStarsPage => session.Resolve<ChatStarsViewModel>(),
+                ChatStoriesPage => session.Resolve<ChatStoriesViewModel>(),
+
+                // Popups
+                ContactsPopup => session.Resolve<ContactsViewModel>(),
+                CallsPopup => session.Resolve<CallsViewModel>(),
+                DownloadsPopup => session.Resolve<DownloadsViewModel>(),
+                SettingsUsernamePopup => session.Resolve<SettingsUsernameViewModel>(),
+                ChooseChatsPopup => session.Resolve<ChooseChatsViewModel>(),
+                ChooseSoundPopup => session.Resolve<ChooseSoundViewModel>(),
+                ChatNotificationsPopup => session.Resolve<ChatNotificationsViewModel>(),
+                CreateChatPhotoPopup => session.Resolve<CreateChatPhotoViewModel>(),
+                PromoPopup => session.Resolve<PromoViewModel>(),
+                StarsPage => session.Resolve<StarsViewModel>(),
+                GramsPage => session.Resolve<GramsViewModel>(),
+                BuyPopup => session.Resolve<BuyViewModel>(),
+                PayPopup => session.Resolve<PayViewModel>(),
+                StoryInteractionsPopup => session.Resolve<StoryInteractionsViewModel>(),
+                BackgroundsPopup => session.Resolve<SettingsBackgroundsViewModel>(),
+                BackgroundPopup backgroundPopup => session.Resolve<BackgroundViewModel, IBackgroundDelegate>(backgroundPopup),
+                _ => null
+            };
+        }
+    }
+}

@@ -1,0 +1,273 @@
+<local:HostedPage x:Class="Telegram.Views.DiagnosticsPage"
+                  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                  xmlns:local="using:Telegram.Views"
+                  xmlns:common="using:Telegram.Common"
+                  xmlns:controls="using:Telegram.Controls"
+                  xmlns:services="using:Telegram.Services"
+                  xmlns:viewModels="using:Telegram.ViewModels"
+                  xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+                  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                  mc:Ignorable="d"
+                  NavigationMode="Root">
+
+    <Grid Background="{ThemeResource SettingsPageBackground}">
+        <ScrollViewer x:Name="ScrollingHost"
+                      VerticalScrollBarVisibility="Auto"
+                      VerticalScrollMode="Auto">
+            <controls:SettingsPanel>
+                <controls:HeaderedControl Header="Experimental">
+                    <CheckBox IsChecked="{x:Bind ViewModel.UseTestDC, Mode=TwoWay}"
+                              Visibility="{x:Bind ViewModel.CanUseTestDC}"
+                              Content="Use Test DC"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.AllowRightToLeft, Mode=TwoWay}"
+                              Content="Allow Right to Left"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Stickers.IsPointerOverEnabled, Mode=TwoWay}"
+                              Content="Show Stickers Panel on Pointer Over"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+                    
+                    <controls:SettingsButton Content="Deleted Message Effect">
+                        <controls:SettingsButton.Badge>
+                            <controls:SettingsComboBox ItemsSource="{x:Bind ViewModel.MessageDustOptions}"
+                                                       SelectedIndex="{x:Bind ViewModel.MessageDust, Mode=TwoWay}" />
+                        </controls:SettingsButton.Badge>
+                    </controls:SettingsButton>
+
+                    <controls:SettingsButton Content="Native Text Input (restart)">
+                        <controls:SettingsButton.Badge>
+                            <controls:SettingsComboBox ItemsSource="{x:Bind ViewModel.NativeTextInputOptions}"
+                                                       SelectedIndex="{x:Bind ViewModel.NativeTextInput, Mode=TwoWay}" />
+                        </controls:SettingsButton.Badge>
+                    </controls:SettingsButton>
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.EditorMeter, Mode=TwoWay}"
+                              Content="Editor Meter (Ctrl+Alt+Shift+M in an Editor)"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.AnalyzerTextLayout, Mode=TwoWay}"
+                              Content="Analyzer Text Layout in Editors (restart)"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind ViewModel.LegacyScrollBars, Mode=TwoWay}"
+                              Content="Legacy ScrollBar Style"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.ShowMemoryUsage, Mode=TwoWay}"
+                              Content="Show Memory Usage"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.HidePhoneNumber, Mode=TwoWay}"
+                              Content="Hide Phone Number in Navigation"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.ForceRawAudio, Mode=TwoWay}"
+                              Content="Force Raw Audio"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.DisableHardwareVideoEncoding, Mode=TwoWay}"
+                              Content="Disable Hardware Video Encoding"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.EnableWebViewDevTools, Mode=TwoWay}"
+                              Content="Enable WebView DevTools"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.ForceEdgeHtml, Mode=TwoWay}"
+                              Content="Force EdgeHTML"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.DisableXamlGcCollect, Mode=TwoWay}"
+                              Content="Disable XAML GC Collect"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.DisableMemoryPressure, Mode=TwoWay}"
+                              Content="Disable Memory Pressure"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.DisablePackageManager, Mode=TwoWay}"
+                              Content="Disable Package Manager"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind ViewModel.PreferIpv6, Mode=TwoWay}"
+                              Content="{CustomResource ConnectWithIPv6}"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.ForumTabsDebug, Mode=TwoWay}"
+                              Content="Forum Tabs Debug"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.BubbleElevationDebug, Mode=TwoWay}"
+                              Content="Bubble Elevation Debug"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.BubbleRecyclingDebug, Mode=TwoWay}"
+                              Content="Bubble Recycling Debug"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.BubbleContentRecyclingDebug, Mode=TwoWay}"
+                              Content="Bubble Content Recycling Debug"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.WindowResizeDebug, Mode=TwoWay}"
+                              Content="Window Resize Debug"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.DeleteFilesDebug, Mode=TwoWay}"
+                              Content="Delete Files Debug"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.AlbumPreloadDebug, Mode=TwoWay}"
+                              Content="Album Preload Debug"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.ConnectedAnimationsDebug, Mode=TwoWay}"
+                              Content="Connected Animations Debug"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.DirectTextDebug, Mode=TwoWay}"
+                              Content="Direct Text Debug (restart)"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl>
+                    <controls:SettingsButton Click="{x:Bind services:AppSettings.ToolTip.Reset}"
+                                             Content="Reset Tool Tips"
+                                             Foreground="{ThemeResource DangerButtonForeground}" />
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl Header="Calls Logs">
+                    <controls:SettingsButton Content="tgcalls.txt"
+                                             Click="{x:Bind ViewModel.SendCalls}"
+                                             Badge="{x:Bind ConvertSize(ViewModel.LogCallsSize), Mode=OneWay}" />
+                    <controls:SettingsButton Content="tgcalls_group.txt"
+                                             Click="{x:Bind ViewModel.SendGroupCalls}"
+                                             Badge="{x:Bind ConvertSize(ViewModel.LogGroupCallsSize), Mode=OneWay}" />
+                    <controls:SettingsButton Content="Video informations"
+                                             Click="{x:Bind ViewModel.VideoInfo}" />
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl Header="TDLib JSON"
+                                          Footer="Counts what Client.Receive parses. Off it costs nothing; on it reads a timestamp per update and scans each payload for its length, which the parser itself no longer does.">
+                    <CheckBox IsChecked="{x:Bind services:AppSettings.Diagnostics.MeasureDeserialization, Mode=TwoWay}"
+                              Content="Measure Deserialization"
+                              Style="{StaticResource SettingsCheckBoxStyle}" />
+
+                    <controls:SettingsButton Description="Deserialization">
+                        <TextBlock Text="{x:Bind ViewModel.Deserialization, Mode=OneWay}"
+                                   IsTextSelectionEnabled="True" />
+                    </controls:SettingsButton>
+                    <controls:SettingsButton Content="Reset"
+                                             Click="{x:Bind ViewModel.ResetDeserialization}" />
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl Header="File updates"
+                                          Footer="What updateFile costs the UI: how many arrive, how many handler calls come out of them once a burst for one file has been collapsed, and how many dispatcher work items carry those calls.">
+                    <controls:SettingsButton Description="Updates">
+                        <TextBlock Text="{x:Bind ViewModel.FileUpdates, Mode=OneWay}"
+                                   IsTextSelectionEnabled="True" />
+                    </controls:SettingsButton>
+                    <controls:SettingsButton Content="Reset"
+                                             Click="{x:Bind ViewModel.ResetFileUpdates}" />
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl Header="Garbage collection"
+                                          Footer="Every pause suspends every managed thread, so the time here is time the interface did not exist. A blocking collection covering every generation is one the app was asked for rather than one the collector chose - XAML requests those through the reference tracker when its own memory grows.">
+                    <controls:SettingsButton Description="Collections">
+                        <TextBlock Text="{x:Bind ViewModel.GarbageCollection, Mode=OneWay}"
+                                   IsTextSelectionEnabled="True" />
+                    </controls:SettingsButton>
+                    <controls:SettingsButton Content="Refresh"
+                                             Click="{x:Bind ViewModel.RefreshGarbageCollection}" />
+                    <controls:SettingsButton Content="Copy"
+                                             Click="{x:Bind ViewModel.CopyGarbageCollection}" />
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl Header="TDLib Logs"
+                                          Footer="**Warning**: TDLib Logs will contain **private data** if Verbosity Level was ever set to VERBOSE or higher value.&#x0a;&#x0a;Using high Verbosity Level will dramatically slow down the app as well.">
+                    <controls:SettingsButton Content="Verbosity Level">
+                        <controls:SettingsButton.Badge>
+                            <controls:SettingsComboBox ItemsSource="{x:Bind ViewModel.VerbosityOptions}"
+                                                       SelectedIndex="{x:Bind ViewModel.Verbosity, Mode=TwoWay}" />
+                        </controls:SettingsButton.Badge>
+                    </controls:SettingsButton>
+                    <controls:SettingsButton Content="tdlib_log.txt"
+                                             Click="{x:Bind ViewModel.SendLog}"
+                                             Badge="{x:Bind ConvertSize(ViewModel.LogSize), Mode=OneWay}" />
+                    <controls:SettingsButton Content="tdlib_log.txt.old"
+                                             Click="{x:Bind ViewModel.SendLogOld}"
+                                             Badge="{x:Bind ConvertSize(ViewModel.LogOldSize), Mode=OneWay}" />
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl Header="App Logs"
+                                          Footer="App Logs use the same Verbosity Level, and are kept in two files: when the newest one reaches 10 MB it replaces the oldest.">
+                    <controls:SettingsButton Content="app_log.txt"
+                                             Click="{x:Bind ViewModel.SendAppLog}"
+                                             Badge="{x:Bind ConvertSize(ViewModel.AppLogSize), Mode=OneWay}" />
+                    <controls:SettingsButton Content="app_log.txt.old"
+                                             Click="{x:Bind ViewModel.SendAppLogOld}"
+                                             Badge="{x:Bind ConvertSize(ViewModel.AppLogOldSize), Mode=OneWay}" />
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl>
+                    <controls:SettingsButton Content="Disable Database"
+                                             Click="{x:Bind ViewModel.DisableDatabase}"
+                                             Foreground="{ThemeResource DangerButtonForeground}"
+                                             Visibility="{x:Bind ViewModel.IsDatabaseDisabled, Converter={StaticResource BooleanToVisibilityConverter}, ConverterParameter=invert}" />
+                    <controls:SettingsButton Content="Enable Database"
+                                             Click="{x:Bind ViewModel.DisableDatabase}"
+                                             Visibility="{x:Bind ViewModel.IsDatabaseDisabled, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl Header="Power Saving"
+                                          Footer="What the policy reads, what it decided, and what each flag ends up as. A flag that disagrees with the setting behind it says so."
+                                          ItemsSource="{x:Bind ViewModel.PowerSaving}">
+                    <controls:HeaderedControl.ItemTemplate>
+                        <DataTemplate x:DataType="viewModels:DiagnosticsOption">
+                            <controls:SettingsButton Content="{x:Bind Name}"
+                                                     Badge="{x:Bind Value}" />
+                        </DataTemplate>
+                    </controls:HeaderedControl.ItemTemplate>
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl Header="TDLib Modules"
+                                          ItemsSource="{x:Bind ViewModel.Tags}">
+                    <controls:HeaderedControl.ItemTemplate>
+                        <DataTemplate x:DataType="viewModels:DiagnosticsTag">
+                            <controls:SettingsButton Content="{x:Bind Name}">
+                                <controls:SettingsButton.Badge>
+                                    <controls:SettingsComboBox ItemsSource="{x:Bind VerbosityOptions}"
+                                                               SelectedIndex="{x:Bind Verbosity, Mode=TwoWay}" />
+                                </controls:SettingsButton.Badge>
+                            </controls:SettingsButton>
+                        </DataTemplate>
+                    </controls:HeaderedControl.ItemTemplate>
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl Header="Options"
+                                          ItemsSource="{x:Bind ViewModel.Options}">
+                    <controls:HeaderedControl.ItemTemplate>
+                        <DataTemplate x:DataType="viewModels:DiagnosticsOption">
+                            <controls:SettingsButton Content="{x:Bind Name}"
+                                                     Badge="{x:Bind Value}" />
+                        </DataTemplate>
+                    </controls:HeaderedControl.ItemTemplate>
+                </controls:HeaderedControl>
+
+                <controls:HeaderedControl>
+                    <controls:SettingsButton Content="Generate Exception"
+                                             Click="Exception_Click" />
+                    <controls:SettingsButton Content="Crash the app &#x2620;"
+                                             Click="Crash_Click" />
+                    <controls:SettingsButton Content="Crash TDLib &#x2620;"
+                                             Click="Logger_Click" />
+                    <controls:SettingsButton Content="Copy Anonymous User ID"
+                                             Click="Anonymous_Click" />
+                </controls:HeaderedControl>
+            </controls:SettingsPanel>
+        </ScrollViewer>
+    </Grid>
+</local:HostedPage>

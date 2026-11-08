@@ -1,0 +1,32 @@
+import "NativeUtils.idl";
+
+namespace Telegram.Native
+{
+    struct MaxLinesMetrics
+    {
+        Double X;
+        Double Y;
+        Double Width;
+        Double Height;
+        Double TruncatedHeight;
+        Int32 TruncatedOffset;
+    };
+
+    struct TextStylePart
+    {
+        Int32 Offset;
+        Int32 Length;
+        TextStyle Type;
+    };
+
+    [default_interface]
+    runtimeclass TextFormat 
+    {
+        TextFormat();
+        Windows.Foundation.Numerics.Vector2 ContentEnd(Double fontSize, Double width);
+        Windows.Foundation.Numerics.Vector2 ContentWidths(Double fontSize, Double width, Boolean rtl);
+        MaxLinesMetrics MaxLines(Int32 offset, Int32 length, Double fontSize, Double width, Boolean rtl, Int32 maxLines);
+        Windows.Foundation.Rect[] RangeMetrics(Int32 offset, Int32 length, Double fontSize, Double width, Boolean rtl, Boolean wrap, Int32 maxLines);
+        Windows.Foundation.Rect[] LineMetrics(Int32 offset, Int32 length, Double fontSize, Double width, Boolean rtl, Boolean wrap);
+    }
+}

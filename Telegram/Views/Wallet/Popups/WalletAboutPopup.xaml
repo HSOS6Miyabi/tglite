@@ -1,0 +1,53 @@
+<controls:ModalPopup x:Class="Telegram.Views.Wallet.Popups.WalletAboutPopup"
+                     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                     xmlns:common="using:Telegram.Common"
+                     xmlns:controls="using:Telegram.Controls"
+                     mc:Ignorable="d"
+                     Padding="0"
+                     IsDismissButtonVisible="True">
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                  VerticalScrollMode="Auto">
+        <StackPanel>
+            <controls:AnimatedImage Source="ms-appx:///Assets/Animations/Gram.tgs"
+                                    IsCachingEnabled="False"
+                                    AutoPlay="True"
+                                    FrameSize="120,120"
+                                    DecodeFrameType="Logical"
+                                    Width="120"
+                                    Height="120" />
+
+            <TextBlock Text="{CustomResource WalletHowItWorks}"
+                       Style="{StaticResource PopupTextBlockStyle}"
+                       TextAlignment="Center"
+                       VerticalAlignment="Top"
+                       Margin="12,0,12,4" />
+
+            <TextBlock common:TextBlockHelper.Markdown="{CustomResource WalletHowItWorksInfo}"
+                       Style="{StaticResource BodyTextBlockStyle}"
+                       TextAlignment="Center"
+                       Grid.Row="2" />
+
+            <controls:PopupInfo Title="{CustomResource WalletSendInstantly}"
+                                Subtitle="{CustomResource WalletSendInstantlyInfo}"
+                                Glyph="&#xEB2B;"
+                                Margin="0,12,0,0" />
+            <controls:PopupInfo Title="{CustomResource WalletNoFees}"
+                                Subtitle="{CustomResource WalletNoFeesInfo}"
+                                Glyph="&#xEA9D;" />
+            <controls:PopupInfo Title="{CustomResource WalletBlockchainVerified}"
+                                Subtitle="{CustomResource WalletBlockchainVerifiedInfo}"
+                                Glyph="&#xEA8B;" />
+
+            <controls:SettingsFooter x:Name="Footer"
+                                     Click="Footer_Click"
+                                     IsLink="True"
+                                     Text="{CustomResource Strings.WalletTermsOfService}"
+                                     TextAlignment="Center"
+                                     Margin="12,8,12,24" />
+        </StackPanel>
+    </ScrollViewer>
+</controls:ModalPopup>

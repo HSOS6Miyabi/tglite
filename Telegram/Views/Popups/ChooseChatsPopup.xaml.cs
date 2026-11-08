@@ -1,0 +1,2402 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Numerics;
+using System.Threading.Tasks;
+using Telegram.Collections;
+using Telegram.Common;
+using Telegram.Controls;
+using Telegram.Controls.Cells;
+using Telegram.Controls.Drawers;
+using Telegram.Controls.Media;
+using Telegram.Controls.RichEditor;
+using Telegram.Controls.Views;
+using Telegram.Navigation;
+using Telegram.Navigation.Services;
+using Telegram.Services;
+using Telegram.Td;
+using Telegram.Td.Api;
+using Telegram.ViewModels;
+using Telegram.ViewModels.Drawers;
+using Telegram.ViewModels.Folders;
+using Windows.ApplicationModel.DataTransfer.ShareTarget;
+using Windows.UI.Composition;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Controls.Primitives;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Input;
+using Windows.UI.Xaml.Media.Animation;
+using Windows.UI.Xaml.Navigation;
+
+namespace Telegram.Views.Popups
+{
+    #region Options
+
+    public enum ChooseChatsMode
+    {
+        Chats,
+        Contacts
+    }
+
+    public record ChooseChatsOptions
+    {
+        public bool AllowAll => AllowChannelChats && AllowGroupChats && AllowBotChats && AllowUserChats && AllowSecretChats && AllowSelf && !CanPostMessages && !CanInviteUsers && !CanShareContact;
+
+        public bool AllowChannelChats { get; set; } = true;
+        public bool AllowGroupChats { get; set; } = true;
+        public bool AllowBotChats { get; set; } = true;
+        public bool AllowUserChats { get; set; } = true;
+        public bool AllowSecretChats { get; set; } = true;
+
+        public bool AllowSelf { get; set; } = true;
+
+        public bool CanPostMessages { get; set; } = false;
+        public bool CanInviteUsers { get; set; } = false;
+        public bool CanShareContact { get; set; } = false;
+        public bool CanPromoteMembers { get; set; } = false;
+
+        public ChooseChatsMode Mode { get; set; } = ChooseChatsMode.Chats;
+
+        public bool ShowMessages { get; set; } = false;
+
+        #region Predefined
+
+        public static readonly ChooseChatsOptions All = new()
+        {
+            AllowChannelChats = true,
+            AllowGroupChats = true,
+            AllowBotChats = true,
+            AllowUserChats = true,
+            AllowSecretChats = true,
+            AllowSelf = true,
+            CanPostMessages = false,
+            CanInviteUsers = false,
+            CanShareContact = false,
+            Mode = ChooseChatsMode.Chats,
+            ShowMessages = true
+        };
+
+        public static readonly ChooseChatsOptions ChannelsCanPromoteMembers = new()
+        {
+            AllowChannelChats = true,
+            AllowGroupChats = false,
+            AllowBotChats = false,
+            AllowUserChats = false,
+            AllowSecretChats = false,
+            AllowSelf = false,
+            CanPostMessages = false,
+            CanInviteUsers = false,
+            CanPromoteMembers = true,
+            CanShareContact = false,
+            Mode = ChooseChatsMode.Chats,
+            ShowMessages = false
+        };
+
+        public static readonly ChooseChatsOptions GroupsAndChannels = new()
+        {
+            AllowChannelChats = true,
+            AllowGroupChats = true,
+            AllowBotChats = false,
+            AllowUserChats = false,
+            AllowSecretChats = false,
+            AllowSelf = false,
+            CanPostMessages = true,
+            CanInviteUsers = false,
+            CanShareContact = false,
+            Mode = ChooseChatsMode.Chats,
+            ShowMessages = false
+        };
+
+        public static readonly ChooseChatsOptions UsersAndChannels = new()
+        {
+            AllowChannelChats = true,
+            AllowGroupChats = false,
+            AllowBotChats = false,
+            AllowUserChats = true,
+            AllowSecretChats = false,
+            AllowSelf = true,
+            CanPostMessages = true,
+            CanInviteUsers = false,
+            CanShareContact = false,
+            Mode = ChooseChatsMode.Chats,
+            ShowMessages = false
+        };
+
+        public static readonly ChooseChatsOptions Contacts = new()
+        {
+            AllowChannelChats = false,
+            AllowGroupChats = false,
+            AllowBotChats = false,
+            AllowUserChats = true,
+            AllowSecretChats = false,
+            AllowSelf = false,
+            CanPostMessages = false,
+            CanInviteUsers = false,
+            CanShareContact = false,
+            Mode = ChooseChatsMode.Contacts,
+            ShowMessages = false
+        };
+
+        public static readonly ChooseChatsOptions ContactsOnly = new()
+        {
+            AllowChannelChats = false,
+            AllowGroupChats = false,
+            AllowBotChats = false,
+            AllowUserChats = true,
+            AllowSecretChats = false,
+            AllowSelf = false,
+            CanPostMessages = false,
+            CanInviteUsers = false,
+            CanShareContact = true,
+            Mode = ChooseChatsMode.Contacts,
+            ShowMessages = false
+        };
+
+        public static readonly ChooseChatsOptions Users = new()
+        {
+            AllowChannelChats = false,
+            AllowGroupChats = false,
+            AllowBotChats = true,
+            AllowUserChats = true,
+            AllowSecretChats = false,
+            AllowSelf = false,
+            CanPostMessages = false,
+            CanInviteUsers = false,
+            CanShareContact = false,
+            Mode = ChooseChatsMode.Chats,
+            ShowMessages = false
+        };
+
+        public static readonly ChooseChatsOptions PostMessages = new()
+        {
+            AllowChannelChats = true,
+            AllowGroupChats = true,
+            AllowBotChats = true,
+            AllowUserChats = true,
+            AllowSecretChats = true,
+            AllowSelf = true,
+            CanPostMessages = true,
+            CanInviteUsers = false,
+            CanShareContact = false,
+            Mode = ChooseChatsMode.Chats,
+            ShowMessages = false
+        };
+
+        public static readonly ChooseChatsOptions InviteUsers = new()
+        {
+            AllowChannelChats = false,
+            AllowGroupChats = false,
+            AllowBotChats = true,
+            AllowUserChats = true,
+            AllowSecretChats = false,
+            AllowSelf = false,
+            CanPostMessages = false,
+            CanInviteUsers = true,
+            CanShareContact = false,
+            Mode = ChooseChatsMode.Chats,
+            ShowMessages = false
+        };
+
+        public static readonly ChooseChatsOptions Privacy = new()
+        {
+            AllowChannelChats = false,
+            AllowGroupChats = true,
+            AllowBotChats = true,
+            AllowUserChats = true,
+            AllowSecretChats = false,
+            AllowSelf = false,
+            CanPostMessages = false,
+            CanInviteUsers = false,
+            CanShareContact = false,
+            Mode = ChooseChatsMode.Contacts,
+            ShowMessages = false
+        };
+
+        #endregion
+
+        public virtual bool Allow(IClientService clientService, Chat chat)
+        {
+            if (AllowAll)
+            {
+                return true;
+            }
+
+            switch (chat.Type)
+            {
+                case ChatTypeBasicGroup:
+                    if (AllowGroupChats)
+                    {
+                        if (CanPostMessages)
+                        {
+                            return clientService.CanPostMessages(chat);
+                        }
+                        else if (CanInviteUsers)
+                        {
+                            return clientService.CanInviteUsers(chat);
+                        }
+                        else if (CanPromoteMembers)
+                        {
+                            return clientService.CanPromoteMembers(chat);
+                        }
+
+                        return true;
+                    }
+                    return false;
+                case ChatTypePrivate privata:
+                    if (privata.UserId == clientService.Options.MyId)
+                    {
+                        return AllowSelf;
+                    }
+                    else if (clientService.TryGetUser(privata.UserId, out User user))
+                    {
+                        if (user.Type is UserTypeDeleted)
+                        {
+                            return false;
+                        }
+                        else if (user.Type is UserTypeBot)
+                        {
+                            return AllowBotChats
+                                && !CanShareContact
+                                && chat.Id != clientService.Options.RepliesBotChatId
+                                && chat.Id != clientService.Options.VerificationCodesBotChatId;
+                        }
+                        else if (CanShareContact)
+                        {
+                            return user.PhoneNumber.Length > 0;
+                        }
+                    }
+                    return AllowUserChats;
+                case ChatTypeSecret:
+                    return AllowSecretChats;
+                case ChatTypeSupergroup supergroup:
+                    if ((supergroup.IsChannel ? AllowChannelChats : AllowGroupChats) && clientService.TryGetSupergroup(supergroup.SupergroupId, out Supergroup super))
+                    {
+                        if (super.IsDirectMessagesGroup && !CanPostMessages)
+                        {
+                            return false;
+                        }
+
+                        if (CanPostMessages)
+                        {
+                            return super.CanPostMessages();
+                        }
+                        else if (CanInviteUsers)
+                        {
+                            return super.CanInviteUsers(chat);
+                        }
+                        else if (CanPromoteMembers)
+                        {
+                            return super.CanPromoteMembers();
+                        }
+
+                        return true;
+                    }
+                    return false;
+                default:
+                    return false;
+            }
+        }
+
+        public virtual bool Allow(IClientService clientService, User user)
+        {
+            if (AllowAll)
+            {
+                return true;
+            }
+
+            if (user.Id == clientService.Options.MyId)
+            {
+                return AllowSelf;
+            }
+            else if (user.Type is UserTypeBot)
+            {
+                return AllowBotChats && !CanShareContact;
+            }
+            else if (CanShareContact)
+            {
+                return user.PhoneNumber.Length > 0;
+            }
+
+            return AllowUserChats;
+        }
+    }
+
+    public record ChooseChatsOptionsRequestUsers : ChooseChatsOptions
+    {
+        public ChooseChatsOptionsRequestUsers(ChooseChatsConfigurationRequestUsers requestUsers)
+        {
+            UserIsPremium = requestUsers.UserIsPremium;
+            RestrictUserIsPremium = requestUsers.RestrictUserIsPremium;
+            UserIsBot = requestUsers.UserIsBot;
+            RestrictUserIsBot = requestUsers.RestrictUserIsBot;
+
+            AllowUserChats = !RestrictUserIsBot || (RestrictUserIsBot && !UserIsBot);
+            Mode = ChooseChatsMode.Contacts;
+        }
+
+        /// <summary>
+        /// True, if the shared users must be Telegram Premium users; otherwise, the shared
+        /// users must not be Telegram Premium users. Ignored if RestrictUserIsPremium is
+        /// false.
+        /// </summary>
+        public bool UserIsPremium { get; set; }
+
+        /// <summary>
+        /// True, if the shared users must or must not be Telegram Premium users.
+        /// </summary>
+        public bool RestrictUserIsPremium { get; set; }
+
+        /// <summary>
+        /// True, if the shared users must be bots; otherwise, the shared users must not
+        /// be bots. Ignored if RestrictUserIsBot is false.
+        /// </summary>
+        public bool UserIsBot { get; set; }
+
+        /// <summary>
+        /// True, if the shared users must or must not be bots.
+        /// </summary>
+        public bool RestrictUserIsBot { get; set; }
+
+        public override bool Allow(IClientService clientService, Chat chat)
+        {
+            if (clientService.TryGetUser(chat, out User user))
+            {
+                if (chat.Id == clientService.Options.RepliesBotChatId || chat.Id == clientService.Options.VerificationCodesBotChatId)
+                {
+                    return false;
+                }
+
+                return Allow(clientService, user);
+            }
+
+            return false;
+        }
+
+        public override bool Allow(IClientService clientService, User user)
+        {
+            if (RestrictUserIsBot)
+            {
+                return UserIsBot == user.Type is UserTypeBot;
+            }
+
+            if (RestrictUserIsPremium)
+            {
+                return UserIsPremium == user.IsPremium;
+            }
+
+            return user.Type is UserTypeBot or UserTypeRegular;
+        }
+    }
+
+    public record ChooseChatsOptionsRequestChat : ChooseChatsOptions
+    {
+        public ChooseChatsOptionsRequestChat(ChooseChatsConfigurationRequestChat requestChat)
+        {
+            BotIsMember = requestChat.BotIsMember;
+            BotAdministratorRights = requestChat.BotAdministratorRights;
+            UserAdministratorRights = requestChat.UserAdministratorRights;
+            ChatIsCreated = requestChat.ChatIsCreated;
+            ChatHasUsername = requestChat.ChatHasUsername;
+            RestrictChatHasUsername = requestChat.RestrictChatHasUsername;
+            ChatIsForum = requestChat.ChatIsForum;
+            RestrictChatIsForum = requestChat.RestrictChatIsForum;
+            ChatIsChannel = requestChat.ChatIsChannel;
+
+            AllowUserChats = false;
+            Mode = ChooseChatsMode.Chats;
+        }
+
+        /// <summary>
+        /// True, if the bot must be a member of the chat; for basic group and supergroup
+        /// chats only.
+        /// </summary>
+        public bool BotIsMember { get; }
+
+        /// <summary>
+        /// Expected bot administrator rights in the chat; may be null if they aren't restricted.
+        /// </summary>
+        public ChatAdministratorRights BotAdministratorRights { get; }
+
+        /// <summary>
+        /// Expected user administrator rights in the chat; may be null if they aren't restricted.
+        /// </summary>
+        public ChatAdministratorRights UserAdministratorRights { get; }
+
+        /// <summary>
+        /// True, if the chat must be created by the current user.
+        /// </summary>
+        public bool ChatIsCreated { get; }
+
+        /// <summary>
+        /// True, if the chat must have a username; otherwise, the chat must not have a username.
+        /// Ignored if RestrictChatHasUsername is false.
+        /// </summary>
+        public bool ChatHasUsername { get; }
+
+        /// <summary>
+        /// True, if the chat must or must not have a username.
+        /// </summary>
+        public bool RestrictChatHasUsername { get; }
+
+        /// <summary>
+        /// True, if the chat must be a forum supergroup; otherwise, the chat must not be
+        /// a forum supergroup. Ignored if RestrictChatIsForum is false.
+        /// </summary>
+        public bool ChatIsForum { get; }
+
+        /// <summary>
+        /// True, if the chat must or must not be a forum supergroup.
+        /// </summary>
+        public bool RestrictChatIsForum { get; }
+
+        /// <summary>
+        /// True, if the chat must be a channel; otherwise, a basic group or a supergroup
+        /// chat is shared.
+        /// </summary>
+        public bool ChatIsChannel { get; }
+
+        public override bool Allow(IClientService clientService, Chat chat)
+        {
+            if (ChatIsCreated)
+            {
+                return false;
+            }
+
+            if (clientService.TryGetSupergroup(chat, out Supergroup supergroup))
+            {
+                if (RestrictChatHasUsername && ChatHasUsername != supergroup.HasActiveUsername())
+                {
+                    return false;
+                }
+                else if (RestrictChatIsForum && ChatIsForum != supergroup.IsForum)
+                {
+                    return false;
+                }
+
+                return ChatIsChannel == supergroup.IsChannel;
+            }
+            else if (clientService.TryGetBasicGroup(chat, out BasicGroup basicGroup))
+            {
+                if (RestrictChatHasUsername && ChatHasUsername)
+                {
+                    return false;
+                }
+                else if (RestrictChatIsForum && ChatIsForum)
+                {
+                    return false;
+                }
+
+                return !ChatIsChannel;
+            }
+
+            return false;
+        }
+
+        public override bool Allow(IClientService clientService, User user)
+        {
+            return false;
+        }
+    }
+
+    #endregion
+
+    #region Configurations
+
+    public partial class ChooseChatsConfigurationTransferGift : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationTransferGift(ReceivedGift gift)
+        {
+            Gift = gift;
+        }
+
+        public ReceivedGift Gift { get; }
+    }
+
+    public partial class ChooseChatsConfigurationCreateGroupCall : ChooseChatsConfiguration
+    {
+
+    }
+
+    public partial class ChooseChatsConfigurationBotAddToChannel : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationBotAddToChannel(long botUserId, ChatAdministratorRights administratorRights)
+        {
+            BotUserId = botUserId;
+            AdministratorRights = administratorRights;
+        }
+
+        public long BotUserId { get; }
+
+        public ChatAdministratorRights AdministratorRights { get; }
+    }
+
+
+    public partial class ChooseChatsConfigurationGroupCall : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationGroupCall(int groupCallId, bool isRtmpStream)
+        {
+            GroupCallId = groupCallId;
+            IsRtmpStream = isRtmpStream;
+        }
+
+        public int GroupCallId { get; }
+
+        public bool IsRtmpStream { get; }
+
+        public override int NumberOfSentMessages => 1;
+    }
+
+    public partial class ChooseChatsConfigurationShareOperation : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationShareOperation(ShareOperation shareOperation)
+        {
+            ShareOperation = shareOperation;
+        }
+
+        public ShareOperation ShareOperation { get; }
+    }
+
+    public partial class ChooseChatsConfigurationSwitchInline : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationSwitchInline(string query, TargetChat targetChat, User bot)
+        {
+            Query = query;
+            TargetChat = targetChat;
+            Bot = bot;
+        }
+
+        public ChooseChatsConfigurationSwitchInline(PreparedInlineMessage preparedInlineMessage, User bot)
+        {
+            Result = preparedInlineMessage.Result;
+            InlineQueryId = preparedInlineMessage.InlineQueryId;
+            TargetChat = new TargetChatChosen(preparedInlineMessage.ChatTypes);
+            Bot = bot;
+        }
+
+        public string Query { get; }
+
+        public InlineQueryResult Result { get; }
+
+        public long InlineQueryId { get; }
+
+        public TargetChat TargetChat { get; }
+
+        public User Bot { get; }
+    }
+
+    public partial class ChooseChatsConfigurationPostText : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationPostText(FormattedText text)
+        {
+            Text = text;
+        }
+
+        public ChooseChatsConfigurationPostText(string text)
+        {
+            Text = text.AsFormattedText();
+        }
+
+        public FormattedText Text { get; }
+
+        public override int NumberOfSentMessages => 1;
+    }
+
+    public partial class ChooseChatsConfigurationShareGame : ChooseChatsConfigurationShareMessages
+    {
+        public ChooseChatsConfigurationShareGame(long chatId, long messageId, bool withMyScore = false)
+            : base(new MessageToShare(chatId, messageId, typeof(MessageGame), true, true, false, true))
+        {
+            WithMyScore = withMyScore;
+        }
+
+        public bool WithMyScore { get; }
+    }
+
+    public partial class ChooseChatsConfigurationReplyToMessage : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationReplyToMessage(MessageViewModel message, InputTextQuote quote = null, int checklistTaskId = 0, string pollOptionId = "")
+        {
+            Message = message;
+            Quote = quote;
+            ChecklistTaskId = checklistTaskId;
+            PollOptionId = pollOptionId;
+        }
+
+        public MessageViewModel Message { get; }
+
+        public InputTextQuote Quote { get; }
+
+        public int ChecklistTaskId { get; }
+
+        public string PollOptionId { get; }
+    }
+
+    public partial class ChooseChatsConfigurationInviteToChat : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationInviteToChat(long chatId)
+        {
+            ChatId = chatId;
+        }
+
+        public long ChatId { get; }
+
+        public override bool CanBeSelected(ChooseChatsViewModel viewModel, Chat chat)
+        {
+            if (viewModel.ClientService.TryGetChat(ChatId, out Chat target)
+                && target.Type is ChatTypeBasicGroup or ChatTypeSupergroup { IsChannel: false }
+                && viewModel.ClientService.TryGetUser(chat, out User user))
+            {
+                if (user.Type is UserTypeBot { CanJoinGroups: false })
+                {
+                    viewModel.ShowToast(Strings.BotCantJoinGroups, ToastPopupIcon.Info);
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public override Task<ContentDialogResult> ConfirmSelectionAsync(ChooseChatsViewModel viewModel, IList<Chat> chats)
+        {
+            if (!viewModel.ClientService.TryGetChat(ChatId, out Chat chat))
+            {
+                return Task.FromResult(ContentDialogResult.Primary);
+            }
+
+            if (chat.Type is ChatTypeSupergroup { IsChannel: true })
+            {
+                var selected = chats.FirstOrDefault(x => x.Type is ChatTypePrivate && viewModel.ClientService.GetUser(x).Type is UserTypeBot);
+                if (selected != null)
+                {
+                    return viewModel.ShowPopupAsync(Strings.AddBotAsAdmin, Strings.AddBotAdminAlert, Strings.AddAsAdmin, Strings.Cancel);
+                }
+            }
+
+            string title = Locale.Declension(Strings.R.AddManyMembersAlertTitle, chats.Count);
+            string message;
+
+            if (chats.Count <= 5)
+            {
+                var names = string.Join(", ", chats.Select(x => x.Title));
+                message = string.Format(Strings.AddMembersAlertNamesText, names, chat.Title);
+            }
+            else
+            {
+                message = Locale.Declension(Strings.R.AddManyMembersAlertNamesText, chats.Count, chat.Title);
+            }
+
+            return viewModel.ShowPopupAsync(message, title, Strings.Add, Strings.Cancel);
+        }
+    }
+
+    public partial class ChooseChatsConfigurationShareStory : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationShareStory(long chatId, int storyId)
+        {
+            ChatId = chatId;
+            StoryId = storyId;
+        }
+
+        public long ChatId { get; }
+
+        public int StoryId { get; }
+
+        public override int NumberOfSentMessages => 1;
+    }
+
+    public partial class MessageToShare
+    {
+        public MessageToShare(long chatId, long id, Type contentType, bool canBeCopied, bool canBeCopiedtoSecretChat, bool hasCaption, bool hasSenderId)
+        {
+            ChatId = chatId;
+            Id = id;
+            ContentType = contentType;
+            CanBeCopied = canBeCopied;
+            CanBeCopiedToSecretChat = canBeCopiedtoSecretChat;
+            HasCaption = hasCaption;
+        }
+
+        public MessageToShare(Message message, MessageProperties properties)
+        {
+            ChatId = message.ChatId;
+            Id = message.Id;
+            ContentType = message.Content.GetType();
+            CanBeCopied = properties.CanBeCopied;
+            CanBeCopiedToSecretChat = properties.CanBeCopiedToSecretChat;
+            HasCaption = message.Content is not MessageText && message.HasCaption();
+            SenderId = message.SenderId;
+            ForwardInfo = message.ForwardInfo;
+            ImportInfo = message.ImportInfo;
+        }
+
+        public MessageToShare(MessageWithOwner message, MessageProperties properties)
+        {
+            ChatId = message.ChatId;
+            Id = message.Id;
+            ContentType = message.Content.GetType();
+            CanBeCopied = properties.CanBeCopied;
+            CanBeCopiedToSecretChat = properties.CanBeCopiedToSecretChat;
+            HasCaption = message.Content is not MessageText && message.HasCaption();
+            SenderId = message.SenderId;
+            ForwardInfo = message.ForwardInfo;
+            ImportInfo = message.ImportInfo;
+        }
+
+        public long ChatId { get; }
+
+        public long Id { get; }
+
+        public Type ContentType { get; }
+
+        public bool CanBeCopied { get; }
+
+        public bool CanBeCopiedToSecretChat { get; }
+
+        public bool HasCaption { get; }
+
+        public MessageSender SenderId { get; }
+
+        public MessageForwardInfo ForwardInfo { get; }
+
+        public MessageImportInfo ImportInfo { get; }
+
+        public string GetSenderId(IClientService clientService)
+        {
+            if (ChatId == clientService.Options.MyId && ForwardInfo == null)
+            {
+                return null;
+            }
+
+            // TODO: Not beautiful but it does the trick
+            if (ForwardInfo?.Origin is MessageOriginUser fromUser)
+            {
+                return "MessageOriginUser" + fromUser.SenderUserId;
+            }
+            else if (ForwardInfo?.Origin is MessageOriginChat fromChat)
+            {
+                return "MessageOriginChat" + fromChat.SenderChatId;
+            }
+            else if (ForwardInfo?.Origin is MessageOriginChannel fromChannel)
+            {
+                return "MessageOriginChannel" + fromChannel.ChatId;
+            }
+            else if (ForwardInfo?.Origin is MessageOriginHiddenUser hiddenUser)
+            {
+                return "MessageOriginHiddenUser" + hiddenUser.SenderName;
+            }
+            else if (ImportInfo != null)
+            {
+                return "MessageImportInfo" + ImportInfo.SenderName;
+            }
+            else if (SenderId is MessageSenderChat senderChat)
+            {
+                return "MessageSenderChat" + senderChat.ChatId;
+            }
+            else if (SenderId is MessageSenderUser senderUser)
+            {
+                return "MessageSenderUser" + senderUser.UserId;
+            }
+
+            return null;
+        }
+    }
+
+    public partial class ChooseChatsConfigurationShareMessages : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationShareMessages(MessageToShare message)
+        {
+            Messages = new[] { message };
+        }
+
+        public ChooseChatsConfigurationShareMessages(IEnumerable<MessageToShare> messages)
+        {
+            Messages = messages.ToArray();
+        }
+
+        public IList<MessageToShare> Messages { get; }
+
+        public override int NumberOfSentMessages => Messages.Count;
+    }
+
+    public partial class ChooseChatsConfigurationSetTheme : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationSetTheme(UpgradedGift gift)
+        {
+            Gift = gift;
+        }
+
+        public UpgradedGift Gift { get; }
+
+        public override Task<ContentDialogResult> ConfirmSelectionAsync(ChooseChatsViewModel viewModel, IList<Chat> chats)
+        {
+            if (Gift.UsedThemeChatId != chats[0].Id && viewModel.ClientService.TryGetChat(Gift.UsedThemeChatId, out Chat usedChat))
+            {
+                return viewModel.ShowPopupAsync(string.Format(Strings.GiftThemesSetInReuseInfo, usedChat.Title), Strings.AppName, Strings.GiftThemesSetInReuseConfirm, Strings.Cancel);
+            }
+
+            return Task.FromResult(ContentDialogResult.Primary);
+        }
+    }
+
+    public partial class ChooseChatsConfigurationPostLink : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationPostLink(HttpUrl url)
+        {
+            Url = url;
+        }
+
+        public ChooseChatsConfigurationPostLink(InternalLinkType internalLink)
+        {
+            InternalLink = internalLink;
+        }
+
+        public HttpUrl Url { get; }
+
+        public InternalLinkType InternalLink { get; }
+
+        public override int NumberOfSentMessages => 1;
+    }
+
+    public partial class ChooseChatsConfigurationPostMessage : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationPostMessage(InputMessageContent content)
+        {
+            Content = content;
+        }
+
+        public InputMessageContent Content { get; }
+
+        public override int NumberOfSentMessages => 1;
+    }
+
+    public partial class ChooseChatsConfigurationPostLogs : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationPostLogs(string path)
+        {
+            Path = path;
+        }
+
+        public string Path { get; }
+
+        public override int NumberOfSentMessages => 1;
+    }
+
+    public partial class ChooseChatsConfigurationVerifyChat : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationVerifyChat(long botUserId)
+        {
+            BotUserId = botUserId;
+        }
+
+        public long BotUserId { get; }
+    }
+
+    public partial class ChooseChatsConfigurationStartBot : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationStartBot(User bot, string token = null)
+        {
+            Bot = bot;
+            Token = token;
+        }
+
+        public User Bot { get; }
+
+        public string Token { get; }
+    }
+
+    public partial class ChooseChatsConfigurationRequestUsers : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationRequestUsers(KeyboardButtonSource source, KeyboardButtonTypeRequestUsers requestUsers)
+        {
+            Source = source;
+
+            MaxQuantity = requestUsers.MaxQuantity;
+            UserIsPremium = requestUsers.UserIsPremium;
+            RestrictUserIsPremium = requestUsers.RestrictUserIsPremium;
+            UserIsBot = requestUsers.UserIsBot;
+            RestrictUserIsBot = requestUsers.RestrictUserIsBot;
+            Id = requestUsers.Id;
+        }
+
+        public KeyboardButtonSource Source { get; }
+
+        /// <summary>
+        /// The maximum number of users to share.
+        /// </summary>
+        public int MaxQuantity { get; }
+
+        /// <summary>
+        /// True, if the shared users must be Telegram Premium users; otherwise, the shared
+        /// users must not be Telegram Premium users. Ignored if RestrictUserIsPremium is
+        /// false.
+        /// </summary>
+        public bool UserIsPremium { get; }
+
+        /// <summary>
+        /// True, if the shared users must or must not be Telegram Premium users.
+        /// </summary>
+        public bool RestrictUserIsPremium { get; }
+
+        /// <summary>
+        /// True, if the shared users must be bots; otherwise, the shared users must not
+        /// be bots. Ignored if RestrictUserIsBot is false.
+        /// </summary>
+        public bool UserIsBot { get; }
+
+        /// <summary>
+        /// True, if the shared users must or must not be bots.
+        /// </summary>
+        public bool RestrictUserIsBot { get; }
+
+        /// <summary>
+        /// Unique button identifier.
+        /// </summary>
+        public int Id { get; }
+    }
+
+    public partial class ChooseChatsConfigurationRequestChat : ChooseChatsConfiguration
+    {
+        public ChooseChatsConfigurationRequestChat(KeyboardButtonTypeRequestChat requestChat)
+        {
+            BotIsMember = requestChat.BotIsMember;
+            BotAdministratorRights = requestChat.BotAdministratorRights;
+            UserAdministratorRights = requestChat.UserAdministratorRights;
+            ChatIsCreated = requestChat.ChatIsCreated;
+            ChatHasUsername = requestChat.ChatHasUsername;
+            RestrictChatHasUsername = requestChat.RestrictChatHasUsername;
+            ChatIsForum = requestChat.ChatIsForum;
+            RestrictChatIsForum = requestChat.RestrictChatIsForum;
+            ChatIsChannel = requestChat.ChatIsChannel;
+            Id = requestChat.Id;
+        }
+
+        /// <summary>
+        /// True, if the bot must be a member of the chat; for basic group and supergroup
+        /// chats only.
+        /// </summary>
+        public bool BotIsMember { get; }
+
+        /// <summary>
+        /// Expected bot administrator rights in the chat; may be null if they aren't restricted.
+        /// </summary>
+        public ChatAdministratorRights BotAdministratorRights { get; }
+
+        /// <summary>
+        /// Expected user administrator rights in the chat; may be null if they aren't restricted.
+        /// </summary>
+        public ChatAdministratorRights UserAdministratorRights { get; }
+
+        /// <summary>
+        /// True, if the chat must be created by the current user.
+        /// </summary>
+        public bool ChatIsCreated { get; }
+
+        /// <summary>
+        /// True, if the chat must have a username; otherwise, the chat must not have a username.
+        /// Ignored if RestrictChatHasUsername is false.
+        /// </summary>
+        public bool ChatHasUsername { get; }
+
+        /// <summary>
+        /// True, if the chat must or must not have a username.
+        /// </summary>
+        public bool RestrictChatHasUsername { get; }
+
+        /// <summary>
+        /// True, if the chat must be a forum supergroup; otherwise, the chat must not be
+        /// a forum supergroup. Ignored if RestrictChatIsForum is false.
+        /// </summary>
+        public bool ChatIsForum { get; }
+
+        /// <summary>
+        /// True, if the chat must or must not be a forum supergroup.
+        /// </summary>
+        public bool RestrictChatIsForum { get; }
+
+        /// <summary>
+        /// True, if the chat must be a channel; otherwise, a basic group or a supergroup
+        /// chat is shared.
+        /// </summary>
+        public bool ChatIsChannel { get; }
+
+        /// <summary>
+        /// Unique button identifier.
+        /// </summary>
+        public int Id { get; }
+    }
+
+    public abstract class ChooseChatsConfiguration
+    {
+        public virtual int NumberOfSentMessages => 0;
+
+        public virtual bool CanBeSelected(ChooseChatsViewModel viewModel, Chat chat)
+        {
+            return true;
+        }
+
+        public virtual Task<ContentDialogResult> ConfirmSelectionAsync(ChooseChatsViewModel viewModel, IList<Chat> chats)
+        {
+            if (NumberOfSentMessages > 0)
+            {
+                var messageCount = NumberOfSentMessages;
+
+                int chatCount = 0;
+                long starCount = 0;
+
+                foreach (var chat in chats)
+                {
+                    var paidMessageStarCount = 0L;
+
+                    if (viewModel.ClientService.TryGetUserFull(chat, out UserFullInfo userFullInfo))
+                    {
+                        paidMessageStarCount = userFullInfo.OutgoingPaidMessageStarCount;
+                    }
+                    else if (viewModel.ClientService.TryGetSupergroup(chat, out Supergroup supergroup))
+                    {
+                        if (supergroup.Status is not ChatMemberStatusAdministrator and not ChatMemberStatusCreator && !supergroup.IsAdministeredDirectMessagesGroup)
+                        {
+                            paidMessageStarCount = supergroup.PaidMessageStarCount;
+                        }
+                    }
+
+                    if (paidMessageStarCount > 0)
+                    {
+                        chatCount++;
+                        starCount += paidMessageStarCount;
+                    }
+                }
+
+                if (starCount != 0)
+                {
+                    if (!string.IsNullOrEmpty(viewModel.SendMessage?.Text) || !string.IsNullOrEmpty(viewModel.Caption?.Text))
+                    {
+                        messageCount++;
+                    }
+
+                    var message1 = Locale.Declension(Strings.R.MessageLockedStarsConfirmMessageMulti1, chatCount);
+                    var message3 = Locale.Declension(Strings.R.MessageLockedStarsConfirmMessageMulti2Messages, chatCount * messageCount);
+                    var message2 = Locale.Declension(Strings.R.MessageLockedStarsConfirmMessageMulti2, starCount * messageCount, message3);
+
+                    var title = Strings.MessageLockedStarsConfirmTitle;
+                    var message = string.Format("{0} {1}", message1, message2);
+                    var primaryButtonText = Icons.Premium16 + Icons.Spacing + (starCount * messageCount).ToString("N0"); //Locale.Declension(Strings.R.MessageLockedStarsConfirmMessagePay, messageCount),
+                    var secondaryButtonText = Strings.Cancel;
+
+                    return viewModel.ShowPopupAsync(message, title, primaryButtonText, secondaryButtonText);
+                }
+            }
+
+            return Task.FromResult(ContentDialogResult.Primary);
+        }
+    }
+
+    #endregion
+
+    public sealed partial class ChooseChatsPopup : ModalPopup
+    {
+        public ChooseChatsViewModel ViewModel => DataContext as ChooseChatsViewModel;
+
+        public ChooseChatsPopup()
+        {
+            InitializeComponent();
+
+            PrimaryButtonText = Strings.Send;
+            SecondaryButtonText = Strings.Close;
+
+            CaptionInput.CustomEmoji = CustomEmoji;
+        }
+
+        [Obsolete]
+        public void Legacy(ISession session)
+        {
+            DataContext = session.Resolve<ChooseChatsViewModel>();
+        }
+
+        private bool _legacyNavigated;
+
+        public override void OnNavigatedTo(object parameter)
+        {
+            if (_legacyNavigated)
+            {
+                return;
+            }
+
+            _legacyNavigated = true;
+
+            EmojiPanel.DataContext = EmojiDrawerViewModel.Create(ViewModel.Session);
+            ViewModel.PropertyChanged += OnPropertyChanged;
+
+            if (ViewModel.Options.Mode == ChooseChatsMode.Contacts)
+            {
+                ChatFolders.Visibility = Visibility.Collapsed;
+            }
+
+            if (ViewModel.IsCommentEnabled)
+            {
+                CommentPanel.Visibility = Visibility.Visible;
+                PrimaryButtonText = string.Empty;
+                SecondaryButtonText = string.Empty;
+                IsDismissButtonVisible = ViewModel.Configuration is not ChooseChatsConfigurationShareOperation;
+            }
+            else
+            {
+                CommentPanel.Visibility = Visibility.Collapsed;
+                if (ViewModel.SelectionMode == ListViewSelectionMode.None)
+                {
+                    PrimaryButtonText = string.Empty;
+                    SecondaryButtonText = string.Empty;
+                    IsDismissButtonVisible = true;
+                }
+                else
+                {
+                    PrimaryButtonText = ViewModel.PrimaryButtonText;
+                    SecondaryButtonText = Strings.Cancel;
+                    IsDismissButtonVisible = false;
+                }
+            }
+
+            // An export date of 0 means the gift cannot go to the blockchain at all.
+            if (ViewModel.Configuration is ChooseChatsConfigurationTransferGift { Gift: { ExportDate: > 0, Gift: SentGiftUpgraded } })
+            {
+                var wallet = ViewModel.ClientService.Options.CanUseTonWallet;
+                var button = new SettingsButton
+                {
+                    Content = wallet ? Strings.Gift2TransferToMyWallet : Strings.Gift2SendViaFragment,
+                    Glyph = wallet ? Icons.Wallet : Icons.FragmentFilled,
+                    Style = BootStrapper.Current.Resources["GlyphBadgeButtonPopupStyle"] as Style,
+                    Margin = new Thickness(12, 0, 12, 0),
+                };
+
+                button.Click += ExportGift_Click;
+                Header = button;
+            }
+
+            if (ViewModel.Configuration is ChooseChatsConfigurationShareOperation
+                && LifetimeService.Current.Count > 1
+                && ViewModel.ClientService.TryGetUser(ViewModel.ClientService.Options.MyId, out User user))
+            {
+                Alias.Visibility = Visibility.Visible;
+                Photo.Source = ProfilePictureSource.User(ViewModel.ClientService, user);
+            }
+        }
+
+        protected override void OnApplyTemplate()
+        {
+            if (ViewModel != null)
+            {
+                OnNavigatedTo(null);
+            }
+
+            base.OnApplyTemplate();
+        }
+
+        private void ExportGift_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is SettingsButton button)
+            {
+                button.Click -= ExportGift_Click;
+            }
+
+            if (ViewModel.Configuration is ChooseChatsConfigurationTransferGift transferGift)
+            {
+                Hide();
+                GiftHelper.Export(ViewModel.ClientService, ViewModel.NavigationService, transferGift.Gift);
+            }
+        }
+
+        private void Send_ContextRequested(object sender, ContextRequestedEventArgs args)
+        {
+            if (ViewModel.Configuration is ChooseChatsConfigurationShareMessages shareMessages)
+            {
+                var flyout = new MenuFlyout();
+
+                var senders = shareMessages.Messages
+                    .GroupBy(x => x.GetSenderId(ViewModel.ClientService))
+                    .ToList();
+
+                if (senders[0].Key != null && shareMessages.Messages.Any(x => x.CanBeCopied))
+                {
+                    void SendAsCopy()
+                    {
+                        ViewModel.SendAsCopy = true;
+                        Hide(ContentDialogResult.Primary);
+                    }
+
+                    flyout.CreateFlyoutItem(SendAsCopy, senders.Count > 1 ? Strings.HideSenderNames : Strings.HideSendersName, Icons.PersonOff);
+                }
+
+                if (shareMessages.Messages.Any(x => x.HasCaption && x.CanBeCopied))
+                {
+                    void RemoveCaptions()
+                    {
+                        ViewModel.RemoveCaptions = true;
+                        Hide(ContentDialogResult.Primary);
+                    }
+
+                    flyout.CreateFlyoutItem(RemoveCaptions, Strings.HideCaption, Icons.TextDescriptionOff);
+                }
+
+                flyout.CreateFlyoutSeparator();
+
+                void DisableNotifications()
+                {
+                    ViewModel.SendDisableNotifications = true;
+                    Hide(ContentDialogResult.Primary);
+                }
+
+                flyout.CreateFlyoutItem(DisableNotifications, Strings.SendWithoutSound, Icons.AlertOff);
+
+                if (ViewModel.SelectedItems.Count == 1)
+                {
+                    var chat = ViewModel.SelectedItems[0];
+                    var self = ViewModel.ClientService.IsSavedMessages(chat);
+
+                    if (ViewModel.ClientService.TryGetUser(chat, out Td.Api.User user) && user.Type is UserTypeRegular && user.Status is not UserStatusRecently && !self)
+                    {
+                        flyout.CreateFlyoutItem(SchedulingStateSendWhenOnline, Strings.SendWhenOnline, Icons.PersonCircleOnline);
+                    }
+
+                    flyout.CreateFlyoutItem(SchedulingStateSendAtDate, self ? Strings.SetReminder : Strings.ScheduleMessage, Icons.CalendarClock);
+                }
+                else
+                {
+                    flyout.CreateFlyoutItem(SchedulingStateSendAtDate, Strings.ScheduleMessage, Icons.CalendarClock);
+                }
+
+                flyout.ShowAt(sender as UIElement, FlyoutPlacementMode.TopEdgeAlignedRight);
+            }
+        }
+
+        private void SchedulingStateSendWhenOnline()
+        {
+            ViewModel.SendSchedulingState = new MessageSchedulingStateSendWhenOnline();
+            Hide(ContentDialogResult.Primary);
+        }
+
+        private async void SchedulingStateSendAtDate()
+        {
+            User user = null;
+            bool self = false;
+
+            if (ViewModel.SelectedItems.Count == 1)
+            {
+                var chat = ViewModel.SelectedItems[0];
+
+                self = ViewModel.ClientService.IsSavedMessages(chat);
+                user = ViewModel.ClientService.GetUser(chat);
+            }
+
+            var popup = new ScheduleMessagePopup(ViewModel.ClientService, ViewModel.NavigationService, user, self)
+            {
+                //Title = Strings.ExpireAfter,
+                //Header = Strings.PaidContentPriceTitle,
+                //PrimaryButtonContent = Strings.OK,
+                PrimaryButtonStyle = BootStrapper.Current.Resources["AccentButtonStyle"] as Style,
+                //SecondaryButtonContent = Strings.Cancel,
+                IsLightDismissEnabled = true,
+            };
+
+            var confirm = await popup.ShowAsync(XamlRoot);
+            if (confirm == ContentDialogResult.Primary)
+            {
+                ViewModel.SendSchedulingState = popup.SchedulingState;
+                Hide(ContentDialogResult.Primary);
+            }
+        }
+
+        private void OnPropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e)
+        {
+            if (string.Equals(e.PropertyName, "PreSelectedItems", StringComparison.OrdinalIgnoreCase))
+            {
+                ChatsPanel.SelectedItems.Clear();
+                ChatsPanel.SelectedItems.AddRange(ViewModel.SelectedItems);
+            }
+        }
+
+        public object Header
+        {
+            get => ChatsPanel.Header;
+            set => ChatsPanel.Header = value;
+        }
+
+        #region Show
+
+        public static ChooseChatsPopup Create(INavigationService navigationService, string title)
+        {
+            var popup = new ChooseChatsPopup();
+            popup.DataContext = navigationService.Session.Resolve<ChooseChatsViewModel>();
+            popup.ViewModel.NavigationService = navigationService;
+            popup.ViewModel.Title = title;
+            popup.ChatFolders.Visibility = Visibility.Collapsed;
+
+            return popup;
+        }
+
+        public static async Task<Chat> PickChatAsync(INavigationService navigationService, string title, ChooseChatsOptions options)
+        {
+            var popup = new ChooseChatsPopup();
+            popup.DataContext = navigationService.Session.Resolve<ChooseChatsViewModel>();
+            popup.ViewModel.NavigationService = navigationService;
+            popup.ViewModel.Title = title;
+            popup.ChatFolders.Visibility = Visibility.Collapsed;
+
+            var confirm = await popup.PickAsync(navigationService.XamlRoot, Array.Empty<long>(), options, ListViewSelectionMode.None);
+            if (confirm != ContentDialogResult.Primary)
+            {
+                return null;
+            }
+
+            return popup.ViewModel.SelectedItems.FirstOrDefault();
+        }
+
+        public static async Task<User> PickUserAsync(IClientService clientService, INavigationService navigationService, string title, bool contact)
+        {
+            return clientService.GetUser(await PickChatAsync(navigationService, title, contact ? ChooseChatsOptions.Contacts : new ChooseChatsOptions()
+            {
+                AllowChannelChats = false,
+                AllowGroupChats = false,
+                AllowBotChats = false,
+                AllowUserChats = true,
+                AllowSecretChats = false,
+                AllowSelf = false,
+                CanPostMessages = false,
+                CanInviteUsers = false,
+                CanShareContact = false,
+                Mode = ChooseChatsMode.Chats,
+                ShowMessages = false
+            }));
+        }
+
+        public static async Task<IList<Chat>> PickChatsAsync(INavigationService navigationService, string title, long[] selected, ChooseChatsOptions options, ListViewSelectionMode selectionMode = ListViewSelectionMode.Multiple, bool allowEmptySelection = false)
+        {
+            var popup = new ChooseChatsPopup();
+            popup.DataContext = navigationService.Session.Resolve<ChooseChatsViewModel>();
+            popup.ViewModel.NavigationService = navigationService;
+            popup.ViewModel.SelectionMode = selectionMode;
+            popup.ViewModel.AllowEmptySelection = allowEmptySelection;
+            popup.ViewModel.Title = title;
+            popup.PrimaryButtonText = Strings.OK;
+
+            var confirm = await popup.PickAsync(navigationService.XamlRoot, selected, options);
+            if (confirm != ContentDialogResult.Primary)
+            {
+                return null;
+            }
+
+            return popup.ViewModel.SelectedItems.ToList();
+        }
+
+        public static async Task<IList<User>> PickUsersAsync(IClientService clientService, INavigationService navigationService, string title, ListViewSelectionMode selectionMode = ListViewSelectionMode.Multiple, bool allowEmptySelection = false)
+        {
+            return (await PickChatsAsync(navigationService, title, Array.Empty<long>(), ChooseChatsOptions.InviteUsers, selectionMode, allowEmptySelection))?.Select(x => clientService.GetUser(x)).Where(x => x != null).ToList();
+        }
+
+        public Task<ContentDialogResult> PickAsync(XamlRoot xamlRoot, IList<long> selectedItems, ChooseChatsOptions options, ListViewSelectionMode selectionMode = ListViewSelectionMode.Multiple)
+        {
+            ViewModel.SelectionMode = selectionMode;
+            ViewModel.Options = options;
+            ViewModel.IsCommentEnabled = false;
+            ViewModel.IsChatSelection = true;
+
+            ViewModel.PreSelectedItems = selectedItems;
+
+            return ShowAsync(xamlRoot);
+        }
+
+        private Task<ContentDialogResult> ShowAsync(XamlRoot xamlRoot)
+        {
+            ViewModel.Items.Clear();
+
+            RoutedEventHandler handler = null;
+            handler = new RoutedEventHandler(async (s, args) =>
+            {
+                Loaded -= handler;
+                await ViewModel.NavigatedToAsync(null, NavigationMode.New, null);
+            });
+
+            Loaded += handler;
+            return this.ShowQueuedAsync(xamlRoot);
+        }
+
+        #endregion
+
+        #region PickFiltersAsync
+
+        public static async Task<IList<ChatFolderElement>> AddExecute(INavigationService navigationService, bool include, bool allowFilters, bool business, IList<ChatFolderElement> target)
+        {
+            if (allowFilters)
+            {
+                //var target = new List<ChatFolderElement>();
+
+                var flags = new List<FolderFlag>();
+
+                if (business)
+                {
+                    if (include)
+                    {
+                        flags.Add(new FolderFlag(ChatListFolderFlags.NewChats));
+                        flags.Add(new FolderFlag(ChatListFolderFlags.IncludeContacts));
+                        flags.Add(new FolderFlag(ChatListFolderFlags.IncludeNonContacts));
+                    }
+                    else
+                    {
+                        flags.Add(new FolderFlag(ChatListFolderFlags.ExistingChats));
+                        flags.Add(new FolderFlag(ChatListFolderFlags.IncludeContacts));
+                        flags.Add(new FolderFlag(ChatListFolderFlags.IncludeNonContacts));
+                    }
+                }
+                else if (include)
+                {
+                    flags.Add(new FolderFlag(ChatListFolderFlags.IncludeContacts));
+                    flags.Add(new FolderFlag(ChatListFolderFlags.IncludeNonContacts));
+                    flags.Add(new FolderFlag(ChatListFolderFlags.IncludeGroups));
+                    flags.Add(new FolderFlag(ChatListFolderFlags.IncludeChannels));
+                    flags.Add(new FolderFlag(ChatListFolderFlags.IncludeBots));
+                }
+                else
+                {
+                    flags.Add(new FolderFlag(ChatListFolderFlags.ExcludeMuted));
+                    flags.Add(new FolderFlag(ChatListFolderFlags.ExcludeRead));
+                    flags.Add(new FolderFlag(ChatListFolderFlags.ExcludeArchived));
+                }
+
+                var header = new MultipleListView();
+                header.SelectionMode = ListViewSelectionMode.Multiple;
+                header.ItemsSource = flags;
+                header.ItemTemplate = BootStrapper.Current.Resources["FolderPickerTemplate"] as DataTemplate;
+                header.ContainerContentChanging += Header_ContainerContentChanging;
+                header.Padding = new Thickness(12, 0, 12, 0);
+                header.ItemContainerTransitions = new TransitionCollection();
+
+                foreach (var folder in target.OfType<FolderFlag>())
+                {
+                    var already = flags.FirstOrDefault(x => x.Flag == folder.Flag);
+                    if (already != null)
+                    {
+                        header.SelectedItems.Add(already);
+                    }
+                }
+
+                var panel = new StackPanel();
+                panel.Children.Add(new Border
+                {
+                    Child = new TextBlock
+                    {
+                        Text = Strings.FilterChatTypes,
+                        Padding = new Thickness(24, 8, 0, 4),
+                        Style = BootStrapper.Current.Resources["BaseTextBlockStyle"] as Style
+                    }
+                });
+                panel.Children.Add(header);
+                panel.Children.Add(new Border
+                {
+                    Child = new TextBlock
+                    {
+                        Text = Strings.FilterChats,
+                        Padding = new Thickness(24, 16, 0, 4),
+                        Style = BootStrapper.Current.Resources["BaseTextBlockStyle"] as Style
+                    }
+                });
+
+                var popup = new ChooseChatsPopup();
+                popup.DataContext = navigationService.Session.Resolve<ChooseChatsViewModel>();
+                popup.ViewModel.NavigationService = navigationService;
+                popup.ViewModel.Title = include ? Strings.FilterAlwaysShow : Strings.FilterNeverShow;
+                popup.ViewModel.AllowEmptySelection = true;
+                popup.Header = panel;
+                popup.IsPrimaryButtonEnabled = true;
+
+                var confirm = await popup.PickAsync(navigationService.XamlRoot, target.OfType<FolderChat>().Select(x => x.ChatId).ToArray(), ChooseChatsOptions.All);
+                if (confirm != ContentDialogResult.Primary)
+                {
+                    return null;
+                }
+
+                target.Clear();
+
+                foreach (var folder in header.SelectedItems.OfType<FolderFlag>())
+                {
+                    target.Add(folder);
+                }
+
+                foreach (var chat in popup.ViewModel.SelectedItems)
+                {
+                    if (chat == null)
+                    {
+                        continue;
+                    }
+
+                    target.Add(new FolderChat(chat.Id));
+                }
+
+                return target;
+            }
+            else
+            {
+                var popup = new ChooseChatsPopup();
+                popup.DataContext = navigationService.Session.Resolve<ChooseChatsViewModel>();
+                popup.ViewModel.NavigationService = navigationService;
+                popup.ViewModel.Title = include ? Strings.FilterAlwaysShow : Strings.FilterNeverShow;
+                popup.ViewModel.AllowEmptySelection = true;
+                popup.IsPrimaryButtonEnabled = true;
+
+                var confirm = await popup.PickAsync(navigationService.XamlRoot, target.OfType<FolderChat>().Select(x => x.ChatId).ToArray(), ChooseChatsOptions.All);
+                if (confirm != ContentDialogResult.Primary)
+                {
+                    return null;
+                }
+
+                target.Clear();
+
+                foreach (var chat in popup.ViewModel.SelectedItems)
+                {
+                    if (chat == null)
+                    {
+                        continue;
+                    }
+
+                    target.Add(new FolderChat(chat.Id));
+                }
+
+                return target;
+            }
+        }
+
+        private static void Header_ContainerContentChanging(ListViewBase sender, ContainerContentChangingEventArgs args)
+        {
+            if (args.InRecycleQueue)
+            {
+                return;
+            }
+            else if (args.ItemContainer.ContentTemplateRoot is ChatShareCell content && args.Item is FolderFlag folder)
+            {
+                content.UpdateState(args.ItemContainer.IsSelected, false, true);
+                content.UpdateChatFolder(folder);
+
+                args.Handled = true;
+            }
+        }
+
+        #endregion
+
+        #region Recycle
+
+        private bool _focused = true;
+
+        private void OnChoosingItemContainer(ListViewBase sender, ChoosingItemContainerEventArgs args)
+        {
+            if (args.ItemContainer == null)
+            {
+                args.ItemContainer = new MultipleListViewItem(sender, false);
+                args.ItemContainer.Style = sender.ItemContainerStyle;
+                args.ItemContainer.ContentTemplate = sender.ItemTemplate;
+            }
+
+            if (_focused)
+            {
+                _focused = false;
+                args.ItemContainer.Loaded += ItemContainer_Loaded;
+
+            }
+
+            args.IsContainerPrepared = true;
+        }
+
+        private void ItemContainer_Loaded(object sender, RoutedEventArgs e)
+        {
+            if (sender is SelectorItem container)
+            {
+                container.Loaded -= ItemContainer_Loaded;
+                container.Focus(FocusState.Pointer);
+            }
+        }
+
+        private void OnContainerContentChanging(ListViewBase sender, ContainerContentChangingEventArgs args)
+        {
+            if (args.InRecycleQueue)
+            {
+                return;
+            }
+            else if (args.ItemContainer.ContentTemplateRoot is ChatShareCell chatCell)
+            {
+                chatCell.UpdateState(args.ItemContainer.IsSelected, false, true);
+                chatCell.UpdateChat(ViewModel.ClientService, args, OnContainerContentChanging);
+            }
+            else if (args.ItemContainer.ContentTemplateRoot is ForumTopicShareCell topicCell)
+            {
+                if (args.Item is ForumTopic forumTopic)
+                {
+                    topicCell.UpdateCell(ViewModel.ClientService, forumTopic);
+                }
+                else if (args.Item is DirectMessagesChatTopic directMessagesChatTopic)
+                {
+                    topicCell.UpdateCell(ViewModel.ClientService, directMessagesChatTopic);
+                }
+
+                args.Handled = true;
+            }
+        }
+
+        #endregion
+
+        #region Search
+
+        private bool _searchCollapsed = true;
+
+        private void ShowHideSearch(bool show)
+        {
+            if (_searchCollapsed != show)
+            {
+                return;
+            }
+
+            _searchCollapsed = !show;
+            ShowHideBackButton(show || !_forumCollapsed);
+
+            FindName(nameof(SearchPanel));
+            ChatListPanel.Visibility = Visibility.Visible;
+            SearchPanel.Visibility = Visibility.Visible;
+
+            SearchClear.Visibility = show
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
+            if (show)
+            {
+                SearchField.ControlledList = SearchPanel.Root;
+            }
+
+            var chats = ElementComposition.GetElementVisual(ChatListPanel);
+            var panel = ElementComposition.GetElementVisual(SearchPanel);
+
+            chats.CenterPoint = panel.CenterPoint = new Vector3(ChatListPanel.ActualSize / 2, 0);
+
+            var batch = panel.Compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += (s, args) =>
+            {
+                ChatListPanel.Visibility = _searchCollapsed ? Visibility.Visible : Visibility.Collapsed;
+                SearchPanel.Visibility = _searchCollapsed ? Visibility.Collapsed : Visibility.Visible;
+
+                if (_searchCollapsed)
+                {
+                    ChatsPanel.Focus(FocusState.Pointer);
+                }
+            };
+
+            var scale1 = panel.Compositor.CreateVector3KeyFrameAnimation();
+            scale1.InsertKeyFrame(show ? 0 : 1, new Vector3(1.05f, 1.05f, 1));
+            scale1.InsertKeyFrame(show ? 1 : 0, new Vector3(1));
+            scale1.Duration = TimeSpan.FromMilliseconds(200);
+
+            var scale2 = panel.Compositor.CreateVector3KeyFrameAnimation();
+            scale2.InsertKeyFrame(show ? 0 : 1, new Vector3(1));
+            scale2.InsertKeyFrame(show ? 1 : 0, new Vector3(0.95f, 0.95f, 1));
+            scale2.Duration = TimeSpan.FromMilliseconds(200);
+
+            var opacity1 = panel.Compositor.CreateScalarKeyFrameAnimation();
+            opacity1.InsertKeyFrame(show ? 0 : 1, 0);
+            opacity1.InsertKeyFrame(show ? 1 : 0, 1);
+            opacity1.Duration = TimeSpan.FromMilliseconds(200);
+
+            var opacity2 = panel.Compositor.CreateScalarKeyFrameAnimation();
+            opacity2.InsertKeyFrame(show ? 0 : 1, 1);
+            opacity2.InsertKeyFrame(show ? 1 : 0, 0);
+            opacity2.Duration = TimeSpan.FromMilliseconds(200);
+
+            panel.StartAnimation("Scale", scale1);
+            panel.StartAnimation("Opacity", opacity1);
+
+            chats.StartAnimation("Scale", scale2);
+            chats.StartAnimation("Opacity", opacity2);
+
+            batch.End();
+        }
+
+        private void Search_GettingFocus(UIElement sender, GettingFocusEventArgs args)
+        {
+            if (args.FocusState == FocusState.Programmatic)
+            {
+                args.TryCancel();
+            }
+        }
+
+        private void Search_Click(object sender, RoutedEventArgs e)
+        {
+            if (SearchField.FocusState == FocusState.Pointer && _searchCollapsed)
+            {
+                ShowHideSearch(true);
+                ViewModel.SearchChats.Query = SearchField.Text;
+            }
+        }
+
+        private void Search_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (SearchField.FocusState != FocusState.Unfocused)
+            {
+                ShowHideSearch(true);
+            }
+
+            ViewModel.SearchChats.Query = SearchField.Text;
+        }
+
+        private void SearchClear_Click(object sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrEmpty(SearchField.Text))
+            {
+                ShowHideSearch(false);
+            }
+            else
+            {
+                SearchField.Text = string.Empty;
+            }
+        }
+
+        #endregion
+
+        #region Forum
+
+        private bool _forumCollapsed = true;
+
+        private void ShowHideForum(Chat chat)
+        {
+            if (chat == null)
+            {
+                if (ForumList.ItemsSource is TopicListViewModel.ForumTopicsCollection forumTopicCollection && !ViewModel.SelectedTopics.ContainsKey(forumTopicCollection.Chat.Id))
+                {
+                    ChatsPanel.SelectedItems.Remove(forumTopicCollection.Chat);
+                }
+                else if (ForumList.ItemsSource is TopicListViewModel.DirectMessagesChatTopicsCollection directMessagesChatTopicCollection && !ViewModel.SelectedTopics.ContainsKey(directMessagesChatTopicCollection.Chat.Id))
+                {
+                    ChatsPanel.SelectedItems.Remove(directMessagesChatTopicCollection.Chat);
+                }
+
+                ShowHideForum(false);
+                return;
+            }
+
+            ShowHideForum(true);
+            DisposeForum();
+
+            if (ViewModel.ClientService.IsForum(chat))
+            {
+                ForumList.ItemsSource = new TopicListViewModel.ForumTopicsCollection(ViewModel.ClientService, ViewModel.Aggregator, null, chat);
+            }
+            else
+            {
+                ForumList.ItemsSource = new TopicListViewModel.DirectMessagesChatTopicsCollection(ViewModel.ClientService, ViewModel.Aggregator, null, chat);
+            }
+        }
+
+        private void DisposeForum()
+        {
+            if (ForumList?.ItemsSource is TopicListViewModel.ITopicListCollection collection)
+            {
+                collection.Dispose();
+            }
+        }
+
+        private void ShowHideForum(bool show)
+        {
+            if (_forumCollapsed != show)
+            {
+                return;
+            }
+
+            _forumCollapsed = !show;
+            ShowHideBackButton(show || !_searchCollapsed);
+
+            FindName(nameof(ForumGrid));
+            MainGrid.Visibility = Visibility.Visible;
+            ForumGrid.Visibility = Visibility.Visible;
+
+            var chats = ElementComposition.GetElementVisual(MainGrid);
+            var panel = ElementComposition.GetElementVisual(ForumGrid);
+
+            chats.CenterPoint = panel.CenterPoint = new Vector3(MainGrid.ActualSize / 2, 0);
+
+            var batch = panel.Compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += (s, args) =>
+            {
+                MainGrid.Visibility = _forumCollapsed ? Visibility.Visible : Visibility.Collapsed;
+                ForumGrid.Visibility = _forumCollapsed ? Visibility.Collapsed : Visibility.Visible;
+
+                if (_forumCollapsed)
+                {
+                    ChatsPanel.Focus(FocusState.Pointer);
+                }
+            };
+
+            var scale1 = panel.Compositor.CreateVector3KeyFrameAnimation();
+            scale1.InsertKeyFrame(show ? 0 : 1, new Vector3(1.05f, 1.05f, 1));
+            scale1.InsertKeyFrame(show ? 1 : 0, new Vector3(1));
+            scale1.Duration = TimeSpan.FromMilliseconds(200);
+
+            var scale2 = panel.Compositor.CreateVector3KeyFrameAnimation();
+            scale2.InsertKeyFrame(show ? 0 : 1, new Vector3(1));
+            scale2.InsertKeyFrame(show ? 1 : 0, new Vector3(0.95f, 0.95f, 1));
+            scale2.Duration = TimeSpan.FromMilliseconds(200);
+
+            var opacity1 = panel.Compositor.CreateScalarKeyFrameAnimation();
+            opacity1.InsertKeyFrame(show ? 0 : 1, 0);
+            opacity1.InsertKeyFrame(show ? 1 : 0, 1);
+            opacity1.Duration = TimeSpan.FromMilliseconds(200);
+
+            var opacity2 = panel.Compositor.CreateScalarKeyFrameAnimation();
+            opacity2.InsertKeyFrame(show ? 0 : 1, 1);
+            opacity2.InsertKeyFrame(show ? 1 : 0, 0);
+            opacity2.Duration = TimeSpan.FromMilliseconds(200);
+
+            panel.StartAnimation("Scale", scale1);
+            panel.StartAnimation("Opacity", opacity1);
+
+            chats.StartAnimation("Scale", scale2);
+            chats.StartAnimation("Opacity", opacity2);
+
+            batch.End();
+        }
+
+        #endregion
+
+        #region Comment
+
+        private Visibility ConvertCommentVisibility(int count, bool enabled)
+        {
+            return count > 0 && enabled ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        #endregion
+
+        #region Binding
+
+        private bool _primaryButtonEnabled;
+
+        private bool ConvertButtonEnabled(bool allowEmpty, int count)
+        {
+            if (Send != null)
+            {
+                return Send.IsEnabled = _primaryButtonEnabled = allowEmpty || count > 0;
+            }
+
+            return _primaryButtonEnabled = allowEmpty || count > 0;
+        }
+
+        #endregion
+
+        private void List_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            var hasSecretChats = false;
+            var hasChecklists = ViewModel.Configuration switch
+            {
+                ChooseChatsConfigurationShareMessages shareMessages => shareMessages.Messages.Any(x => x.ContentType == typeof(MessageChecklist)),
+                _ => false
+            };
+            var maxQuantity = ViewModel.Configuration switch
+            {
+                ChooseChatsConfigurationRequestUsers requestUsers => requestUsers.MaxQuantity,
+                ChooseChatsConfigurationCreateGroupCall => ViewModel.ClientService.Options.GroupCallParticipantCountMax,
+                _ => int.MaxValue
+            };
+            var maxExceeded = ChatsPanel.SelectedItems.Count > maxQuantity;
+
+            foreach (var newItem in e.AddedItems.OfType<Chat>())
+            {
+                if (hasChecklists && newItem.Type is ChatTypeSecret or ChatTypeSupergroup { IsChannel: true })
+                {
+                    hasSecretChats = newItem.Type is ChatTypeSecret;
+                    maxExceeded = true;
+                }
+
+                if (maxExceeded || (ViewModel.Options.CanPostMessages && ViewModel.ClientService.IsForum(newItem) && !ViewModel.SelectedTopics.ContainsKey(newItem.Id)))
+                {
+                    if (ChatsPanel.SelectionMode == ListViewSelectionMode.Multiple)
+                    {
+                        ChatsPanel.SelectedItems.Remove(newItem);
+                    }
+                    else
+                    {
+                        ChatsPanel.SelectedItem = null;
+                    }
+                }
+            }
+
+            if (maxExceeded)
+            {
+                if (hasChecklists)
+                {
+                    ToastPopup.Show(XamlRoot, hasSecretChats ? Strings.TodoCantForwardSecretChat : Strings.TodoCantForward, ToastPopupIcon.Info);
+                }
+                else
+                {
+                    ToastPopup.Show(XamlRoot, Locale.Declension(Strings.R.BotMultiContactsSelectorLimit, maxQuantity), ToastPopupIcon.Info);
+                }
+            }
+
+            var selection = ChatsPanel.SelectedItems
+                .OfType<Chat>()
+                .Where(x => ViewModel.ClientService.IsForum(x) ? ViewModel.SelectedTopics.ContainsKey(x.Id) : true);
+
+            ViewModel.SelectedItems = new RangeObservableCollection<Chat>(selection);
+        }
+
+        private void List_ItemClick(object sender, ItemClickEventArgs e)
+        {
+            ItemClick(e.ClickedItem as Chat, true);
+        }
+
+        private async void ListView_ItemClick(object sender, ItemClickEventArgs e)
+        {
+            var item = e.ClickedItem;
+            if (item is SearchResult result)
+            {
+                if (result.Chat != null)
+                {
+                    item = result.Chat;
+                    ViewModel.ClientService.Send(new AddRecentlyFoundChat(result.Chat.Id));
+                }
+                else
+                {
+                    item = result.User;
+                }
+            }
+
+            if (item is User user)
+            {
+                var response = await ViewModel.ClientService.SendAsync(new CreatePrivateChat(user.Id, false));
+                if (response is Chat)
+                {
+                    item = response as Chat;
+                }
+            }
+            else if (item is ForumTopic forumTopic && ForumList.ItemsSource is TopicListViewModel.ForumTopicsCollection forumTopicCollection)
+            {
+                item = forumTopicCollection.Chat;
+                ViewModel.SelectedTopics[forumTopicCollection.Chat.Id] = forumTopic.ToId();
+                ShowHideForum(null);
+            }
+            else if (item is DirectMessagesChatTopic directMessagesChatTopic && ForumList.ItemsSource is TopicListViewModel.DirectMessagesChatTopicsCollection directMessagesChatTopicCollection)
+            {
+                item = directMessagesChatTopicCollection.Chat;
+                ViewModel.SelectedTopics[directMessagesChatTopicCollection.Chat.Id] = directMessagesChatTopic.ToId();
+                ShowHideForum(null);
+            }
+
+            if (ViewModel.SearchChats.CanSendMessageToUser && ViewModel.ClientService.TryGetUser(item as Chat, out User tempUser))
+            {
+                var response = await ViewModel.ClientService.SendAsync(new CanSendMessageToUser(tempUser.Id, true));
+                if (response is CanSendMessageToUserResultUserRestrictsNewChats)
+                {
+                    var text = string.Format(Strings.MessageLockedPremiumLocked, tempUser.FirstName);
+                    var markdown = ClientEx.ParseMarkdown(text);
+
+                    var confirm = await ToastPopup.ShowActionAsync(XamlRoot, markdown, Strings.UserBlockedNonPremiumButton, ToastPopupIcon.Premium);
+                    if (confirm == ContentDialogResult.Primary)
+                    {
+                        Hide();
+                        ViewModel.NavigationService.ShowPromo();
+                    }
+
+                    return;
+                }
+            }
+
+            var chat = item as Chat;
+            if (chat == null || ItemClick(chat, e.ClickedItem is not ForumTopic and not DirectMessagesChatTopic))
+            {
+                return;
+            }
+
+            chat = ViewModel.Items.FirstOrDefault(x => x.Id == chat.Id) ?? chat;
+            SearchField.Text = string.Empty;
+            ShowHideSearch(false);
+
+            var items = ViewModel.Items;
+            var selectedItems = ViewModel.SelectedItems;
+
+            var index = items.IndexOf(chat);
+            if (index >= 0)
+            {
+                if (index > 0)
+                {
+                    items.Remove(chat);
+                    items.Insert(1, chat);
+                }
+            }
+            else if (items.Count > 0)
+            {
+                items.Insert(1, chat);
+            }
+            else
+            {
+                items.Add(chat);
+            }
+
+            if (ChatsPanel.SelectionMode == ListViewSelectionMode.Multiple)
+            {
+                ChatsPanel.SelectedItems.Add(chat);
+            }
+            else
+            {
+                ChatsPanel.SelectedItem = chat;
+            }
+        }
+
+        private bool ItemClick(Chat chat, bool origin)
+        {
+            if (ViewModel.Configuration != null && !ViewModel.Configuration.CanBeSelected(ViewModel, chat))
+            {
+                return true;
+            }
+            else if (ViewModel.Options.CanPostMessages && ViewModel.Configuration is not ChooseChatsConfigurationShareOperation && ViewModel.ClientService.IsSavedMessages(chat))
+            {
+                if (ViewModel.SelectedItems.Empty())
+                {
+                    ViewModel.SelectedItems = new RangeObservableCollection<Chat>(new[] { chat });
+
+                    ConfirmPaidMessages();
+                    return true;
+                }
+            }
+            else if (ViewModel.Options.CanPostMessages && origin && (ViewModel.ClientService.IsForum(chat) || ViewModel.ClientService.IsAdministeredDirectMessagesGroup(chat)))
+            {
+                if (ViewModel.SelectedItems.Contains(chat))
+                {
+                    ViewModel.SelectedTopics.Remove(chat.Id);
+                    ShowHideForum(null);
+                }
+                else
+                {
+                    ShowHideForum(chat);
+                }
+
+                return false;
+            }
+            else if (ViewModel.SelectionMode == ListViewSelectionMode.None)
+            {
+                ViewModel.SelectedItems = new RangeObservableCollection<Chat>(new[] { chat });
+
+                ConfirmPaidMessages();
+                return true;
+            }
+
+            return false;
+        }
+
+        private async void ConfirmPaidMessages()
+        {
+            if (ViewModel.ShouldCloseOnCommit)
+            {
+                Hide(ContentDialogResult.Primary);
+            }
+            else if (await ViewModel.ConfirmPaidMessagesAsync())
+            {
+                ViewModel.SendCommand.Execute();
+            }
+        }
+
+        private void OnLoaded(object sender, RoutedEventArgs args)
+        {
+            CharacterReceived += OnCharacterReceived;
+            PreviewKeyDown += OnPreviewKeyDown;
+        }
+
+        private void OnUnloaded(object sender, RoutedEventArgs args)
+        {
+            ViewModel.PropertyChanged -= OnPropertyChanged;
+            CharacterReceived -= OnCharacterReceived;
+            PreviewKeyDown -= OnPreviewKeyDown;
+
+            DisposeForum();
+        }
+
+        // Enter never reaches CharacterReceived: XAML consumes it as a key before any character
+        // is produced. It used to arrive as CR through CoreWindow, which sat below that pipeline.
+        // Preview rather than KeyDown, so a focused ListViewItem cannot swallow it first.
+        private void OnPreviewKeyDown(object sender, KeyRoutedEventArgs args)
+        {
+            if (args.Key != VirtualKey.Enter || args.Handled)
+            {
+                return;
+            }
+
+            var focused = FocusManagerEx.TryGetFocusedElement(XamlRoot);
+            if (focused is TextBox or RichEditBox or RichEditorView or Button or MenuFlyoutItem)
+            {
+                return;
+            }
+
+            if (_primaryButtonEnabled && (SearchPanel == null || SearchPanel.Visibility == Visibility.Collapsed))
+            {
+                Accept();
+                args.Handled = true;
+            }
+        }
+
+        private void OnCharacterReceived(UIElement sender, CharacterReceivedRoutedEventArgs args)
+        {
+            if (args.OriginalSource is TextBox or RichEditBox or RichEditorView or Button or MenuFlyoutItem)
+            {
+                return;
+            }
+
+            var character = args.Character;
+            if (character != '\u0016' && (char.IsControl(character) || char.IsWhiteSpace(character)))
+            {
+                return;
+            }
+
+            if (character == '\u0016')
+            {
+                CaptionInput.FocusInput(FocusState.Keyboard);
+                CaptionInput.PasteFromClipboard();
+            }
+            else
+            {
+                Search_Click(null, null);
+
+                SearchField.Focus(FocusState.Keyboard);
+                SearchField.Text = character.ToString();
+                SearchField.SelectionStart = 1;
+            }
+
+            args.Handled = true;
+        }
+
+        private void Accept()
+        {
+            ViewModel.Caption = CaptionInput.GetFormattedText();
+            Hide(ContentDialogResult.Primary);
+        }
+
+        private void Emoji_Click(object sender, RoutedEventArgs e)
+        {
+            // We don't want to unfocus the text are when the context menu gets opened
+            EmojiPanel.ViewModel.Update();
+            EmojiFlyout.ShowAt(CommentPanel, FlyoutPlacementMode.Top, FlyoutShowMode.Transient, source: EmojiButton);
+        }
+
+        private void Emoji_ItemClick(object sender, EmojiDrawerItemClickEventArgs e)
+        {
+            if (e.ClickedItem is EmojiData emoji)
+            {
+                CaptionInput.InsertText(emoji.Value);
+                CaptionInput.FocusInput(FocusState.Programmatic);
+            }
+            else if (e.ClickedItem is StickerViewModel sticker)
+            {
+                CaptionInput.InsertEmoji(sticker);
+                CaptionInput.FocusInput(FocusState.Programmatic);
+            }
+        }
+
+        private async void OnPrimaryButtonClick(ModalPopup sender, ModalPopupButtonClickEventArgs args)
+        {
+            ViewModel.Caption = CaptionInput.GetFormattedText();
+
+            var deferral = args.GetDeferral();
+
+            if (await ViewModel.ConfirmPaidMessagesAsync())
+            {
+                if (ViewModel.Configuration is ChooseChatsConfigurationShareOperation shareOperation)
+                {
+                    VerticalContentAlignment = VerticalAlignment.Center;
+                    SecondaryButtonText = Strings.Cancel;
+
+                    RootGrid.Children.Clear();
+                    RootGrid.Children.Add(new SendMessagesView(ViewModel.ClientService, ViewModel.Aggregator, shareOperation.ShareOperation, ViewModel.Caption, ViewModel.SelectedItems.ToList(), ViewModel.SendWithChat));
+
+                    args.Cancel = true;
+                }
+                else
+                {
+                    ViewModel.SendCommand.Execute();
+                }
+            }
+            else
+            {
+                args.Cancel = true;
+            }
+
+            deferral.Complete();
+        }
+
+        private void OnSecondaryButtonClick(ModalPopup sender, ModalPopupButtonClickEventArgs args)
+        {
+            if (RootGrid.Children[0] is SendMessagesView sendMessages)
+            {
+                sendMessages.Cancel();
+            }
+        }
+
+        private void CaptionInput_Submitted(object sender, EventArgs args)
+        {
+            Accept();
+        }
+
+        private void Send_Click(object sender, RoutedEventArgs e)
+        {
+            Accept();
+        }
+
+        private void Alias_Click(object sender, RoutedEventArgs e)
+        {
+            var flyout = new MenuFlyout();
+
+            foreach (var session in LifetimeService.Current.Items)
+            {
+                if (session.ClientService.TryGetUser(session.ClientService.Options.MyId, out User user))
+                {
+                    var photo = new ProfilePicture();
+                    photo.Size = 20;
+                    photo.Source = ProfilePictureSource.User(session.ClientService, user);
+
+                    var item = new ToggleMenuFlyoutItem();
+                    item.Style = BootStrapper.Current.Resources["ProfilePictureToggleMenuFlyoutItemStyle"] as Style;
+                    item.IsChecked = session == ViewModel.Session;
+                    item.Icon = new SymbolIcon();
+                    item.Text = user.FullName();
+                    item.Tag = photo;
+                    item.CommandParameter = session.Id;
+                    item.Click += Account_Click;
+
+                    flyout.Items.Add(item);
+                }
+            }
+
+            flyout.ShowAt(Photo, FlyoutPlacementMode.BottomEdgeAlignedRight);
+        }
+
+        private void Account_Click(object sender, RoutedEventArgs e)
+        {
+            if (sender is MenuFlyoutItem item && item.CommandParameter is int sessionId)
+            {
+                var session = LifetimeService.Current.Items.FirstOrDefault(x => x.Id == sessionId);
+                if (session != null)
+                {
+                    AccountClick?.Invoke(session, EventArgs.Empty);
+                }
+            }
+        }
+
+        public event EventHandler AccountClick;
+
+        private void BackButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (!_searchCollapsed)
+            {
+                ShowHideSearch(false);
+            }
+            else if (!_forumCollapsed)
+            {
+                ShowHideForum(null);
+            }
+        }
+
+        private bool _backButtonCollapsed = true;
+        private CompositionScopedBatch _backButtonBatch;
+
+        private void ShowHideBackButton(bool show)
+        {
+            if (_backButtonCollapsed != show)
+            {
+                return;
+            }
+
+            _backButtonCollapsed = !show;
+
+            var width = (float)(BackButton.Width + BackButton.Margin.Left + BackButton.Margin.Right);
+            var fullWidth = SearchField.ActualSize.X + (float)SearchField.Margin.Left;
+            var newWidth = show ? fullWidth - width : fullWidth;
+
+            SearchField.Margin = new Thickness(show ? width : 0, 0, 0, 0);
+            BackButton.Visibility = Visibility.Visible;
+
+            var field = ElementComposition.GetElementVisual(SearchField);
+            var border = SearchField.GetChild<Border>(x => x.Name == "BorderElement");
+
+            if (border == null || SearchField.ActualSize.X == 0 || newWidth <= 0)
+            {
+                _backButtonBatch = null;
+
+                BackButton.Visibility = show
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+                return;
+            }
+
+            ElementCompositionPreview.SetIsTranslationEnabled(SearchField, true);
+
+            var compositor = field.Compositor;
+            var background = ElementComposition.GetElementVisual(border);
+            var button = ElementComposition.GetElementVisual(BackButton);
+
+            var batch = compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += ShowHideBackButton_Completed;
+
+            _backButtonBatch = batch;
+
+            // The field takes its new size at once and slides in from where it was. Its border, scaled
+            // from the left by 1 - translation / width, keeps the right edge fixed only while both
+            // animations share the same duration and easing.
+            var from = show ? -width : width;
+
+            var offset = compositor.CreateScalarKeyFrameAnimation();
+            offset.InsertKeyFrame(0, from);
+            offset.InsertKeyFrame(1, 0);
+            offset.Duration = Constants.FastAnimation;
+
+            var stretch = compositor.CreateScalarKeyFrameAnimation();
+            stretch.InsertKeyFrame(0, 1 - from / newWidth);
+            stretch.InsertKeyFrame(1, 1);
+            stretch.Duration = Constants.FastAnimation;
+
+            var scale = compositor.CreateVector3KeyFrameAnimation();
+            scale.InsertKeyFrame(show ? 0 : 1, Vector3.Zero);
+            scale.InsertKeyFrame(show ? 1 : 0, Vector3.One);
+            scale.Duration = Constants.FastAnimation;
+
+            var opacity = compositor.CreateScalarKeyFrameAnimation();
+            opacity.InsertKeyFrame(show ? 0 : 1, 0);
+            opacity.InsertKeyFrame(show ? 1 : 0, 1);
+            opacity.Duration = Constants.FastAnimation;
+
+            button.CenterPoint = new Vector3(BackButton.ActualSize / 2, 0);
+
+            background.CenterPoint = Vector3.Zero;
+
+            field.StartAnimation("Translation.X", offset);
+            background.StartAnimation("Scale.X", stretch);
+            button.StartAnimation("Scale", scale);
+            button.StartAnimation("Opacity", opacity);
+
+            batch.End();
+        }
+
+        private void ShowHideBackButton_Completed(object sender, CompositionBatchCompletedEventArgs args)
+        {
+            if (sender is CompositionScopedBatch batch)
+            {
+                batch.Completed -= ShowHideBackButton_Completed;
+            }
+
+            // An interrupted batch completes after its replacement has started, and must not reset it.
+            if (sender != _backButtonBatch)
+            {
+                return;
+            }
+
+            _backButtonBatch = null;
+
+            BackButton.Visibility = _backButtonCollapsed
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+        }
+    }
+}

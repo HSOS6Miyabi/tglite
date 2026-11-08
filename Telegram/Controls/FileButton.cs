@@ -1,0 +1,647 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using Microsoft.Graphics.Canvas.Geometry;
+using System;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using Telegram.Common;
+using Telegram.Controls.Media;
+using Telegram.Native.Controls;
+using Telegram.Navigation;
+using Telegram.Services;
+using Telegram.Td.Api;
+using Windows.UI;
+using Windows.UI.Composition;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Automation;
+using Windows.UI.Xaml.Automation.Peers;
+using Windows.UI.Xaml.Automation.Provider;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Media;
+
+namespace Telegram.Controls
+{
+    public enum MessageContentState
+    {
+        None,
+        Download,
+        Downloading,
+        Uploading,
+        Confirm,
+        Document,
+        Photo,
+        Animation,
+        Ttl,
+        Unlock,
+        Play,
+        Pause,
+        Theme,
+        VoiceCall,
+        VideoCall,
+    }
+
+    public partial class FileButton : HyperlinkButtonEx
+    {
+        private Grid RootGrid;
+        private UIElement RootOverlay;
+
+        private ProgressBarRing ProgressBar;
+
+        private TextBlock ContentPresenter1;
+        private TextBlock ContentPresenter2;
+        private TextBlock _label;
+
+        private bool _hasContainer;
+
+        private long _fileId;
+        private MessageContentState _state;
+        private string _glyph;
+        private double _enqueuedProgress;
+        private bool _shouldEnqueueProgress;
+
+        private int _disconnectedFileId;
+        private MessageContentState _disconnectedState;
+
+        private bool _templateApplied;
+
+        public FileButton()
+        {
+            DefaultStyleKey = typeof(FileButton);
+        }
+
+        public MessageContentState State => _state;
+
+        public bool IsSmall { get; set; }
+
+        protected override AutomationPeer OnCreateAutomationPeer()
+        {
+            return new FileButtonAutomationPeer(this);
+        }
+
+        protected override void OnApplyTemplate()
+        {
+            RootGrid = GetTemplateChild(nameof(RootGrid)) as Grid;
+
+            if (_progressVisibility == Visibility.Visible)
+            {
+                RootOverlay = GetTemplateChild(nameof(RootOverlay)) as UIElement;
+                RootOverlay?.Visibility = _progressVisibility;
+            }
+
+            ContentPresenter1 = GetTemplateChild(nameof(ContentPresenter1)) as TextBlock;
+            ContentPresenter2 = GetTemplateChild(nameof(ContentPresenter2)) as TextBlock;
+
+            ContentPresenter1.Text = _glyph ?? string.Empty;
+            ContentPresenter2.Text = string.Empty;
+
+            _label = ContentPresenter1;
+
+            if (_progress != 0)
+            {
+                ProgressBar = GetTemplateChild(nameof(ProgressBar)) as ProgressBarRing;
+                ProgressBar.Value = _progress;
+            }
+
+            _templateApplied = true;
+        }
+
+        protected override void OnLoaded()
+        {
+            if (_disconnectedFileId != 0 && _disconnectedState != MessageContentState.None)
+            {
+                SetGlyph(_disconnectedFileId, _disconnectedState);
+
+                _disconnectedFileId = 0;
+                _disconnectedState = MessageContentState.None;
+            }
+        }
+
+        protected override void OnUnloaded()
+        {
+            _fileId = 0;
+            _state = MessageContentState.None;
+        }
+
+        #region Thumbnail
+
+        private long _thumbnailToken;
+
+        private IClientService _clientService;
+        private Thumbnail _thumbnail;
+
+        private ThumbnailController _thumbnailController;
+        private ImageBrush _thumbnailTexture;
+
+        public void SetThumbnail(IClientService clientService, Thumbnail thumbnail, Minithumbnail minithumbnail)
+        {
+            if (_thumbnail == thumbnail || _thumbnail?.File.Id == thumbnail?.File.Id)
+            {
+                return;
+            }
+
+            _thumbnail = thumbnail;
+
+            if (thumbnail != null)
+            {
+                _clientService = clientService;
+
+                UpdateManager.Subscribe(this, clientService, thumbnail.File, ref _thumbnailToken, UpdateThumbnail, true);
+                UpdateThumbnail(clientService, thumbnail, minithumbnail);
+            }
+            else
+            {
+                _clientService = null;
+
+                UpdateManager.Unsubscribe(this, ref _thumbnailToken);
+                UpdateThumbnail(null, null, null);
+            }
+        }
+
+        private void UpdateThumbnail(File file)
+        {
+            if (_clientService != null && _thumbnail?.File.Id == file.Id)
+            {
+                UpdateThumbnail(_clientService, _thumbnail, null);
+            }
+        }
+
+        private void UpdateThumbnail(IClientService clientService, Thumbnail thumbnail, Minithumbnail minithumbnail)
+        {
+            if (thumbnail == null)
+            {
+                _thumbnailController?.Recycle();
+                UpdateThumbnailState(false);
+                return;
+            }
+
+            var file = thumbnail.File;
+            if (file.Local.IsDownloadingCompleted)
+            {
+                double ratioX = (double)48 / thumbnail.Width;
+                double ratioY = (double)48 / thumbnail.Height;
+                double ratio = Math.Max(ratioX, ratioY);
+
+                var width = (int)(thumbnail.Width * ratio);
+                var height = (int)(thumbnail.Height * ratio);
+
+                _thumbnailTexture ??= new ImageBrush
+                {
+                    Stretch = Stretch.UniformToFill,
+                    AlignmentX = AlignmentX.Center,
+                    AlignmentY = AlignmentY.Center
+                };
+                _thumbnailController ??= new ThumbnailController(_thumbnailTexture);
+
+                _thumbnailController.Bitmap(file.Local.Path, width, height, file.Id /*HashCode.Combine(message.ChatId, message.Id)*/);
+                UpdateThumbnailState(true);
+            }
+            else
+            {
+                if (file.Local.CanBeDownloaded && !file.Local.IsDownloadingActive)
+                {
+                    clientService.DownloadFile(file.Id, 8);
+                }
+
+                if (minithumbnail != null)
+                {
+                    _thumbnailTexture ??= new ImageBrush
+                    {
+                        Stretch = Stretch.UniformToFill,
+                        AlignmentX = AlignmentX.Center,
+                        AlignmentY = AlignmentY.Center
+                    };
+                    _thumbnailController ??= new ThumbnailController(_thumbnailTexture);
+
+                    _thumbnailController.Bitmap(minithumbnail.Data, minithumbnail.Width, minithumbnail.Height, file.Id);
+                    UpdateThumbnailState(true);
+                }
+                else
+                {
+                    _thumbnailController?.Recycle();
+                    UpdateThumbnailState(false);
+                }
+            }
+        }
+
+        public void RecycleThumbnail()
+        {
+            _thumbnail = null;
+            _clientService = null;
+
+            UpdateManager.Unsubscribe(this, ref _thumbnailToken);
+
+            _thumbnailController?.Recycle();
+            UpdateThumbnailState(false);
+        }
+
+        private bool _thumbnailState;
+
+        private void UpdateThumbnailState(bool state)
+        {
+            if (_thumbnailState == state)
+            {
+                return;
+            }
+
+            _thumbnailState = state;
+
+            if (state)
+            {
+                Background = _thumbnailTexture;
+                Foreground = new SolidColorBrush(Colors.White);
+                ProgressVisibility = Visibility.Visible;
+            }
+            else
+            {
+                ClearValue(BackgroundProperty);
+                ClearValue(ForegroundProperty);
+                ProgressVisibility = Visibility.Collapsed;
+            }
+        }
+
+        #endregion
+
+        #region ProgressVisibility
+
+        private Visibility _progressVisibility = Visibility.Collapsed;
+        public Visibility ProgressVisibility
+        {
+            get => _progressVisibility;
+            set
+            {
+                if (_progressVisibility != value)
+                {
+                    _progressVisibility = value;
+
+                    if (RootOverlay != null || (value == Visibility.Visible && _templateApplied))
+                    {
+                        RootOverlay ??= GetTemplateChild(nameof(RootOverlay)) as UIElement;
+                        RootOverlay?.Visibility = value;
+                    }
+                }
+            }
+        }
+
+        #endregion
+
+        private double _progress;
+        public double Progress
+        {
+            get => _progress;
+            set
+            {
+                if (_state is MessageContentState.Downloading or MessageContentState.Uploading)
+                {
+                    value = Math.Clamp(value, 0.05, 1);
+                }
+
+                if (_shouldEnqueueProgress || !_templateApplied || IsDisconnected)
+                {
+                    _enqueuedProgress = value;
+                }
+                else
+                {
+                    ProgressBar ??= GetTemplateChild(nameof(ProgressBar)) as ProgressBarRing;
+                    ProgressBar.Value = value;
+                }
+
+                if (AutomationPeer.ListenerExists(AutomationEvents.PropertyChanged))
+                {
+                    var peer = FrameworkElementAutomationPeer.FromElement(this);
+                    peer?.RaisePropertyChangedEvent(ValuePatternIdentifiers.ValueProperty, _progress, value);
+                }
+
+                _progress = value;
+            }
+        }
+
+        public void SetGlyph(int fileId, MessageContentState state)
+        {
+            if (IsDisconnected)
+            {
+                _disconnectedFileId = fileId;
+                _disconnectedState = state;
+                return;
+            }
+
+            if (_fileId != fileId || fileId == 0)
+            {
+                _state = MessageContentState.None;
+            }
+
+            switch (state)
+            {
+                case MessageContentState.Download:
+                    OnGlyphChanged(IsSmall ? Icons.DownloadSmall : Icons.ArrowDownloadFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionDownload);
+                    break;
+                case MessageContentState.Downloading:
+                    if (IsSmall || (_state != MessageContentState.Download && _state != MessageContentState.Downloading))
+                    {
+                        OnGlyphChanged(IsSmall ? Icons.CancelSmall : Icons.DismissFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionCancelDownload, false);
+                    }
+                    else if (_state != MessageContentState.Downloading)
+                    {
+                        SetDownloadGlyph(_state != MessageContentState.Download);
+                    }
+                    break;
+                case MessageContentState.Uploading:
+                    OnGlyphChanged(IsSmall ? Icons.CancelSmall : Icons.DismissFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionCancelDownload);
+                    break;
+                case MessageContentState.Confirm:
+                    OnGlyphChanged(Icons.CheckmarkFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionCancelDownload);
+                    break;
+                case MessageContentState.Document:
+                    OnGlyphChanged(Icons.DocumentFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionOpenFile);
+                    break;
+                case MessageContentState.Animation:
+                    OnGlyphChanged(Icons.Animation, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionPlay);
+                    break;
+                case MessageContentState.Photo:
+                    OnGlyphChanged(string.Empty, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionOpenFile);
+                    break;
+                case MessageContentState.Play:
+                    OnGlyphChanged(Icons.PlayFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionPlay);
+                    break;
+                case MessageContentState.Pause:
+                    OnGlyphChanged(Icons.PauseFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionPause);
+                    break;
+                case MessageContentState.Ttl:
+                    OnGlyphChanged(Icons.TtlFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionOpenFile);
+                    break;
+                case MessageContentState.Unlock:
+                    OnGlyphChanged(Icons.LockClosedFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionOpenFile);
+                    break;
+                case MessageContentState.Theme:
+                    OnGlyphChanged(Icons.ColorFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.AccActionOpenFile);
+                    break;
+                case MessageContentState.VoiceCall:
+                    OnGlyphChanged(Icons.CallFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.Call);
+                    break;
+                case MessageContentState.VideoCall:
+                    OnGlyphChanged(Icons.VideoFilled24, _glyph, _state != state && _state != MessageContentState.None, Strings.Call);
+                    break;
+            }
+
+            _fileId = fileId;
+            _state = state;
+        }
+
+        private void OnGlyphChanged(string newValue, string oldValue, bool animate, string automation, bool clearContainer = true)
+        {
+            if (string.Equals(newValue, oldValue, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            _glyph = newValue;
+            AutomationProperties.SetName(this, automation);
+
+            if (_label == null)
+            {
+                return;
+            }
+
+            if (animate)
+            {
+                var labelShow = _label == ContentPresenter1 ? ContentPresenter2 : ContentPresenter1;
+                var labelHide = _label == ContentPresenter1 ? ContentPresenter1 : ContentPresenter2;
+
+                var visualShow = ElementComposition.GetElementVisual(labelShow);
+                var visualHide = ElementComposition.GetElementVisual(labelHide);
+
+                var compositor = visualShow.Compositor;
+
+                visualShow.CenterPoint = new Vector3(10);
+                visualHide.CenterPoint = new Vector3(10);
+
+                var hide1 = compositor.CreateVector3KeyFrameAnimation();
+                hide1.InsertKeyFrame(0, Vector3.One);
+                hide1.InsertKeyFrame(1, Vector3.Zero);
+
+                var hide2 = compositor.CreateScalarKeyFrameAnimation();
+                hide2.InsertKeyFrame(0, 1);
+                hide2.InsertKeyFrame(1, 0);
+
+                visualHide.StartAnimation("Scale", hide1);
+                visualHide.StartAnimation("Opacity", hide2);
+
+                var show1 = compositor.CreateVector3KeyFrameAnimation();
+                show1.InsertKeyFrame(1, Vector3.One);
+                show1.InsertKeyFrame(0, Vector3.Zero);
+
+                var show2 = compositor.CreateScalarKeyFrameAnimation();
+                show2.InsertKeyFrame(1, 1);
+                show2.InsertKeyFrame(0, 0);
+
+                visualShow.StartAnimation("Scale", show1);
+                visualShow.StartAnimation("Opacity", show2);
+
+                _label = labelShow;
+            }
+
+            _label.Text = newValue;
+
+            if (_hasContainer && (clearContainer || !animate) && IsConnected)
+            {
+                _hasContainer = false;
+                ElementComposition.SetElementChildVisual(RootGrid, null);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void SetDownloadGlyph(bool animate)
+        {
+            try
+            {
+                SetDownloadGlyphImpl(animate);
+            }
+            catch
+            {
+                // Compositor.CreateSpriteShape can throw InvalidCastException
+                OnGlyphChanged(Icons.DismissFilled24, _glyph, animate, Strings.AccActionCancelDownload, false);
+            }
+        }
+
+        private void SetDownloadGlyphImpl(bool animate)
+        {
+            if (RootGrid == null)
+            {
+                return;
+            }
+
+            OnGlyphChanged(string.Empty, _glyph, animate, Strings.AccActionCancelDownload, false);
+
+            var compositor = BootStrapper.Current.Compositor;
+            var diameter = 48f; // min(bounds.size.width, bounds.size.height)
+            var factor = diameter / 48f;
+
+            var lineWidth = 2; //MathF.Max(1.6f, 2.25f * factor);
+
+            var arrowHeadSize = 15.0f * factor;
+            var arrowLength = 18.0f * factor;
+            var arrowHeadOffset = 1.0f * factor;
+
+            var leftLine = compositor.CreateLineGeometry();
+            leftLine.Start = new Vector2(x: diameter / 2.0f, y: diameter / 2.0f + arrowLength / 2.0f + arrowHeadOffset);
+            leftLine.End = new Vector2(x: diameter / 2.0f - arrowHeadSize / 2.0f, y: diameter / 2.0f + arrowLength / 2.0f - arrowHeadSize / 2.0f + arrowHeadOffset);
+
+            var rightLine = compositor.CreateLineGeometry();
+            rightLine.Start = new Vector2(x: diameter / 2.0f, y: diameter / 2.0f + arrowLength / 2.0f + arrowHeadOffset);
+            rightLine.End = new Vector2(x: diameter / 2.0f + arrowHeadSize / 2.0f, y: diameter / 2.0f + arrowLength / 2.0f - arrowHeadSize / 2.0f + arrowHeadOffset);
+
+            var leftShape = compositor.CreateSpriteShape(leftLine);
+            leftShape.StrokeThickness = lineWidth;
+            leftShape.StrokeBrush = compositor.CreateColorBrush(Colors.White);
+            leftShape.StrokeStartCap = CompositionStrokeCap.Round;
+            leftShape.StrokeEndCap = CompositionStrokeCap.Round;
+
+            var rightShape = compositor.CreateSpriteShape(rightLine);
+            rightShape.StrokeThickness = lineWidth;
+            rightShape.StrokeBrush = compositor.CreateColorBrush(Colors.White);
+            rightShape.StrokeStartCap = CompositionStrokeCap.Round;
+            rightShape.StrokeEndCap = CompositionStrokeCap.Round;
+
+            var arrowPath = compositor.CreatePathGeometry();
+            //arrowPath.Path = svgPath("M4.2,31.1 C4.7,32.5 5.4,33.8 6.2,35 C12.1,44 24,44.7 24,33.3 L24,16 ", Vector2.One, Vector2.Zero);
+            arrowPath.Path = GetArrowShape();
+            arrowPath.TrimStart = 0.65f;
+
+            var arrowShape = compositor.CreateSpriteShape(arrowPath);
+            arrowShape.StrokeThickness = lineWidth;
+            arrowShape.StrokeBrush = compositor.CreateColorBrush(Colors.White);
+            arrowShape.StrokeStartCap = CompositionStrokeCap.Round;
+            arrowShape.StrokeEndCap = CompositionStrokeCap.Round;
+            arrowShape.StrokeLineJoin = CompositionStrokeLineJoin.Round;
+
+            var visual1 = compositor.CreateShapeVisual();
+            visual1.Shapes.Add(leftShape);
+            visual1.Shapes.Add(rightShape);
+            visual1.Size = new Vector2(48, 48);
+
+            var visual3 = compositor.CreateShapeVisual();
+            visual3.Shapes.Add(arrowShape);
+            visual3.Size = new Vector2(48, 48);
+
+            var container = BootStrapper.Current.Compositor.CreateContainerVisual();
+            container.Children.InsertAtTop(visual1);
+            container.Children.InsertAtTop(visual3);
+            container.Size = new Vector2(48, 48);
+
+            _hasContainer = true;
+            ElementCompositionPreview.SetElementChildVisual(RootGrid, container);
+
+            _shouldEnqueueProgress = true;
+
+            var batch = compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += OnDownloadingCompleted;
+
+            var animLeft = compositor.CreateScalarKeyFrameAnimation();
+            animLeft.InsertKeyFrame(0, 1);
+            animLeft.InsertKeyFrame(1, 0);
+            animLeft.Duration = TimeSpan.FromMilliseconds(200);
+
+            leftLine.StartAnimation("TrimEnd", animLeft);
+            rightLine.StartAnimation("TrimEnd", animLeft);
+
+            var opacityLeft = compositor.CreateScalarKeyFrameAnimation();
+            opacityLeft.InsertKeyFrame(0, 1);
+            opacityLeft.InsertKeyFrame(1, 0);
+            opacityLeft.Duration = TimeSpan.FromSeconds(0.10);
+            opacityLeft.DelayTime = TimeSpan.FromSeconds(0.06);
+
+            visual1.StartAnimation("Opacity", opacityLeft);
+
+            batch.End();
+
+            var animBody = compositor.CreateScalarKeyFrameAnimation();
+            animBody.InsertKeyFrame(0, 0.65f);
+            animBody.InsertKeyFrame(1, 0, compositor.CreateLinearEasingFunction());
+            animBody.Duration = TimeSpan.FromMilliseconds(400);
+
+            var animBodyEnd = compositor.CreateScalarKeyFrameAnimation();
+            animBodyEnd.InsertKeyFrame(0, 1);
+            animBodyEnd.InsertKeyFrame(1, 0, compositor.CreateLinearEasingFunction());
+            animBodyEnd.Duration = TimeSpan.FromMilliseconds(400);
+
+            arrowPath.StartAnimation("TrimStart", animBody);
+            arrowPath.StartAnimation("TrimEnd", animBodyEnd);
+        }
+
+        private void OnDownloadingCompleted(object sender, CompositionBatchCompletedEventArgs args)
+        {
+            try
+            {
+                if (_state == MessageContentState.Downloading && _templateApplied && IsConnected)
+                {
+                    OnGlyphChanged(Icons.Cancel, Icons.ArrowDownload, true, Strings.AccActionCancelDownload, false);
+
+                    ProgressBar ??= GetTemplateChild(nameof(ProgressBar)) as ProgressBarRing;
+                    ProgressBar.Value = _enqueuedProgress;
+                }
+
+                _shouldEnqueueProgress = false;
+                //_container.Children.RemoveAll();
+            }
+            catch
+            {
+                // May throw MissingInteropDataException, kind of unexplicable as no reflection is involved.
+            }
+        }
+
+        private CompositionPath GetArrowShape()
+        {
+            CanvasGeometry result;
+            using (var builder = new CanvasPathBuilder(null))
+            {
+                builder.BeginFigure(4.2f, 31.1f);
+                builder.AddCubicBezier(new Vector2(4.7f, 32.5f), new Vector2(5.4f, 33.8f), new Vector2(6.2f, 35f));
+                builder.AddCubicBezier(new Vector2(12.1f, 44f), new Vector2(24f, 44.7f), new Vector2(24f, 33.3f));
+                builder.AddLine(24f, 16f);
+                builder.EndFigure(CanvasFigureLoop.Open);
+                result = CanvasGeometry.CreatePath(builder);
+            }
+            return new CompositionPath(result);
+        }
+    }
+
+    public partial class FileButtonAutomationPeer : HyperlinkButtonAutomationPeer, IValueProvider
+    {
+        private readonly FileButton _owner;
+
+        public FileButtonAutomationPeer(FileButton owner)
+            : base(owner)
+        {
+            _owner = owner;
+        }
+
+        protected override object GetPatternCore(PatternInterface patternInterface)
+        {
+            if (patternInterface == PatternInterface.Value)
+            {
+                return this;
+            }
+
+            return base.GetPatternCore(patternInterface);
+        }
+
+        protected override AutomationControlType GetAutomationControlTypeCore()
+        {
+            return AutomationControlType.Button;
+        }
+
+        public void SetValue(string value)
+        {
+            // Not implemented
+        }
+
+        public bool IsReadOnly => true;
+
+        public string Value => _owner.Progress.ToString("P0");
+    }
+}

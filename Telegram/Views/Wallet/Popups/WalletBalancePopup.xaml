@@ -1,0 +1,92 @@
+<controls:ModalPopup x:Class="Telegram.Views.Wallet.Popups.WalletBalancePopup"
+                     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                     xmlns:controls="using:Telegram.Controls"
+                     mc:Ignorable="d"
+                     ContentMinWidth="408"
+                     ContentMaxWidth="408">
+
+    <!-- All of it in the overlay, the popup's own card hidden: the card floats with the note in a
+         tip above it and the buttons below, which come and go with its flight. -->
+    <controls:ModalPopup.Overlay>
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- A toast as ToastPopup.ShowImpl makes one: dark, as wide as its text up to the
+                 toast's 320, with its tail pointing down at the card. The shadow is cast from code,
+                 as ToastPopup casts its own. -->
+            <Grid x:Name="Tip"
+                  RequestedTheme="Dark"
+                  Opacity="0"
+                  MaxWidth="320"
+                  HorizontalAlignment="Center"
+                  Margin="0,0,0,8">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="8" />
+                </Grid.RowDefinitions>
+
+                <Border x:Name="TipRoot"
+                        Background="{ThemeResource TeachingTipBackgroundBrush}"
+                        BorderBrush="{ThemeResource TeachingTipBorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="{ThemeResource OverlayCornerRadius}">
+                    <TextBlock x:Name="Note"
+                               Foreground="{ThemeResource TeachingTipForegroundBrush}"
+                               FontFamily="{ThemeResource EmojiThemeFontFamilyWithSymbols}"
+                               TextWrapping="Wrap"
+                               TextAlignment="Center"
+                               Margin="12" />
+                </Border>
+
+                <!-- ToastPopup's tail exactly, as SetTail docks it below: taller than its 8 band and
+                     bottom-aligned, so it reaches up into the content rather than meeting its edge,
+                     which leaves no seam at any scale. -->
+                <Polygon Points="0,0 10,10 20,0"
+                         Fill="{ThemeResource TeachingTipBackgroundBrush}"
+                         Stroke="{ThemeResource TeachingTipBorderBrush}"
+                         StrokeThickness="1"
+                         HorizontalAlignment="Center"
+                         VerticalAlignment="Bottom"
+                         Margin="0,-1,0,0"
+                         Grid.Row="1" />
+            </Grid>
+
+            <controls:WalletCard x:Name="Card"
+                                 Inserted="Card_Inserted"
+                                 Margin="24,0,24,0"
+                                 Grid.Row="1" />
+
+            <!-- ModalPopup's horizontal command row: primary on the left, the other one beside it,
+                 or across the whole row when it is alone. -->
+            <Grid x:Name="Actions"
+                  Opacity="0"
+                  ColumnSpacing="8"
+                  Margin="24,12,24,0"
+                  Grid.Row="2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition />
+                    <ColumnDefinition />
+                </Grid.ColumnDefinitions>
+
+                <Button x:Name="SendMoneyButton"
+                        Click="SendMoneyButton_Click"
+                        Style="{StaticResource AccentButtonStyle}"
+                        Height="36"
+                        HorizontalAlignment="Stretch" />
+
+                <Button x:Name="CloseCardButton"
+                        Click="CloseCardButton_Click"
+                        Height="36"
+                        HorizontalAlignment="Stretch"
+                        Grid.Column="1" />
+            </Grid>
+        </Grid>
+    </controls:ModalPopup.Overlay>
+</controls:ModalPopup>

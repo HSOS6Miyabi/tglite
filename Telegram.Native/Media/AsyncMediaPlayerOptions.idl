@@ -1,0 +1,23 @@
+import "Media/AsyncMediaPlayerSwapChain.idl";
+
+namespace Telegram.Native.Media
+{
+    [flags]
+    enum AsyncMediaPlayerMode
+    {
+        None,
+        Audio,
+        Video
+    };
+
+    [default_interface]
+    runtimeclass AsyncMediaPlayerOptions
+    {
+        AsyncMediaPlayerOptions();
+        AsyncMediaPlayerMode Mode;
+        Boolean CreateSwapChain;
+        Boolean Mute;
+        Double Volume;
+        Double Rate;
+    }
+}

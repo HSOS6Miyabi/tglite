@@ -1,0 +1,144 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Telegram.Controls;
+using Windows.Security.Authorization.AppCapabilityAccess;
+using Windows.System;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+
+namespace Telegram.Common
+{
+    public enum MediaDeviceAccess
+    {
+        Audio,
+        Video,
+        AudioAndVideo
+    }
+
+    /// <summary>
+    /// What the devices are wanted for. It only picks the wording of the denial.
+    /// </summary>
+    public enum MediaDevicePurpose
+    {
+        Call,
+        Record
+    }
+
+    public partial class MediaDevicePermissions
+    {
+        public static bool IsUnsupported(XamlRoot xamlRoot)
+        {
+            if (ApiInfo.IsMediaSupported)
+            {
+                return false;
+            }
+
+            // VoIP isn't supported on Windows N because:
+            // - MediaCapture is used for capturing video (no alternatives on WinRT)
+            // - MediaFoundation is used for encoding/decoding video frames (can fallback for WebRTC's software)
+            _ = MessagePopup.ShowAsync(xamlRoot, Strings.VoipPlatformUnsupportedText, Strings.VoipPlatformUnsupportedTitle, Strings.OK);
+            return true;
+        }
+
+        public static async Task<bool> CheckAccessAsync(XamlRoot xamlRoot, MediaDeviceAccess requestedAccess, ElementTheme requestedTheme = ElementTheme.Default, MediaDevicePurpose purpose = MediaDevicePurpose.Call)
+        {
+            string[] capabilities;
+
+            if (requestedAccess == MediaDeviceAccess.AudioAndVideo)
+            {
+                capabilities = new[] { "microphone", "webcam" };
+            }
+            else if (requestedAccess == MediaDeviceAccess.Audio)
+            {
+                capabilities = new[] { "microphone" };
+            }
+            else
+            {
+                capabilities = new[] { "webcam" };
+            }
+
+            IReadOnlyDictionary<string, AppCapabilityAccessStatus> access;
+            try
+            {
+                access = await AppCapability.RequestAccessForCapabilitiesAsync(capabilities);
+            }
+            catch
+            {
+                access = capabilities.ToDictionary(x => x, y => AppCapabilityAccessStatus.DeniedBySystem);
+            }
+
+            access.TryGetValue("microphone", out AppCapabilityAccessStatus audio);
+            access.TryGetValue("webcam", out AppCapabilityAccessStatus video);
+
+            if (requestedAccess == MediaDeviceAccess.AudioAndVideo)
+            {
+                if (audio != AppCapabilityAccessStatus.Allowed && video != AppCapabilityAccessStatus.Allowed)
+                {
+                    ShowPopup(xamlRoot, MediaDeviceAccess.AudioAndVideo, purpose, requestedTheme);
+                    return false;
+                }
+                else if (audio != AppCapabilityAccessStatus.Allowed)
+                {
+                    ShowPopup(xamlRoot, MediaDeviceAccess.Audio, purpose, requestedTheme);
+                    return false;
+                }
+                else if (video != AppCapabilityAccessStatus.Allowed)
+                {
+                    ShowPopup(xamlRoot, MediaDeviceAccess.Video, purpose, requestedTheme);
+                    return false;
+                }
+            }
+            else if (requestedAccess == MediaDeviceAccess.Audio && audio != AppCapabilityAccessStatus.Allowed)
+            {
+                ShowPopup(xamlRoot, MediaDeviceAccess.Audio, purpose, requestedTheme);
+                return false;
+            }
+            else if (requestedAccess == MediaDeviceAccess.Video && video != AppCapabilityAccessStatus.Allowed)
+            {
+                ShowPopup(xamlRoot, MediaDeviceAccess.Video, purpose, requestedTheme);
+                return false;
+            }
+
+            return true;
+        }
+
+        private static async void ShowPopup(XamlRoot xamlRoot, MediaDeviceAccess requestedAccess, MediaDevicePurpose purpose, ElementTheme requestedTheme = ElementTheme.Default)
+        {
+            var popup = new MessagePopup
+            {
+                Title = Strings.AppName,
+                Message = purpose == MediaDevicePurpose.Record
+                    ? requestedAccess switch
+                    {
+                        MediaDeviceAccess.Audio => Strings.PermissionNoAudio,
+                        MediaDeviceAccess.Video => Strings.PermissionNoCamera,
+                        _ => Strings.PermissionNoAudioVideo
+                    }
+                    : requestedAccess switch
+                    {
+                        MediaDeviceAccess.Audio => Strings.PermissionNoAudioCalls,
+                        MediaDeviceAccess.Video => Strings.PermissionNoVideoCalls,
+                        _ => Strings.PermissionNoAudioVideoCalls
+                    },
+                PrimaryButtonText = Strings.Settings,
+                SecondaryButtonText = Strings.OK,
+                RequestedTheme = requestedTheme
+            };
+
+            var confirm = await popup.ShowQueuedAsync(xamlRoot);
+            if (confirm == ContentDialogResult.Primary)
+            {
+                await Launcher.LaunchUriAsync(new Uri("ms-settings:appsfeatures-app"));
+            }
+        }
+    }
+}

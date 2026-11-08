@@ -1,0 +1,840 @@
+﻿#include "pch.h"
+#include "Scene3DPanel.h"
+#if __has_include("Graphics/Scene3DPanel.g.cpp")
+#include "Graphics/Scene3DPanel.g.cpp"
+#endif
+
+#include "DiamondScene.h"
+#include "IconScene.h"
+
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.System.h>
+#include <winrt/Windows.UI.Xaml.Interop.h>
+
+#include <algorithm>
+#include <chrono>
+
+using namespace winrt::Windows::Foundation;
+using namespace winrt::Windows::System;
+using namespace winrt::UIXaml;
+using namespace winrt::UIXaml::Automation;
+using namespace winrt::UIXaml::Controls;
+using namespace winrt::UIComposition;
+using namespace winrt::UIXaml::Hosting;
+using namespace winrt::UIXaml::Input;
+
+namespace winrt::Telegram::Native::Graphics::implementation
+{
+    namespace
+    {
+        std::unique_ptr<::Graphics3D::IScene3D> CreateScene(Graphics::Scene3DModel model)
+        {
+            switch (model)
+            {
+            case Graphics::Scene3DModel::Star:
+                return std::make_unique<::Graphics3D::IconScene>(false);
+            case Graphics::Scene3DModel::Coin:
+                return std::make_unique<::Graphics3D::IconScene>(true);
+            case Graphics::Scene3DModel::Diamond:
+            default:
+                return std::make_unique<::Graphics3D::DiamondScene>();
+            }
+        }
+
+        // The limits for a tap: a touch slop of 8 logical pixels, and the long-press timeout past
+        // which a release is no longer one.
+        constexpr float TapSlop = 8.0f;
+        constexpr std::chrono::milliseconds TapTimeout{ 400 };
+    }
+
+    Scene3DPanel::Scene3DPanel()
+    {
+        // Before the parser assigns anything: it applies a {ThemeResource} to a property it cannot
+        // find registered as to a plain one, and that fails.
+        FallbackForegroundProperty();
+
+        // Never unhooked, and deliberately not through a revoker: the event source is this very
+        // object, so the handlers die with it, while the destructor can run on the finalizer
+        // thread whenever a managed subclass owns the outer object - and XAML's remove_* is
+        // thread-affine, so revoking there fails and fail-fasts. Same reasoning as
+        // FrameworkElementEx.
+        SizeChanged({ this, &Scene3DPanel::OnSizeChanged });
+        CompositionScaleChanged({ this, &Scene3DPanel::OnCompositionScaleChanged });
+
+        PointerPressed({ this, &Scene3DPanel::OnPointerPressed });
+        PointerMoved({ this, &Scene3DPanel::OnPointerMoved });
+        PointerReleased({ this, &Scene3DPanel::OnPointerReleased });
+        PointerCanceled({ this, &Scene3DPanel::OnPointerReleased });
+        PointerCaptureLost({ this, &Scene3DPanel::OnPointerCaptureLost });
+        ActualThemeChanged({ this, &Scene3DPanel::OnActualThemeChanged });
+    }
+
+    Scene3DPanel::~Scene3DPanel()
+    {
+        // Joins the render thread. The destructor may be on the finalizer thread, which is fine:
+        // nothing here touches XAML, and the renderer owns everything it has to release.
+        m_renderer.reset();
+    }
+
+    void Scene3DPanel::Model(Graphics::Scene3DModel value)
+    {
+        if (m_model == value)
+        {
+            return;
+        }
+
+        m_model = value;
+
+        // Takes effect the next time the panel is shown. A scene owns its shaders, its buffers
+        // and its targets, so exchanging one mid-flight is a reload - and there is no screen in
+        // the app that changes its mind about which model it is showing.
+        if (m_renderer != nullptr)
+        {
+            m_renderer->Detach();
+            m_renderer.reset();
+        }
+
+        // A different scene may well load where the last one did not.
+        m_failed = false;
+        m_given = false;
+        UpdateFallback();
+
+        UpdateRunning();
+    }
+
+    void Scene3DPanel::IsSpinning(bool value)
+    {
+        m_spinning = value;
+        m_spinningSet = true;
+
+        if (m_renderer != nullptr)
+        {
+            m_renderer->SetSpinning(value);
+        }
+    }
+
+    void Scene3DPanel::SpinSpeed(double value)
+    {
+        m_spinSpeed = value;
+
+        if (m_renderer != nullptr)
+        {
+            m_renderer->SetSpinSpeed(static_cast<float>(value));
+        }
+    }
+
+    void Scene3DPanel::IsInteractive(bool value)
+    {
+        m_interactive = value;
+
+        if (!value)
+        {
+            EndDrag();
+        }
+    }
+
+    void Scene3DPanel::Palette(Graphics::Scene3DPalette value)
+    {
+        m_palette = value;
+
+        if (m_renderer != nullptr)
+        {
+            m_renderer->SetVariant(static_cast<int>(value));
+        }
+    }
+
+    void Scene3DPanel::PressScale(double value)
+    {
+        if (m_pressScale == value)
+        {
+            return;
+        }
+
+        m_pressScale = value;
+
+        // The surface is sized for the largest the panel will be drawn at, so changing that
+        // changes how big it has to be.
+        UpdateSize();
+    }
+
+    void Scene3DPanel::IsPaused(bool value)
+    {
+        if (m_paused == value)
+        {
+            return;
+        }
+
+        m_paused = value;
+        UpdateRunning();
+    }
+
+    void Scene3DPanel::Kick(double degreesPerSecond)
+    {
+        if (m_renderer != nullptr)
+        {
+            m_renderer->Kick(degreesPerSecond);
+        }
+    }
+
+    bool Scene3DPanel::TransferTo(Graphics::Scene3DPanel const& target)
+    {
+        if (target == nullptr || m_renderer == nullptr)
+        {
+            return false;
+        }
+
+        const auto other = winrt::get_self<Scene3DPanel>(target);
+
+        if (other == this || other->m_model != m_model)
+        {
+            return false;
+        }
+
+        EndDrag();
+
+        if (other->m_renderer != nullptr)
+        {
+            // A target already in the tree has built a scene of its own, which this replaces.
+            other->EndDrag();
+            other->m_renderer->Detach();
+            other->m_renderer.reset();
+        }
+
+        auto renderer = std::move(m_renderer);
+        m_given = true;
+
+        if (!renderer->Rebind(target, other->NotifyHandler()))
+        {
+            renderer->Detach();
+            other->UpdateRunning();
+            return false;
+        }
+
+        other->m_renderer = std::move(renderer);
+        other->m_given = false;
+        other->m_failed = false;
+
+        // A panel kept paused so that it showed nothing while a scene was on its way to it: being
+        // handed one is being asked to show it, and a paused panel would release it at once.
+        other->m_paused = false;
+        other->UpdateFallback();
+
+        // The target's own settings win where it has any; otherwise the scene goes on as it was.
+        if (other->m_spinningSet)
+        {
+            other->m_renderer->SetSpinning(other->m_spinning);
+        }
+        else
+        {
+            other->m_spinning = other->m_renderer->IsSpinning();
+        }
+
+        other->m_renderer->SetVariant(static_cast<int>(other->m_palette));
+        other->m_renderer->SetSpinSpeed(static_cast<float>(other->m_spinSpeed));
+        other->UpdateSize();
+
+        if (other->IsConnected())
+        {
+            other->UpdateRunning();
+        }
+        else
+        {
+            // Not through UpdateRunning, which would release it as a panel that has gone. Stopped
+            // rather than left running into a panel nobody can see, and its OnLoaded starts it -
+            // Start restarts the clock, so the wait is not counted as time on screen.
+            other->m_renderer->Stop();
+        }
+
+        // Anything the renderer reported while the notification still went here was dropped by
+        // OnRendererNotified, which finds no renderer to act on.
+        if (other->m_renderer != nullptr && (other->m_renderer->HasFailed() || other->m_renderer->WasReplaced()))
+        {
+            other->OnRendererNotified();
+        }
+
+        return true;
+    }
+
+    void Scene3DPanel::OnLoaded()
+    {
+        if (!m_viewportToken)
+        {
+            m_viewportToken = EffectiveViewportChanged(
+                { this, &Scene3DPanel::OnEffectiveViewportChanged });
+        }
+
+        UpdateRunning();
+    }
+
+    void Scene3DPanel::OnUnloaded()
+    {
+        if (m_viewportToken)
+        {
+            // Safe to revoke here, unlike in the destructor: Unloaded runs on the thread that
+            // owns the event.
+            EffectiveViewportChanged(m_viewportToken);
+            m_viewportToken = {};
+        }
+
+        // Nothing has measured the next placement yet, so the next show starts out drawing.
+        m_visible = true;
+        m_given = false;
+
+        UpdateRunning();
+    }
+
+    void Scene3DPanel::OnEffectiveViewportChanged(FrameworkElement const& sender,
+        EffectiveViewportChangedEventArgs const& args)
+    {
+        // The same test AnimatedImageBase uses: how far it would have to travel to be brought
+        // into view, against its own size. This catches scrolling and nothing else.
+        const bool visible = args.BringIntoViewDistanceX() < sender.ActualWidth()
+            && args.BringIntoViewDistanceY() < sender.ActualHeight();
+
+        if (visible != m_visible)
+        {
+            m_visible = visible;
+            UpdateRunning();
+        }
+    }
+
+    void Scene3DPanel::UpdateRunning()
+    {
+        // Two policies, because scrolled out of view is not the same as gone.
+        //
+        // Gone - out of the tree, or paused outright - releases everything. A closed popup may
+        // never reopen, and a device, a swap chain and half a megabyte of geometry held against
+        // that is a cost paid for the whole session.
+        //
+        // Out of view only stops the loop. Coming back from a scroll has to be immediate, so the
+        // swap chain, the shaders and the buffers stay exactly where they are and starting again
+        // is a flag and nothing else. Releasing here is what made it take a few frames to reappear.
+        if (!IsConnected() || m_paused)
+        {
+            if (m_renderer != nullptr)
+            {
+                EndDrag();
+
+                // Here rather than in the destructor: handing the panel its swap chain back is a
+                // XAML call and has to happen on this thread, while a native object owned by a
+                // managed subclass can be destroyed on the finalizer one.
+                m_renderer->Detach();
+                m_renderer.reset();
+            }
+
+            return;
+        }
+
+        if (!m_visible)
+        {
+            if (m_renderer != nullptr)
+            {
+                EndDrag();
+                m_renderer->Stop();
+            }
+
+            return;
+        }
+
+        if (m_renderer == nullptr)
+        {
+            if (m_failed || m_given)
+            {
+                return;
+            }
+
+            try
+            {
+                m_renderer = std::make_unique<::Graphics3D::Scene3DRenderer>(CreateScene(m_model));
+
+                if (!m_renderer->Attach(*this, NotifyHandler()))
+                {
+                    // No device on this machine, or the panel refused the swap chain.
+                    Fail();
+                    return;
+                }
+            }
+            catch (...)
+            {
+                // Out of the Loaded handler, an exception would end the process.
+                ::Graphics3D::LogException(L"Scene3D: attach");
+                Fail();
+                return;
+            }
+
+            if (m_spinningSet)
+            {
+                m_renderer->SetSpinning(m_spinning);
+            }
+            else
+            {
+                // The scene's own answer.
+                m_spinning = m_renderer->IsSpinning();
+            }
+
+            if (m_palette != Graphics::Scene3DPalette::Default)
+            {
+                m_renderer->SetVariant(static_cast<int>(m_palette));
+            }
+
+            m_renderer->SetSpinSpeed(static_cast<float>(m_spinSpeed));
+            m_renderer->SetDark(ActualTheme() == ElementTheme::Dark);
+
+            // SizeChanged reaches a panel before Loaded does, while there is no renderer to tell,
+            // and nothing raises it again for a size that has not changed: without this a new
+            // renderer has no size, and draws nothing until something - a press - resizes it.
+            UpdateSize();
+        }
+
+        m_renderer->Start();
+    }
+
+    std::function<void()> Scene3DPanel::NotifyHandler()
+    {
+        // Called on the render thread with the device lock held, where neither XAML nor the
+        // renderer may be touched, so all it does is queue the work here.
+        return [queue = winrt::UIDispatching::DispatcherQueue::GetForCurrentThread(), weak = get_weak()]
+        {
+            try
+            {
+                if (queue)
+                {
+                    queue.TryEnqueue([weak]
+                    {
+                        // An exception escaping a dispatcher callback ends the process.
+                        try
+                        {
+                            if (auto strong = weak.get())
+                            {
+                                strong->OnRendererNotified();
+                            }
+                        }
+                        catch (...)
+                        {
+                            ::Graphics3D::LogException(L"Scene3D: notification");
+                        }
+                    });
+                }
+            }
+            catch (...)
+            {
+                // The window is closing, and the panel with it.
+            }
+        };
+    }
+
+    void Scene3DPanel::OnRendererNotified()
+    {
+        // Read off the current renderer rather than carried in the notification: one queued for
+        // a renderer that has since been replaced then finds nothing to do.
+        if (m_renderer == nullptr)
+        {
+            return;
+        }
+
+        if (m_renderer->HasFailed())
+        {
+            Fail();
+        }
+        else if (m_renderer->WasReplaced())
+        {
+            // A new renderer rather than new resources under the old one: everything it holds
+            // came from the device that went, and the pose starting over is no loss next to a
+            // GPU reset.
+            EndDrag();
+
+            m_renderer->Detach();
+            m_renderer.reset();
+
+            UpdateRunning();
+        }
+    }
+
+    void Scene3DPanel::Fail()
+    {
+        m_failed = true;
+
+        if (m_renderer != nullptr)
+        {
+            EndDrag();
+
+            m_renderer->Detach();
+            m_renderer.reset();
+        }
+
+        UpdateFallback();
+    }
+
+    void Scene3DPanel::FallbackText(hstring const& value)
+    {
+        m_fallbackText = value;
+        UpdateFallback();
+    }
+
+    void Scene3DPanel::FallbackFontSize(double value)
+    {
+        m_fallbackFontSize = value;
+        UpdateFallback();
+    }
+
+    void Scene3DPanel::FallbackFontFamily(winrt::UIXaml::Media::FontFamily const& value)
+    {
+        m_fallbackFontFamily = value;
+        UpdateFallback();
+    }
+
+    winrt::UIXaml::Media::Brush Scene3DPanel::FallbackForeground()
+    {
+        return GetValue(FallbackForegroundProperty()).try_as<winrt::UIXaml::Media::Brush>();
+    }
+
+    void Scene3DPanel::FallbackForeground(winrt::UIXaml::Media::Brush const& value)
+    {
+        SetValue(FallbackForegroundProperty(), value);
+    }
+
+    DependencyProperty Scene3DPanel::FallbackForegroundProperty()
+    {
+        // On first use rather than as a static member, whose initialiser would run at module
+        // load - before there is a XAML core to register with.
+        static DependencyProperty const property = DependencyProperty::Register(
+            L"FallbackForeground",
+            winrt::xaml_typename<winrt::UIXaml::Media::Brush>(),
+            winrt::xaml_typename<Graphics::Scene3DPanel>(),
+            PropertyMetadata{ nullptr, PropertyChangedCallback{ &Scene3DPanel::OnFallbackForegroundChanged } });
+
+        return property;
+    }
+
+    void Scene3DPanel::OnFallbackForegroundChanged(DependencyObject const& sender,
+        DependencyPropertyChangedEventArgs const&)
+    {
+        if (auto panel = sender.try_as<Graphics::Scene3DPanel>())
+        {
+            winrt::get_self<Scene3DPanel>(panel)->UpdateFallback();
+        }
+    }
+
+    void Scene3DPanel::UpdateFallback()
+    {
+        if (!m_failed || m_fallbackText.empty())
+        {
+            if (m_fallback != nullptr)
+            {
+                uint32_t index;
+                if (Children().IndexOf(m_fallback, index))
+                {
+                    Children().RemoveAt(index);
+                }
+
+                m_fallback = nullptr;
+            }
+
+            return;
+        }
+
+        if (m_fallback == nullptr)
+        {
+            TextBlock text;
+            text.HorizontalAlignment(HorizontalAlignment::Center);
+            text.VerticalAlignment(VerticalAlignment::Center);
+            text.TextAlignment(TextAlignment::Center);
+            text.IsHitTestVisible(false);
+
+            // A glyph from an icon font reads as nothing, or as a private-use code point, to a
+            // screen reader.
+            AutomationProperties::SetAccessibilityView(text, winrt::UIXaml::Automation::Peers::AccessibilityView::Raw);
+
+            Children().Append(text);
+            m_fallback = text;
+        }
+
+        m_fallback.Text(m_fallbackText);
+
+        if (m_fallbackFontSize > 0)
+        {
+            m_fallback.FontSize(m_fallbackFontSize);
+        }
+        else
+        {
+            m_fallback.ClearValue(TextBlock::FontSizeProperty());
+        }
+
+        if (m_fallbackFontFamily != nullptr)
+        {
+            m_fallback.FontFamily(m_fallbackFontFamily);
+        }
+        else
+        {
+            m_fallback.ClearValue(TextBlock::FontFamilyProperty());
+        }
+
+        if (const auto foreground = FallbackForeground())
+        {
+            m_fallback.Foreground(foreground);
+        }
+        else
+        {
+            m_fallback.ClearValue(TextBlock::ForegroundProperty());
+        }
+    }
+
+    /// <summary>
+    /// How many surface pixels to draw per pixel the panel occupies.
+    /// </summary>
+    /// <remarks>
+    /// A press grows the element, and growing an element magnifies the pixels already in its
+    /// swap chain rather than asking for more. So while it is held the surface is sized for the
+    /// scale it is drawn at, and at rest it is sized for one.
+    ///
+    /// Only while it is held, because the cost is an area: at a press scale of three that is nine
+    /// times the pixels, and nine times the work for the diamond's pixel shader, which is the
+    /// expensive half of it. Paying that at idle for a gesture that is cosmetic and rarely reached
+    /// would be the wrong way round - a reallocation when it actually happens is cheaper. It is
+    /// not free, mind: it resizes the swap chain and rebuilds the scene's offscreen, resolve and
+    /// depth targets, so the first frame of a press can be long. For anything on the pointer's
+    /// usual path that trade would invert again.
+    ///
+    /// The cap leaves headroom past a press scale of three: a render scale of 3.5 while pressed
+    /// and 1 at rest is the intended trade.
+    ///
+    /// Safe to resize at all because neither shader reads the pixel dimensions: `viewport.x` and
+    /// `.y` go unread and only the optical plane count and the flat-mode flag beside them are
+    /// used, so the render size is purely resolution and changes nothing about the look.
+    /// </remarks>
+    float Scene3DPanel::Oversample() const noexcept
+    {
+        if (!m_pressed)
+        {
+            return 1;
+        }
+
+        // Capped because the cost grows as the square, so a careless value would ask for a
+        // surface many times larger than any benefit.
+        return std::clamp(static_cast<float>(m_pressScale), 1.0f, 4.0f);
+    }
+
+    /// <summary>
+    /// Grows the panel while it is held, and lets it spring back when it is let go.
+    /// </summary>
+    /// <remarks>
+    /// The whole element scales, swap chain and all, and this is here rather than in the
+    /// renderer because the growth is a property of how
+    /// the scene is presented, not of what is in it, which is why the two screens that do it
+    /// centre it differently.
+    ///
+    /// The damping ratio is 0.55, and being dimensionless it carries over from a stiffness-based
+    /// spring as it is. The period does not: **Period is the period of the spring's oscillation, not the length of
+    /// the animation.** A settle takes several of them, shortened by the damping, so the useful
+    /// range is tens of milliseconds - Composition's own default is 50 - and a value in the
+    /// hundreds reads as a slow wobble rather than a press.
+    ///
+    /// Which is why the period is not converted from a stiffness. Taking a stiffness of 280 as a
+    /// frequency gives 2 pi / sqrt(280), or 376 ms, and that is arithmetically faithful
+    /// and far too slow on screen. 37 was settled by watching it.
+    ///
+    /// The magnification this would otherwise cost is covered by <see cref="Oversample"/>.
+    /// </remarks>
+    void Scene3DPanel::UpdatePressScale(bool pressed)
+    {
+        if (m_pressScale == 1 || m_pressed == pressed)
+        {
+            return;
+        }
+
+        m_pressed = pressed;
+
+        if (pressed)
+        {
+            // Before the spring, so the pixels are there by the time it has grown into them.
+            UpdateSize();
+        }
+
+        const auto visual = ElementCompositionPreview::GetElementVisual(*this);
+
+        // Read now rather than cached: the panel may have been laid out again since the last
+        // press, and a stale centre scales it off to one side.
+        visual.CenterPoint({ static_cast<float>(ActualWidth()) * m_pressOrigin.X,
+                             static_cast<float>(ActualHeight()) * m_pressOrigin.Y, 0 });
+
+        const auto target = static_cast<float>(pressed ? m_pressScale : 1.0);
+
+        auto spring = visual.Compositor().CreateSpringVector3Animation();
+        spring.DampingRatio(0.55f);
+        spring.Period(std::chrono::milliseconds(37));
+        // Spelled out rather than braced: this one takes a nullable, so there is nothing for the
+        // compiler to deduce a float3 from.
+        spring.FinalValue(winrt::Windows::Foundation::Numerics::float3{ target, target, 1 });
+
+        if (pressed)
+        {
+            visual.StartAnimation(L"Scale", spring);
+            return;
+        }
+
+        // Given back only once it has actually shrunk. Resizing on release would drop the surface
+        // to a ninth while the element was still drawn at three times it, which is the softness
+        // this exists to avoid, arriving at the other end of the gesture.
+        auto batch = visual.Compositor().CreateScopedBatch(CompositionBatchTypes::Animation);
+
+        batch.Completed([strong = get_strong()](auto&&, auto&&)
+        {
+            // A new press may have landed while this was settling, and that one owns the size.
+            if (!strong->m_pressed)
+            {
+                strong->UpdateSize();
+            }
+        });
+
+        visual.StartAnimation(L"Scale", spring);
+        batch.End();
+    }
+
+    void Scene3DPanel::UpdateSize()
+    {
+        if (m_renderer == nullptr)
+        {
+            return;
+        }
+
+        // RasterizationScale rather than CompositionScale, which also moves when the panel sits
+        // in a ScrollViewer whose zoom changes - and a zoom should scale the surface, not reshape
+        // it. AsyncMediaPlayerSwapChain reads it the same way.
+        float scale = 1;
+
+        if (auto root = XamlRoot())
+        {
+            scale = static_cast<float>(root.RasterizationScale());
+        }
+        else
+        {
+            scale = CompositionScaleX();
+        }
+
+        m_renderer->SetSize(static_cast<float>(ActualWidth()), static_cast<float>(ActualHeight()),
+            scale * Oversample());
+    }
+
+    void Scene3DPanel::OnSizeChanged(IInspectable const&, SizeChangedEventArgs const&)
+    {
+        UpdateSize();
+    }
+
+    void Scene3DPanel::OnCompositionScaleChanged(SwapChainPanel const&, IInspectable const&)
+    {
+        UpdateSize();
+    }
+
+    void Scene3DPanel::OnActualThemeChanged(FrameworkElement const&, IInspectable const&)
+    {
+        if (m_renderer != nullptr)
+        {
+            m_renderer->SetDark(ActualTheme() == ElementTheme::Dark);
+        }
+    }
+
+    void Scene3DPanel::OnPointerPressed(IInspectable const&, PointerRoutedEventArgs const& args)
+    {
+        if (!m_interactive || m_renderer == nullptr || m_dragging)
+        {
+            return;
+        }
+
+        if (!CapturePointer(args.Pointer()))
+        {
+            return;
+        }
+
+        m_pointer = args.Pointer().PointerId();
+        m_dragFrom = args.GetCurrentPoint(nullptr).Position();
+        m_dragging = true;
+
+        m_pressFrom = m_dragFrom;
+        m_pressTime = std::chrono::steady_clock::now();
+        m_pressMoved = false;
+
+        m_renderer->BeginDrag();
+        UpdatePressScale(true);
+
+        // Not marked handled: the panel is often inside something scrollable or dismissable, and
+        // a turn of the stone is not a reason for the rest of that to stop working.
+    }
+
+    void Scene3DPanel::OnPointerMoved(IInspectable const&, PointerRoutedEventArgs const& args)
+    {
+        if (!m_dragging || m_renderer == nullptr || args.Pointer().PointerId() != m_pointer)
+        {
+            return;
+        }
+
+        // Relative to the window rather than to this panel. A press puts a Scale on the
+        // element's visual, and a point asked for in the element's own space is reported through
+        // that transform - so while it was grown threefold the pointer appeared to move a third
+        // as far, and the stone turned a third as fast. Window space has no transform of ours in
+        // it, and is in the same logical pixels the drag coefficients are calibrated for.
+        const auto point = args.GetCurrentPoint(nullptr).Position();
+
+        // Previous minus current - a drag to the right gives a negative distance. The renderer
+        // subtracts that again, and the model matrix negates nothing. Two negations, and the
+        // stone follows the pointer.
+        m_renderer->Drag(m_dragFrom.X - point.X, m_dragFrom.Y - point.Y);
+
+        m_dragFrom = point;
+
+        const float dx = point.X - m_pressFrom.X;
+        const float dy = point.Y - m_pressFrom.Y;
+
+        if (dx * dx + dy * dy > TapSlop * TapSlop)
+        {
+            m_pressMoved = true;
+        }
+    }
+
+    void Scene3DPanel::OnPointerReleased(IInspectable const&, PointerRoutedEventArgs const& args)
+    {
+        if (m_dragging && args.Pointer().PointerId() == m_pointer)
+        {
+            const double radius = ActualWidth() / 2;
+
+            if (!m_pressMoved && radius > 0 && m_renderer != nullptr
+                && std::chrono::steady_clock::now() - m_pressTime < TapTimeout)
+            {
+                // In the panel's own space, where the scale a press may put on it is applied;
+                // only a scene that takes taps reads this, and none of those grows on a press.
+                const auto point = args.GetCurrentPoint(*this).Position();
+
+                m_renderer->Tap(static_cast<float>((radius - point.X) / radius),
+                    static_cast<float>((radius - point.Y) / radius));
+            }
+
+            ReleasePointerCapture(args.Pointer());
+            EndDrag();
+        }
+    }
+
+    void Scene3DPanel::OnPointerCaptureLost(IInspectable const&, PointerRoutedEventArgs const& args)
+    {
+        if (m_dragging && args.Pointer().PointerId() == m_pointer)
+        {
+            EndDrag();
+        }
+    }
+
+    void Scene3DPanel::EndDrag()
+    {
+        if (!m_dragging)
+        {
+            return;
+        }
+
+        m_dragging = false;
+        m_pointer = 0;
+
+        UpdatePressScale(false);
+
+        if (m_renderer != nullptr)
+        {
+            m_renderer->EndDrag();
+        }
+    }
+}

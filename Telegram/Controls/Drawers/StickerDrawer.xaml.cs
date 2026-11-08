@@ -1,0 +1,533 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Collections.Generic;
+using Telegram.Common;
+using Telegram.Controls.Media;
+using Telegram.Streams;
+using Telegram.Td.Api;
+using Telegram.ViewModels.Drawers;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Controls.Primitives;
+using Windows.UI.Xaml.Input;
+
+namespace Telegram.Controls.Drawers
+{
+    public partial class StickerDrawerItemClickEventArgs : EventArgs
+    {
+        public StickerDrawerItemClickEventArgs(Sticker sticker, bool fromStickerSet)
+        {
+            Sticker = sticker;
+            FromStickerSet = fromStickerSet;
+        }
+
+        public Sticker Sticker { get; }
+
+        public bool FromStickerSet { get; }
+    }
+
+    public sealed partial class StickerDrawer : UserControlEx, IDrawer
+    {
+        public StickerDrawerViewModel ViewModel => DataContext as StickerDrawerViewModel;
+
+        public event EventHandler<StickerDrawerItemClickEventArgs> ItemClick;
+        public event EventHandler<ItemContextRequestedEventArgs<Sticker>> ItemContextRequested;
+        public event EventHandler ChoosingItem;
+
+        private readonly AnimatedListHandler _handler;
+        private readonly ZoomableListHandler _zoomer;
+
+        private readonly AnimatedListHandler _toolbarHandler;
+
+        private readonly EventDebouncer<TextChangedEventArgs> _typing;
+
+        // Pages the cloud half of the search results; idle at every other time, because nothing
+        // else in this list has more to fetch.
+        private ScrollViewerIncrementalLoader _loader;
+
+        private readonly Dictionary<StickerViewModel, SelectorItem> _itemIdToSelector = new();
+        private long _selectedSetId;
+
+        private bool _isActive;
+
+        private UIElement _header;
+
+        public StickerDrawer()
+        {
+            InitializeComponent();
+
+            this.CreateInsetClip();
+
+            var header = VisualUtilities.DropShadow(Separator);
+            header.Clip = header.Compositor.CreateInsetClip(0, 40, 0, -40);
+
+            _handler = new AnimatedListHandler(List, AnimatedListType.Stickers);
+            _toolbarHandler = new AnimatedListHandler(Toolbar, AnimatedListType.Stickers);
+
+            _zoomer = new ZoomableListHandler(List);
+            _zoomer.Opening += Zoomer_Opening;
+            _zoomer.Closing += Zoomer_Closing;
+
+            _typing = new EventDebouncer<TextChangedEventArgs>(Constants.TypingTimeout, handler => SearchField.TextChanged += new TextChangedEventHandler(handler));
+            _typing.Invoked += OnTypingInvoked;
+        }
+
+        private void Zoomer_Opening(object sender, EventArgs e)
+        {
+            _handler.Suspend();
+        }
+
+        private void Zoomer_Closing(object sender, EventArgs e)
+        {
+            _handler.Resume();
+        }
+
+        public Services.Settings.StickersTab Tab => Services.Settings.StickersTab.Stickers;
+
+        public Thickness ScrollingHostPadding
+        {
+            get => List.Padding;
+            set => List.Padding = new Thickness(2, value.Top, 2, value.Bottom);
+        }
+
+        public ListViewBase ScrollingHost => List;
+
+        public void Activate(Chat chat, EmojiSearchType type = EmojiSearchType.Combined)
+        {
+            _isActive = true;
+            _handler.Resume();
+            _toolbarHandler.ThrottleVisibleItems();
+
+            SearchField.SetType(ViewModel.ClientService, type);
+            ViewModel.Update(chat);
+        }
+
+        public void Deactivate()
+        {
+            _itemIdToSelector.Clear();
+
+            _isActive = false;
+            _handler.UnloadItems();
+            _toolbarHandler.UnloadItems();
+
+            _typing.Cancel();
+
+            // This is called only right before XamlMarkupHelper.UnloadObject
+            // so we can safely clean up any kind of anything from here.
+            Bindings.StopTracking();
+            ViewModel.Unsubscribe();
+
+            // Same as EmojiDrawer: the bindings' last value keeps a CollectionChanged handler
+            // on the view model's collections alive past UnloadObject, and the view model can
+            // still queue an Update from the aggregator.
+            List.ItemsSource = null;
+            StickersSource.Source = null;
+            Toolbar.ItemsSource = null;
+
+            if (_loader != null)
+            {
+                _loader.ItemsSource = null;
+            }
+        }
+
+        public void LoadVisibleItems()
+        {
+            if (_isActive)
+            {
+                _handler.LoadVisibleItems();
+                _toolbarHandler.LoadVisibleItems();
+            }
+        }
+
+        public void ThrottleVisibleItems()
+        {
+            if (_isActive)
+            {
+                _handler.ThrottleVisibleItems();
+                _toolbarHandler.ThrottleVisibleItems();
+            }
+        }
+
+        public void UnloadVisibleItems()
+        {
+            _handler.UnloadVisibleItems();
+            _toolbarHandler.UnloadVisibleItems();
+        }
+
+        private void Stickers_ItemClick(object sender, ItemClickEventArgs e)
+        {
+            if (e.ClickedItem is StickerViewModel sticker && sticker.StickerValue != null)
+            {
+                var container = List.ContainerFromItem(e.ClickedItem);
+
+                var groupContainer = List.GroupHeaderContainerFromItemContainer(container) as GridViewHeaderItem;
+                if (groupContainer == null)
+                {
+                    ItemClick?.Invoke(this, new StickerDrawerItemClickEventArgs(sticker, false));
+                    return;
+                }
+
+                var stickerSet = groupContainer.Content as StickerSetViewModel;
+                if (stickerSet != null)
+                {
+                    ItemClick?.Invoke(this, new StickerDrawerItemClickEventArgs(sticker, stickerSet.Id != 0));
+                }
+            }
+        }
+
+        private void Stickers_Loaded(object sender, RoutedEventArgs e)
+        {
+            var scrollingHost = List.GetChild<ScrollViewer>();
+            if (scrollingHost != null)
+            {
+                scrollingHost.VerticalSnapPointsType = SnapPointsType.None;
+
+                // Syncronizes GridView with the toolbar ListView
+                scrollingHost.ViewChanged += ScrollingHost_ViewChanged;
+                ScrollingHost_ViewChanged(null, null);
+
+                // Loaded comes round again without an Unloaded in between, and the loader hooks
+                // the scroll viewer itself.
+                _loader ??= new ScrollViewerIncrementalLoader(scrollingHost);
+            }
+        }
+
+        private void Toolbar_ItemClick(object sender, ItemClickEventArgs e)
+        {
+            if (e.ClickedItem is StickerSetViewModel set && set.Stickers != null)
+            {
+                List.ScrollIntoView(e.ClickedItem, ScrollIntoViewAlignment.Leading);
+            }
+        }
+
+        private void ScrollingHost_ViewChanged(object sender, ScrollViewerViewChangedEventArgs e)
+        {
+            var scrollingHost = List.ItemsPanelRoot as ItemsWrapGrid;
+            if (scrollingHost != null && _isActive && scrollingHost.FirstVisibleIndex >= 0)
+            {
+                //var item = List.Items[scrollingHost.FirstVisibleIndex];
+                //if (item is StickerViewModel sticker && sticker.SetId != _selectedSetId)
+                //{
+                //    _selectedSetId = sticker.SetId;
+
+                //    if (ViewModel != null && ViewModel.TryGetInstalledSet(sticker.SetId, out var stickerSet))
+                //    {
+                //        Toolbar.SelectedItem = stickerSet;
+                //        Toolbar.ScrollIntoView(stickerSet);
+                //    }
+                //}
+
+                var first = List.ContainerFromIndex(scrollingHost.FirstVisibleIndex);
+                if (first != null)
+                {
+                    var header = List.GroupHeaderContainerFromItemContainer(first) as GridViewHeaderItem;
+                    if (header != null && header.Content != Toolbar.SelectedItem)
+                    {
+                        Toolbar.SelectedItem = header.Content;
+                    }
+                }
+            }
+
+            if (sender is ScrollViewer scrollViewer && scrollViewer.VerticalOffset > 0 && e.IsIntermediate)
+            {
+                ChoosingItem?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        private async void OnChoosingGroupHeaderContainer(ListViewBase sender, ChoosingGroupHeaderContainerEventArgs args)
+        {
+            if (args.GroupHeaderContainer == null)
+            {
+                args.GroupHeaderContainer = new GridViewHeaderItem();
+                args.GroupHeaderContainer.Style = sender.GroupStyle[0].HeaderContainerStyle;
+                args.GroupHeaderContainer.ContentTemplate = sender.GroupStyle[0].HeaderTemplate;
+            }
+
+            if (args.Group is StickerSetViewModel group && !group.IsLoaded)
+            {
+                group.IsLoaded = true;
+
+                //Debug.WriteLine("Loading sticker set " + group.Id);
+
+                var response = await ViewModel.ClientService.SendAsync(new GetStickerSet(group.Id));
+                if (response is StickerSet full && IsConnected)
+                {
+                    group.Update(full, false);
+
+                    //return;
+
+                    foreach (var sticker in group.Stickers)
+                    {
+                        if (sticker.StickerValue != null && _itemIdToSelector.TryGetValue(sticker, out SelectorItem selector) && selector.ContentTemplateRoot is Grid content)
+                        {
+                            var animation = content.Children[0] as AnimatedImage;
+                            animation.Source = new DelayedFileSource(ViewModel.ClientService, sticker);
+                        }
+                    }
+                }
+            }
+        }
+
+        private void OnChoosingItemContainer(ListViewBase sender, ChoosingItemContainerEventArgs args)
+        {
+            if (args.ItemContainer == null)
+            {
+                var item = new GridViewItem();
+                item.ContentTemplate = sender.ItemTemplate;
+                item.Style = sender.ItemContainerStyle;
+                item.ContextRequested += OnContextRequested;
+                args.ItemContainer = item;
+
+                _zoomer.ElementPrepared(args.ItemContainer);
+            }
+
+            args.IsContainerPrepared = true;
+        }
+
+        private void OnContainerContentChanging(ListViewBase sender, ContainerContentChangingEventArgs args)
+        {
+            var content = args.ItemContainer.ContentTemplateRoot as Grid;
+            var sticker = args.Item as StickerViewModel;
+
+            if (args.InRecycleQueue || sticker == null)
+            {
+                if (sticker != null)
+                {
+                    _itemIdToSelector.Remove(sticker);
+                }
+
+                return;
+            }
+
+            if (sticker?.StickerValue != null)
+            {
+                var animation = content.Children[0] as AnimatedImage;
+                animation.Source = new DelayedFileSource(ViewModel.ClientService, sticker);
+            }
+            else
+            {
+                _itemIdToSelector[sticker] = args.ItemContainer;
+
+                var animation = content.Children[0] as AnimatedImage;
+                animation.Source = null;
+            }
+
+            args.Handled = true;
+        }
+
+        private void Toolbar_ContainerContentChanging(ListViewBase sender, ContainerContentChangingEventArgs args)
+        {
+            if (args.InRecycleQueue)
+            {
+                return;
+            }
+            else if (args.Item is SupergroupStickerSetViewModel supergroup)
+            {
+                Automation.SetToolTip(args.ItemContainer, supergroup.Title);
+
+                var chat = ViewModel.ClientService.GetChat(supergroup.ChatId);
+                if (chat == null)
+                {
+                    return;
+                }
+
+                var content = args.ItemContainer.ContentTemplateRoot as Border;
+                if (content?.Child is not ProfilePicture photo)
+                {
+                    return;
+                }
+
+                photo.Source = ProfilePictureSource.Chat(ViewModel.ClientService, chat);
+                args.Handled = true;
+            }
+            else if (args.Item is StickerSetViewModel sticker)
+            {
+                Automation.SetToolTip(args.ItemContainer, sticker.Title);
+
+                var content = args.ItemContainer.ContentTemplateRoot as Grid;
+                if (content?.Children[0] is FontIcon icon)
+                {
+                    icon.Glyph = sticker.Name switch
+                    {
+                        "tg/favedStickers" => Icons.Bookmark,
+                        "tg/recentlyUsed" => Icons.EmojiRecents,
+                        "tg/collectibles" => Icons.Diamond,
+                        _ => string.Empty
+                    };
+                }
+                else if (content?.Children[0] is AnimatedImage animated)
+                {
+                    animated.Source = DelayedFileSource.FromStickerSetInfo(ViewModel.ClientService, sticker);
+                }
+
+                args.Handled = true;
+            }
+        }
+
+        /// <summary>
+        /// Shown under the search box and scrolled with the stickers, while nothing is searched.
+        /// </summary>
+        public UIElement Header
+        {
+            get => _header;
+            set
+            {
+                _header = value;
+                HeaderRoot.Child = value;
+            }
+        }
+
+        private void SearchField_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            // Clearing the field is instant; only a query worth sending waits out the debounce,
+            // which is what both of the other clients do.
+            if (string.IsNullOrWhiteSpace(SearchField.Text))
+            {
+                Search();
+            }
+        }
+
+        private void OnTypingInvoked(object sender, TextChangedEventArgs e)
+        {
+            // The debouncer is armed by the same keystroke that emptied the field, and that case
+            // was handled above the moment it happened.
+            if (!string.IsNullOrWhiteSpace(SearchField.Text))
+            {
+                Search();
+            }
+        }
+
+        private async void Search()
+        {
+            // Deactivate clears the DataContext, and a debounce already armed still arrives.
+            var viewModel = ViewModel;
+            if (viewModel == null)
+            {
+                return;
+            }
+
+            var items = viewModel.Search(SearchField.Text, false);
+            BeginSearch(items != null);
+
+            if (items != null)
+            {
+                await items.SearchAsync();
+
+                // A newer query may have replaced this one while its requests were in flight.
+                if (viewModel.SearchStickers != items)
+                {
+                    return;
+                }
+            }
+
+            EndSearch();
+        }
+
+        private async void SearchField_CategorySelected(object sender, EmojiCategorySelectedEventArgs e)
+        {
+            var viewModel = ViewModel;
+            if (viewModel == null)
+            {
+                return;
+            }
+
+            _typing.Cancel();
+            BeginSearch(true);
+
+            await viewModel.SearchAsync(e.Category.Source);
+
+            EndSearch();
+        }
+
+        private void BeginSearch(bool loading)
+        {
+            // Nothing to page until the search that is starting says there is.
+            if (_loader != null)
+            {
+                _loader.ItemsSource = null;
+            }
+
+            SearchField.SetLoading(loading);
+            ShowHideEmpty(false);
+
+            if (loading)
+            {
+                HeaderRoot.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        private void EndSearch()
+        {
+            var results = ViewModel?.SearchStickers;
+
+            if (_loader != null)
+            {
+                _loader.ItemsSource = results;
+            }
+
+            SearchField.SetLoading(false);
+            ShowHideEmpty(results is { Count: 0 });
+
+            HeaderRoot.Visibility = results == null
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        private void ShowHideEmpty(bool show)
+        {
+            EmptyText.Visibility = show
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        private void OnContextRequested(UIElement sender, ContextRequestedEventArgs args)
+        {
+            var sticker = List.ItemFromContainer(sender) as StickerViewModel;
+            if (sticker == null)
+            {
+                return;
+            }
+
+            ItemContextRequested?.Invoke(sender, new ItemContextRequestedEventArgs<Sticker>(sticker, args));
+        }
+
+        private void Player_Ready(object sender, EventArgs e)
+        {
+            _handler.ThrottleVisibleItems();
+        }
+
+        private void Toolbar_Ready(object sender, EventArgs e)
+        {
+            _toolbarHandler.ThrottleVisibleItems();
+        }
+
+        private void Toolbar_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (_updatingSelectedItem)
+            {
+                return;
+            }
+
+            _updatingSelectedItem = true;
+            VisualUtilities.QueueCallbackForCompositionRendering(UpdateSelectedItem);
+        }
+
+        private bool _updatingSelectedItem;
+
+        private void UpdateSelectedItem()
+        {
+            _updatingSelectedItem = false;
+
+            if (Toolbar.SelectedItem != null)
+            {
+                _ = Toolbar.ScrollToItem2(Toolbar.SelectedItem, VerticalAlignment.Center);
+            }
+        }
+    }
+}

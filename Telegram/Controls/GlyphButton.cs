@@ -1,0 +1,75 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using Telegram.Native.Controls;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+
+namespace Telegram.Controls
+{
+    public partial class GlyphButton : Button
+    {
+        public GlyphButton()
+        {
+            DefaultStyleKey = typeof(GlyphButton);
+        }
+
+        #region Glyph
+
+        public string Glyph
+        {
+            get => (string)GetValue(GlyphProperty);
+            set => SetValue(GlyphProperty, value);
+        }
+
+        public static readonly DependencyProperty GlyphProperty =
+            DependencyProperty.Register("Glyph", typeof(string), typeof(GlyphButton), new PropertyMetadata(null, OnGlyphChanged));
+
+        private static void OnGlyphChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((GlyphButton)d).OnGlyphChanged((string)e.NewValue, (string)e.OldValue);
+        }
+
+        protected virtual void OnGlyphChanged(string newValue, string oldValue)
+        {
+
+        }
+
+        #endregion
+    }
+
+    public partial class GlyphHyperlinkButton : HyperlinkButtonEx
+    {
+        public GlyphHyperlinkButton()
+        {
+            DefaultStyleKey = typeof(GlyphHyperlinkButton);
+        }
+
+        #region Glyph
+
+        public string Glyph
+        {
+            get => (string)GetValue(GlyphProperty);
+            set => SetValue(GlyphProperty, value);
+        }
+
+        public static readonly DependencyProperty GlyphProperty =
+            DependencyProperty.Register("Glyph", typeof(string), typeof(GlyphHyperlinkButton), new PropertyMetadata(null, OnGlyphChanged));
+
+        private static void OnGlyphChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            ((GlyphHyperlinkButton)d).OnGlyphChanged((string)e.NewValue, (string)e.OldValue);
+        }
+
+        protected virtual void OnGlyphChanged(string newValue, string oldValue)
+        {
+
+        }
+
+        #endregion
+    }
+}

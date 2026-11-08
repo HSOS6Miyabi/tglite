@@ -1,0 +1,37 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using Telegram.Common;
+using Telegram.ViewModels.Settings;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+
+namespace Telegram.Views.Settings
+{
+    public sealed partial class SettingsAdvancedPage : HostedPage
+    {
+        public SettingsAdvancedViewModel ViewModel => DataContext as SettingsAdvancedViewModel;
+
+        public SettingsAdvancedPage()
+        {
+            InitializeComponent();
+            Title = Strings.PrivacyAdvanced;
+
+            // The Store serves a single channel: the app channel's beta builds are only reachable
+            // by a sideloaded package.
+            if (ApiInfo.IsPackagedRelease)
+            {
+                FindName(nameof(BetaUpdates));
+            }
+        }
+
+        private void Shortcuts_Click(object sender, RoutedEventArgs e)
+        {
+            Frame.Navigate(typeof(SettingsShortcutsPage));
+        }
+    }
+}

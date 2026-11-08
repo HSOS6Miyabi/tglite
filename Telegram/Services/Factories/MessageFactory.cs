@@ -1,0 +1,240 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Collections.Generic;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Telegram.Common;
+using Telegram.Entities;
+using Telegram.Native;
+using Telegram.Td.Api;
+
+namespace Telegram.Services.Factories
+{
+    public static class MessageFactory
+    {
+        // The longest side of a photo held as a video.
+        private const int StillMaxSide = 854;
+
+        public static async Task<Object> CreatePhotoAsync(StoragePhoto photo, FormattedText caption, bool highQuality, bool captionAboveMedia, bool spoiler, MessageSelfDestructType ttl, long starCount, bool grouped = false)
+        {
+            var conversionType = ConversionType.Compress;
+            var file = photo.File;
+
+            var generation = photo.IsEdited ? photo.EditState : null;
+
+            var size = await ImageHelper.GetScaleAsync(file, allowMultipleFrames: ttl != null || starCount > 0, requestedMinSide: highQuality ? 2560 : 1280, generation: generation);
+            if (size.Width == 0 || size.Height == 0)
+            {
+                // This may happen if the image is a GIF with multiple frames.
+                conversionType = ConversionType.Copy;
+                generation = null;
+            }
+            else if (highQuality)
+            {
+                conversionType = ConversionType.HighQuality;
+            }
+
+            if (generation != null)
+            {
+                var stillDuration = await GenerationService.GetStillDurationAsync(generation.Entities, false);
+                if (stillDuration > TimeSpan.Zero)
+                {
+                    return await CreateStillAsync(photo, generation, stillDuration, caption, captionAboveMedia, spoiler, ttl, starCount, grouped);
+                }
+            }
+
+            var serialized = generation != null ? JsonSerializer.Serialize(generation, GenerationJsonContext.Default.ImageGeneration) : null;
+            var generated = await GenerationService.PrepareAsync(file, conversionType, serialized);
+            var thumbnail = default(InputThumbnail);
+
+            if (starCount > 0)
+            {
+                return new InputPaidMedia(new InputPaidMediaTypePhoto(), generated, thumbnail, null, size.Width, size.Height);
+            }
+            else if (conversionType == ConversionType.Copy)
+            {
+                return new InputMessageDocument(new InputDocument(generated, thumbnail, false), caption);
+            }
+
+            return new InputMessagePhoto(new InputPhoto(generated, thumbnail, null, GetAddedStickers(generation?.Entities), size.Width, size.Height), caption, captionAboveMedia, ttl, spoiler);
+        }
+
+        // A photo with an animated sticker on it goes out as a muted loop of its stickers.
+        private static async Task<Object> CreateStillAsync(StoragePhoto photo, ImageGeneration state, TimeSpan stillDuration, FormattedText caption, bool captionAboveMedia, bool spoiler, MessageSelfDestructType ttl, long starCount, bool grouped)
+        {
+            var generation = new VideoGeneration
+            {
+                Transcode = true,
+                Mute = true,
+                MaxSide = StillMaxSide,
+                StillDuration = stillDuration,
+                Rectangle = state.Rectangle,
+                Angle = state.Angle,
+                Rotation = state.Rotation,
+                Flip = state.Flip,
+                Strokes = state.Strokes,
+                Entities = state.Entities
+            };
+
+            var output = await GenerationService.GetStillOutputSizeAsync(photo.File, generation);
+            var width = (int)output.Width;
+            var height = (int)output.Height;
+            var duration = (int)stillDuration.TotalSeconds;
+            var stickers = GetAddedStickers(state.Entities);
+
+            var serialized = JsonSerializer.Serialize(generation, GenerationJsonContext.Default.VideoGeneration);
+            var generated = await GenerationService.PrepareAsync(photo.File, ConversionType.Transcode, serialized);
+            var thumbnail = await GenerationService.PrepareVideoThumbnailAsync(photo.File, output, serialized);
+
+            if (starCount > 0)
+            {
+                return new InputPaidMedia(new InputPaidMediaTypeVideo(null, 0, duration, true), generated, thumbnail, stickers, width, height);
+            }
+            // Neither an album nor a self-destructing message can hold an animation.
+            else if (ttl == null && !grouped)
+            {
+                return new InputMessageAnimation(new InputAnimation(generated, thumbnail, stickers, duration, width, height), caption, captionAboveMedia, spoiler);
+            }
+
+            return new InputMessageVideo(new InputVideo(generated, thumbnail, null, 0, stickers, duration, width, height, true), caption, captionAboveMedia, ttl, spoiler);
+        }
+
+        // The stickers drawn into the media, so that it can lead to their sets.
+        internal static Vector<int> GetAddedStickers(IReadOnlyList<PaintEntity> entities)
+        {
+            if (entities == null)
+            {
+                return null;
+            }
+
+            List<int> files = null;
+
+            foreach (var entity in entities)
+            {
+                if (entity.Type == PaintEntityType.Sticker && entity.StickerFile is { } file)
+                {
+                    files ??= new List<int>();
+
+                    if (!files.Contains(file.Id))
+                    {
+                        files.Add(file.Id);
+                    }
+                }
+            }
+
+            return files != null ? new Vector<int>(files) : null;
+        }
+
+        public static async Task<Object> CreateVideoAsync(StorageVideo video, FormattedText caption, bool animated, bool captionAboveMedia, bool spoiler, MessageSelfDestructType ttl, long starCount)
+        {
+            var duration = video.TotalSeconds;
+            var videoWidth = video.Width;
+            var videoHeight = video.Height;
+            var generation = video.GetGeneration();
+
+            generation ??= new VideoGeneration
+            {
+                Mute = animated
+            };
+
+            if (generation.TrimStartTime is TimeSpan trimStart && generation.TrimStopTime is TimeSpan trimStop)
+            {
+                duration = (int)(trimStop.TotalSeconds - trimStart.TotalSeconds);
+            }
+
+            if (generation.HasOutputSize)
+            {
+                var output = GenerationService.GetVideoOutputSize(generation, videoWidth, videoHeight);
+
+                videoWidth = (int)output.Width;
+                videoHeight = (int)output.Height;
+            }
+
+            var serialized = JsonSerializer.Serialize(generation, GenerationJsonContext.Default.VideoGeneration);
+            var generated = await GenerationService.PrepareAsync(video.File, ConversionType.Transcode, serialized);
+            var thumbnail = await GenerationService.PrepareVideoThumbnailAsync(video, generation, serialized);
+
+            if (starCount > 0)
+            {
+                return new InputPaidMedia(new InputPaidMediaTypeVideo(null, 0, duration, true), generated, thumbnail, null, videoWidth, videoHeight);
+            }
+            else if (animated && ttl == null)
+            {
+                return new InputMessageAnimation(new InputAnimation(generated, thumbnail, null, duration, videoWidth, videoHeight), caption, captionAboveMedia, spoiler);
+            }
+
+            return new InputMessageVideo(new InputVideo(generated, thumbnail, null, 0, null, duration, videoWidth, videoHeight, true), caption, captionAboveMedia, ttl, spoiler);
+        }
+
+        public static async Task<InputMessageContent> CreateVideoNoteAsync(StorageVideo video, VideoGeneration generation, MessageSelfDestructType selfDestructType)
+        {
+            var duration = video.TotalSeconds;
+            var videoWidth = video.Width;
+            var videoHeight = video.Height;
+
+            var serialized = JsonSerializer.Serialize(generation, GenerationJsonContext.Default.VideoGeneration);
+            var generated = await GenerationService.PrepareAsync(video.File, ConversionType.Transcode, serialized);
+            var thumbnail = await GenerationService.PrepareVideoThumbnailAsync(video, generation, serialized);
+
+            // TODO: 172 selfDestructType
+            return new InputMessageVideoNote(new InputVideoNote(generated, thumbnail, duration, (int)generation.Width), selfDestructType);
+        }
+
+        public static async Task<Object> CreateDocumentAsync(StorageMedia media, FormattedText caption, bool forceDocument)
+        {
+            var file = media.File;
+            var generated = await GenerationService.PrepareAsync(file, media.IsScreenshot ? ConversionType.Screenshot : ConversionType.Copy);
+
+            if (!forceDocument && media is StorageAudio audio)
+            {
+                var duration = audio.TotalSeconds;
+
+                var title = audio.Title;
+                var performer = audio.Performer;
+
+                var albumCover = new InputThumbnail(await GenerationService.PrepareAsync(file, ConversionType.AlbumCover), 0, 0);
+
+                return new InputMessageAudio(new InputAudio(generated, albumCover, duration, title, performer), caption);
+            }
+
+            var thumbnail = new InputThumbnail(await GenerationService.PrepareAsync(file, ConversionType.DocumentThumbnail), 0, 0);
+
+            if (!forceDocument && file.HasExtension(".webp"))
+            {
+                try
+                {
+                    if (Direct2DDevice.IsWebP(file.Path, out int width, out int height))
+                    {
+                        if ((width == 512 && height <= width) || (height == 512 && width <= height))
+                        {
+                            return new InputMessageSticker(new InputSticker(generated, null, width, height), string.Empty);
+                        }
+                    }
+                }
+                catch
+                {
+                    // Not really a sticker, go on sending as a file
+                }
+            }
+            else if (!forceDocument && file.HasExtension(".tgs"))
+            {
+                // TODO
+            }
+
+            return new InputMessageDocument(new InputDocument(generated, thumbnail, true), caption);
+        }
+    }
+
+    public partial class InputMessageFactory
+    {
+        public InputFile InputFile { get; set; }
+        public Func<InputFile, FormattedText, InputMessageContent> Delegate { get; set; }
+        public Func<InputFile, InputPaidMedia> PaidDelegate { get; set; }
+    }
+}

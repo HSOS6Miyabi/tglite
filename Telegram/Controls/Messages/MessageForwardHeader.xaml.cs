@@ -1,0 +1,317 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System.Collections.Generic;
+using Telegram.Common;
+using Telegram.Controls.Media;
+using Telegram.Navigation;
+using Telegram.Services;
+using Telegram.Td.Api;
+using Telegram.ViewModels;
+using Windows.Foundation;
+using Windows.UI;
+using Windows.UI.Composition;
+using Windows.UI.Text;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Automation.Peers;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Input;
+using Windows.UI.Xaml.Media;
+
+namespace Telegram.Controls.Messages
+{
+    public partial class MessageForwardHeader : HyperlinkButton
+    {
+        private Visual _visual;
+        private CompositionGeometricClip _clip;
+        private double _width;
+
+        private MessageViewModel _message;
+        private bool _light;
+
+        public MessageForwardHeader()
+        {
+            DefaultStyleKey = typeof(MessageForwardHeader);
+        }
+
+        protected override AutomationPeer OnCreateAutomationPeer()
+        {
+            return new MessageForwardHeaderAutomationPeer(this);
+        }
+
+        public string GetAutomationName()
+        {
+            if (ForwardText != null)
+            {
+                return ForwardText.Text + " " + ForwardLink.Text;
+            }
+
+            return null;
+        }
+
+        protected override void OnPointerEntered(PointerRoutedEventArgs e)
+        {
+            if (_width != ActualWidth || _visual?.Clip == null)
+            {
+                _width = ActualWidth;
+
+                var rects = new List<Rect>();
+                var shapes = new List<int>();
+                var count = 0;
+                var last = default(Rect);
+
+                var rectangles2 = new[]
+                {
+                    new Rect(0, 0, ForwardText.ActualWidth, ForwardText.ActualHeight),
+                    new Rect(0, ForwardText.ActualHeight, ForwardLink.ActualWidth, ForwardLink.ActualHeight)
+                };
+
+                //var contentEnd = ForwardLabel.ContentEnd.GetCharacterRect(ForwardLabel.ContentEnd.LogicalDirection);
+                //if (contentEnd.Right <= 0)
+                //{
+                //    contentEnd = new Rect(0, contentEnd.Y, finalSize.Width, contentEnd.Height);
+                //}
+
+                //var rectangles2 = new[]
+                //{
+                //    new Rect(0, 0, finalSize.Width, contentEnd.Y),
+                //    new Rect(0, contentEnd.Y, contentEnd.Right, contentEnd.Height)
+                //};
+
+                // A line arrives whole: LineMetrics merges the runs a mixed direction line is
+                // hit tested into, so there is nothing left here to group.
+                for (int i = 0; i < rectangles2?.Length; i++)
+                {
+                    var line = rectangles2[i];
+                    var rect = new Rect(line.X - 4, line.Y, line.Width + 8, line.Height);
+
+                    if (count > 0 && !rect.IntersectsOrTouches(last))
+                    {
+                        shapes.Add(count);
+                        count = 0;
+                    }
+
+                    rects.Add(rect);
+                    last = rect;
+                    count++;
+                }
+
+                if (count > 0)
+                {
+                    shapes.Add(count);
+                }
+
+                if (_visual?.Clip == null)
+                {
+                    _visual ??= ElementCompositionPreview.GetElementVisual(this);
+                    _visual.Clip = _clip = _visual.Compositor.CreateGeometricClip();
+                }
+
+                _clip.Geometry = BootStrapper.Current.Compositor.CreatePathGeometry(Direct2D.Current.GetRoundedPolygon(rects.ToArray(), shapes.ToArray()));
+            }
+
+            try
+            {
+                base.OnPointerEntered(e);
+            }
+            catch
+            {
+                // All the remote procedure calls must be wrapped in a try-catch block
+            }
+        }
+
+        #region InitializeComponent
+
+        private ProfilePicture ForwardPhoto;
+        private TextBlock ForwardText;
+        private TextBlock ForwardLink;
+
+        private bool _templateApplied;
+
+        protected override void OnApplyTemplate()
+        {
+            ForwardPhoto = GetTemplateChild(nameof(ForwardPhoto)) as ProfilePicture;
+            ForwardText = GetTemplateChild(nameof(ForwardText)) as TextBlock;
+            ForwardLink = GetTemplateChild(nameof(ForwardLink)) as TextBlock;
+
+            _templateApplied = true;
+
+            if (_message != null)
+            {
+                UpdateMessage(_message, _light);
+            }
+        }
+
+        #endregion
+
+        private bool _linkCollapsed;
+
+        public void UpdateMessage(MessageViewModel message, bool light)
+        {
+            _message = message;
+            _width = 0;
+
+            if (_light != light)
+            {
+                _light = light;
+
+                if (light)
+                {
+                    Foreground = new SolidColorBrush(Colors.White);
+                }
+                else
+                {
+                    ClearValue(ForegroundProperty);
+                }
+            }
+
+            _visual?.Clip = null;
+
+            if (!_templateApplied || message == null)
+            {
+                return;
+            }
+
+            if (message.ReceiverId != null)
+            {
+                // TODO: icon
+                if (message.ReceiverId.IsUser(message.ClientService.Options.MyId))
+                {
+                    ForwardText.Text = "\uE9A6\u00A0" + Strings.EphemeralMessageVisibleToYou;
+                }
+                else
+                {
+                    ForwardText.Text = "\uE9A6\u00A0" + string.Format(Strings.EphemeralMessageVisibleToOther, message.ClientService.GetTitle(message.ReceiverId));
+                }
+
+                _linkCollapsed = true;
+                ForwardLink.Visibility = Visibility.Collapsed;
+                ForwardPhoto.Visibility = Visibility.Collapsed;
+
+                ForwardLink.Text = string.Empty;
+                ForwardPhoto.Source = null;
+                Visibility = Visibility.Visible;
+            }
+            else if (message.Content is MessageAsyncStory story && message.ClientService.TryGetChat(story.StoryPosterChatId, out Chat storyChat))
+            {
+                if (story.State == MessageStoryState.Expired)
+                {
+                    if (message.ClientService.TryGetSupergroup(storyChat, out Supergroup supergroup) && supergroup.Status is ChatMemberStatusLeft && !supergroup.IsPublic())
+                    {
+                        ForwardText.Text = Strings.PrivateStory;
+                    }
+                    else
+                    {
+                        ForwardText.Text = string.Format("{0}\u00A0{1}", Icons.ExpiredStory, Strings.ExpiredStory);
+                    }
+                }
+                else
+                {
+                    ForwardText.Text = Strings.ForwardedStory;
+                }
+
+                if (_linkCollapsed)
+                {
+                    _linkCollapsed = false;
+                    ForwardLink.Visibility = Visibility.Visible;
+                    ForwardPhoto.Visibility = Visibility.Visible;
+                }
+
+                ForwardLink.Text = "\uEA4F\u00A0" + storyChat.Title;
+                ForwardPhoto.Source = ProfilePictureSource.Chat(message.ClientService, storyChat);
+
+                Visibility = Visibility.Visible;
+            }
+            else if (message.ForwardInfo != null && !message.IsVerificationCode && (!message.IsSaved || !message.ForwardInfo.HasSameOrigin()))
+            {
+                string line1;
+                string line2 = null;
+
+                if (message.ForwardInfo.PublicServiceAnnouncementType.Length > 0)
+                {
+                    var type = LocaleService.Current.GetString("PsaMessage_" + message.ForwardInfo.PublicServiceAnnouncementType);
+                    if (type.Length > 0)
+                    {
+                        line1 = type;
+                    }
+                    else
+                    {
+                        line1 = Strings.PsaMessageDefault;
+                    }
+                }
+                else
+                {
+                    line1 = Strings.ForwardedFrom;
+                }
+
+                if (message.ForwardInfo?.Origin is MessageOriginUser fromUser && message.ClientService.TryGetUser(fromUser.SenderUserId, out User fromUserUser))
+                {
+                    line2 = fromUserUser.FullName();
+                    ForwardLink.FontWeight = FontWeights.SemiBold;
+                    ForwardPhoto.Source = ProfilePictureSource.User(message.ClientService, fromUserUser);
+                }
+                else if (message.ForwardInfo?.Origin is MessageOriginChat fromChat && message.ClientService.TryGetChat(fromChat.SenderChatId, out Chat fromChatChat))
+                {
+                    line2 = fromChatChat.Title;
+                    ForwardLink.FontWeight = FontWeights.SemiBold;
+                    ForwardPhoto.Source = ProfilePictureSource.Chat(message.ClientService, fromChatChat);
+                }
+                else if (message.ForwardInfo?.Origin is MessageOriginChannel fromChannel && message.ClientService.TryGetChat(fromChannel.ChatId, out Chat fromChannelChat))
+                {
+                    line2 = fromChannelChat.Title;
+                    ForwardLink.FontWeight = FontWeights.SemiBold;
+                    ForwardPhoto.Source = ProfilePictureSource.Chat(message.ClientService, fromChannelChat);
+                }
+                else if (message.ForwardInfo?.Origin is MessageOriginHiddenUser fromHiddenUser)
+                {
+                    line2 = fromHiddenUser.SenderName;
+                    ForwardLink.FontWeight = FontWeights.Normal;
+                    ForwardPhoto.Source = ProfilePictureSourceText.GetNameForUser(fromHiddenUser.SenderName, long.MinValue);
+                }
+                else if (message.ImportInfo != null)
+                {
+                    line2 = message.ImportInfo.SenderName;
+                    ForwardLink.FontWeight = FontWeights.Normal;
+                    ForwardPhoto.Source = ProfilePictureSourceText.GetNameForUser(message.ImportInfo.SenderName, long.MinValue);
+                }
+
+                if (_linkCollapsed)
+                {
+                    _linkCollapsed = false;
+                    ForwardLink.Visibility = Visibility.Visible;
+                    ForwardPhoto.Visibility = Visibility.Visible;
+                }
+
+                ForwardText.Text = line1;
+                ForwardLink.Text = "\uEA4F\u00A0" + (line2 ?? string.Empty);
+
+                Visibility = Visibility.Visible;
+            }
+            else
+            {
+                Visibility = Visibility.Collapsed;
+            }
+        }
+    }
+
+    public partial class MessageForwardHeaderAutomationPeer : HyperlinkButtonAutomationPeer
+    {
+        private readonly MessageForwardHeader _owner;
+
+        public MessageForwardHeaderAutomationPeer(MessageForwardHeader owner)
+            : base(owner)
+        {
+            _owner = owner;
+        }
+
+        protected override string GetNameCore()
+        {
+            return _owner.GetAutomationName() ?? base.GetNameCore();
+        }
+    }
+}

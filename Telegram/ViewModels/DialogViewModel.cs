@@ -1,0 +1,5279 @@
+﻿//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
+using Telegram.Common;
+using Telegram.Common.Chats;
+using Telegram.Controls;
+using Telegram.Controls.Chats;
+using Telegram.Controls.Messages;
+using Telegram.Converters;
+using Telegram.Navigation;
+using Telegram.Navigation.Services;
+using Telegram.Services;
+using Telegram.Td;
+using Telegram.Td.Api;
+using Telegram.ViewModels.Chats;
+using Telegram.ViewModels.Delegates;
+using Telegram.ViewModels.Supergroups;
+using Telegram.Views;
+using Telegram.Views.Chats.Popups;
+using Telegram.Views.Popups;
+using Telegram.Views.Premium.Popups;
+using Telegram.Views.Supergroups.Popups;
+using Telegram.Views.Users;
+using Windows.ApplicationModel.DataTransfer;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Controls.Primitives;
+using Windows.UI.Xaml.Media.Animation;
+using Windows.UI.Xaml.Navigation;
+
+namespace Telegram.ViewModels
+{
+    public class MessagesLoadedEventArgs : EventArgs
+    {
+        public PanelScrollingDirection Direction { get; init; }
+
+        public MessagesLoadedEventArgs(PanelScrollingDirection direction)
+        {
+            Direction = direction;
+        }
+    }
+
+    public partial class ChatMessageTopic : IEquatable<ChatMessageTopic>
+    {
+        public ChatMessageTopic(long chatId, MessageTopic messageTopic)
+        {
+            ChatId = chatId;
+            MessageTopic = messageTopic;
+        }
+
+        public long ChatId { get; }
+
+        public MessageTopic MessageTopic { get; }
+
+        public bool Equals(ChatMessageTopic other)
+        {
+            if (other == null) return false;
+            return ChatId == other.ChatId && MessageTopic.AreTheSame(other.MessageTopic);
+        }
+
+        public override bool Equals(object obj)
+        {
+            return Equals(obj as ChatMessageTopic);
+        }
+
+        public override int GetHashCode()
+        {
+            long messageTopicId = MessageTopic switch
+            {
+                MessageTopicDirectMessages directMessages => directMessages.DirectMessagesChatTopicId,
+                MessageTopicForum forum => forum.ForumTopicId,
+                MessageTopicSavedMessages savedMessages => savedMessages.SavedMessagesTopicId,
+                MessageTopicThread thread => thread.MessageThreadId,
+                _ => 0
+            };
+
+            return HashCode.Combine(ChatId, messageTopicId);
+        }
+
+        public override string ToString()
+        {
+            return $"ChatId: {ChatId}, MessageTopic: {MessageTopic}";
+        }
+    }
+
+    public partial class ChatBusinessRepliesIdNavigationArgs
+    {
+        public ChatBusinessRepliesIdNavigationArgs(string quickReplyShortcut)
+        {
+            QuickReplyShortcut = quickReplyShortcut;
+        }
+
+        public string QuickReplyShortcut { get; }
+    }
+
+    public partial class DialogViewModel : ComposeViewModel, IDelegable<IDialogDelegate>
+    {
+        private readonly ConcurrentDictionary<MessageKey, MessageViewModel> _selectedItems = new();
+        public IDictionary<MessageKey, MessageViewModel> SelectedItems => _selectedItems;
+
+        public int SelectedCount => SelectedItems.Count;
+
+        protected readonly ConcurrentDictionary<long, MessageViewModel> _groupedMessages = new();
+        protected readonly ConcurrentDictionary<long, HashSet<long>> _messageEffects = new();
+
+        // The basic group the chat was upgraded from, whose history the chat's continues into.
+        // Looked up only once paging first reaches the chat's oldest message.
+        protected long _upgradedFromChatId;
+        private bool _upgradedFromResolved;
+
+        public MessageKey GetKey(long chatId, long messageId)
+        {
+            return MessageKey.From(messageId, IsUpgradedFromChat(chatId));
+        }
+
+        public bool IsUpgradedFromChat(long chatId)
+        {
+            return _upgradedFromChatId != 0 && chatId == _upgradedFromChatId;
+        }
+
+        // Whether a message of chatId can be in the history: the chat's own, or one of the group it
+        // was upgraded from.
+        private bool IsHistoryChat(long chatId)
+        {
+            return chatId == _chat?.Id || IsUpgradedFromChat(chatId);
+        }
+
+        // A topic or a thread never has migrated history.
+        public bool CanContinueIntoUpgradedFrom => Type == DialogType.History && TopicId == null && Thread == null && _chat?.Type is ChatTypeSupergroup { IsChannel: false };
+
+        private async Task<long> GetUpgradedFromChatIdAsync(Chat chat)
+        {
+            if (_upgradedFromResolved || chat.Type is not ChatTypeSupergroup supergroup)
+            {
+                return _upgradedFromChatId;
+            }
+
+            if (!ClientService.TryGetSupergroupFull(supergroup.SupergroupId, out SupergroupFullInfo fullInfo))
+            {
+                fullInfo = await ClientService.SendAsync(new GetSupergroupFullInfo(supergroup.SupergroupId)) as SupergroupFullInfo;
+            }
+
+            if (fullInfo == null)
+            {
+                return 0;
+            }
+
+            // Only the basic group is cached, not its chat.
+            if (fullInfo.UpgradedFromBasicGroupId != 0 && await ClientService.SendAsync(new CreateBasicGroupChat(fullInfo.UpgradedFromBasicGroupId, false)) is Chat upgradedFrom)
+            {
+                _upgradedFromChatId = upgradedFrom.Id;
+            }
+
+            _upgradedFromResolved = true;
+            return _upgradedFromChatId;
+        }
+
+        // Above the chat's oldest message, the upgraded-from group's newest; below that group's
+        // newest, the chat's oldest.
+        private async Task<MessageCollection> LoadAcrossUpgradeAsync(Chat chat, PanelScrollingDirection direction, MessageViewModel fromMessage)
+        {
+            if (direction == PanelScrollingDirection.Forward)
+            {
+                // From the chat's first message, server id 1.
+                var response = await ClientService.SendAsync(new GetChatHistory(chat.Id, 1L << 20, -Constants.HistoryLimit + 1, Constants.HistoryLimit, false));
+                if (response is Messages messages)
+                {
+                    return new MessageCollection(this, Items.Keys, messages.MessagesValue, messages.MessagesValue.Empty(), Type);
+                }
+
+                return null;
+            }
+
+            var upgradedFromChatId = await GetUpgradedFromChatIdAsync(chat);
+            if (upgradedFromChatId != 0)
+            {
+                var fromMessageId = 0L;
+
+                // The first request for a history TDLib has not loaded yet usually answers with
+                // the last message alone, and here that is the upgrade marker, which the slice
+                // drops. An empty slice reads as the end of the history, so go on from it instead.
+                for (int i = 0; i < 3; i++)
+                {
+                    if (await ClientService.SendAsync(new GetChatHistory(upgradedFromChatId, fromMessageId, 0, Constants.HistoryLimit, false)) is not Messages messages)
+                    {
+                        return null;
+                    }
+
+                    if (messages.MessagesValue.Empty())
+                    {
+                        break;
+                    }
+
+                    var slice = new MessageCollection(this, Items.Keys, messages.MessagesValue, false, Type);
+                    if (slice.Count > 0)
+                    {
+                        return slice;
+                    }
+
+                    fromMessageId = messages.MessagesValue[^1].Id;
+                }
+            }
+
+            var header = await AddHeaderAsync(Vector<Message>.Empty, fromMessage?.Get());
+            return new MessageCollection(this, Items.Keys, header, true, Type);
+        }
+
+        protected static readonly Dictionary<MessageId, MessageContent> _contentOverrides = new();
+
+        protected readonly DialogMessageDelegate _messageDelegate;
+        protected readonly WeakReference _messageDelegateWeak;
+
+        protected readonly ILocationService _locationService;
+        protected readonly INotificationsService _notificationsService;
+        protected readonly IVoipService _voipService;
+        protected readonly INetworkService _networkService;
+        protected readonly IStorageService _storageService;
+        protected readonly ITranslateService _translateService;
+
+        public IStorageService StorageService => _storageService;
+
+        public ITranslateService TranslateService => _translateService;
+
+        public IVoipService VoipService => _voipService;
+
+        public DialogUnreadMessagesViewModel Mentions { get; }
+        public DialogUnreadMessagesViewModel Reactions { get; }
+        public DialogUnreadMessagesViewModel PollVotes { get; }
+
+        public DialogPinnedMessagesViewModel PinnedMessages { get; }
+
+        public IDialogDelegate Delegate { get; set; }
+
+        public DialogMessageDelegate MessageDelegate => _messageDelegate;
+
+        public DialogViewModel(IClientService clientService, ISettingsService settingsService, IEventAggregator aggregator, ILocationService locationService, INotificationsService pushService, IVoipService voipService, INetworkService networkService, IStorageService storageService, ITranslateService translateService)
+            : base(clientService, settingsService, aggregator)
+        {
+            _locationService = locationService;
+            _notificationsService = pushService;
+            _voipService = voipService;
+            _networkService = networkService;
+            _storageService = storageService;
+            _translateService = translateService;
+
+            _messageDelegate = new DialogMessageDelegate(this);
+            _messageDelegateWeak = new WeakReference(_messageDelegate);
+
+            Mentions = new DialogUnreadMessagesViewModel(this, new SearchMessagesFilterUnreadMention());
+            Reactions = new DialogUnreadMessagesViewModel(this, new SearchMessagesFilterUnreadReaction());
+            PollVotes = new DialogUnreadMessagesViewModel(this, new SearchMessagesFilterUnreadPollVote());
+
+            PinnedMessages = new DialogPinnedMessagesViewModel(this);
+
+            Items = new MessageCollection(this);
+
+            _count++;
+            System.Diagnostics.Debug.WriteLine("Creating DialogViewModel {0}", _count);
+        }
+
+        private static volatile int _count;
+
+        ~DialogViewModel()
+        {
+            System.Diagnostics.Debug.WriteLine("Finalizing DialogViewModel {0}", _count);
+            _count--;
+        }
+
+        public void Dispose()
+        {
+            System.Diagnostics.Debug.WriteLine("Disposing DialogViewModel");
+            _groupedMessages.Clear();
+        }
+
+        public Action<Sticker> Sticker_Click;
+
+        public bool IsSavedMessagesTab { get; set; }
+
+        public bool IsSavedPollsTab { get; set; }
+
+        protected Chat _linkedChat;
+        public Chat LinkedChat
+        {
+            get => _linkedChat;
+            set => Set(ref _linkedChat, value);
+        }
+
+        public override MessageTopic TopicId { get; set; }
+
+        public override MessageTopic OutgoingTopicId
+        {
+            get
+            {
+                if (DirectMessagesChatTopic != null)
+                {
+                    return new MessageTopicDirectMessages(DirectMessagesChatTopic.Id);
+                }
+                else if (ForumTopic != null)
+                {
+                    return new MessageTopicForum(ForumTopic.Info.ForumTopicId);
+                }
+                else if (Thread != null)
+                {
+                    return new MessageTopicThread(Thread.MessageThreadId);
+                }
+                else if (IsForum && _chat.LastMessage != null && _chat.LastMessage.TopicId is MessageTopicForum topicForum)
+                {
+                    //if (topicForum.ForumTopicId != ForumTopicService.GeneralId)
+                    //{
+                    //    return _chat.LastMessage.MessageThreadId;
+                    //}
+
+                    return topicForum;
+                }
+
+                return null;
+            }
+        }
+
+        protected MessageThreadInfo _thread;
+        public MessageThreadInfo Thread
+        {
+            get => _thread;
+            set => Set(ref _thread, value);
+        }
+
+        protected ForumTopic _forumTopic;
+        public ForumTopic ForumTopic
+        {
+            get => _forumTopic;
+            set => Set(ref _forumTopic, value);
+        }
+
+        protected SavedMessagesTopic _savedMessagesTopic;
+        public SavedMessagesTopic SavedMessagesTopic
+        {
+            get => _savedMessagesTopic;
+            set => Set(ref _savedMessagesTopic, value);
+        }
+
+        protected DirectMessagesChatTopic _directMessagesChatTopic;
+        public DirectMessagesChatTopic DirectMessagesChatTopic
+        {
+            get => _directMessagesChatTopic;
+            set => Set(ref _directMessagesChatTopic, value);
+        }
+
+        protected QuickReplyShortcut _quickReplyShortcut;
+        public QuickReplyShortcut QuickReplyShortcut
+        {
+            get => _quickReplyShortcut;
+            set => Set(ref _quickReplyShortcut, value);
+        }
+
+        public long SavedMessagesTopicId => SavedMessagesTopic?.Id ?? 0;
+
+        public long ChatId => Chat?.Id ?? 0;
+
+        public bool IsForum { get; private set; }
+
+        public bool IsDirectMessagesGroup { get; private set; }
+
+        public bool HasProtectedContent => Chat?.Type is ChatTypeSecret || (Chat?.HasProtectedContent ?? false);
+
+        protected Chat _chat;
+        public override Chat Chat
+        {
+            get => _chat;
+            set => Set(ref _chat, value);
+        }
+
+        private DialogType _type => Type;
+        public virtual DialogType Type { get; private set; } = DialogType.History;
+
+        private DispatcherTimer _lastSeenTimer;
+
+        private string _lastSeen;
+        public string LastSeen
+        {
+            get
+            {
+                if (Type == DialogType.History)
+                {
+                    return IsDirectMessagesGroup ? Strings.ChatMessageSuggestions : _lastSeen;
+                }
+                else if (Type == DialogType.Thread)
+                {
+                    if (SavedMessagesTopic != null)
+                    {
+                        return Strings.SavedMessagesTab;
+                    }
+                }
+                else if (Type == DialogType.EventLog)
+                {
+                    return Strings.EventLog;
+                }
+                else if (Type == DialogType.Pinned)
+                {
+                    if (MessagesCount > 0)
+                    {
+                        return Locale.Declension(Strings.R.PinnedMessagesCount, MessagesCount);
+                    }
+
+                    return Strings.PinnedMessages;
+                }
+
+                return _lastSeen;
+            }
+            set
+            {
+                Set(ref _lastSeen, value);
+                RaisePropertyChanged(nameof(Subtitle));
+            }
+        }
+
+        public void UpdateLastSeen(string value)
+        {
+            _lastSeenTimer?.Stop();
+            LastSeen = value;
+        }
+
+        public void UpdateLastSeen(User user)
+        {
+            var interval = LastSeenConverter.OnlinePhraseChange(user.Status, DateTime.Now);
+            if (interval > 0 && _lastSeenTimer == null)
+            {
+                _lastSeenTimer ??= new DispatcherTimer();
+                _lastSeenTimer.Tick += LastSeenTimer_Tick;
+            }
+
+            _lastSeenTimer?.Stop();
+
+            if (interval > 0)
+            {
+                _lastSeenTimer.Interval = TimeSpan.FromSeconds(interval);
+                _lastSeenTimer.Start();
+            }
+
+            LastSeen = LastSeenConverter.GetLabel(user, true, true);
+        }
+
+        private void LastSeenTimer_Tick(object sender, object e)
+        {
+            if (ClientService.TryGetUser(Chat, out User user))
+            {
+                UpdateLastSeen(user);
+            }
+        }
+
+        private string _onlineCount;
+        public string OnlineCount
+        {
+            get => _onlineCount;
+            set
+            {
+                Set(ref _onlineCount, value);
+                RaisePropertyChanged(nameof(Subtitle));
+            }
+        }
+
+        private int _messagesCount;
+        public int MessagesCount
+        {
+            get => _messagesCount;
+            set => Set(ref _messagesCount, value);
+        }
+
+        public virtual string Subtitle
+        {
+            get
+            {
+                var chat = _chat;
+                if (chat == null)
+                {
+                    return null;
+                }
+
+                if (chat.Type is ChatTypePrivate or ChatTypeSecret)
+                {
+                    return LastSeen;
+                }
+
+                if (ForumTopic == null && !string.IsNullOrEmpty(OnlineCount) && !string.IsNullOrEmpty(LastSeen))
+                {
+                    return string.Format("{0}, {1}", LastSeen, OnlineCount);
+                }
+
+                return LastSeen;
+            }
+        }
+
+        private ChatSearchViewModel _search;
+        public ChatSearchViewModel Search
+        {
+            get => _search;
+            set => Set(ref _search, value);
+        }
+
+        public void DisposeSearch()
+        {
+            var search = _search;
+            if (search != null)
+            {
+                search.Dispose();
+                UpdateQuery(string.Empty);
+            }
+
+            Search = null;
+        }
+
+        private string _accessToken;
+        public string AccessToken
+        {
+            get => _accessToken;
+            set
+            {
+                Set(ref _accessToken, value);
+                RaisePropertyChanged(nameof(HasAccessToken));
+            }
+        }
+
+        public bool HasAccessToken
+        {
+            get
+            {
+                return (_accessToken != null || _isEmpty) && !_loadingSlice;
+            }
+        }
+
+        private bool _restrictsNewChats;
+        public bool RestrictsNewChats
+        {
+            get => _restrictsNewChats;
+            set => Set(ref _restrictsNewChats, value);
+        }
+
+        private DispatcherTimer _informativeTimer;
+
+        private OutputChatActionManager _chatActionManager;
+        public OutputChatActionManager ChatActionManager
+        {
+            get
+            {
+                return _chatActionManager ??= new OutputChatActionManager(ClientService, _chat, OutgoingTopicId);
+            }
+        }
+
+        private bool _needsUpdateSpeechRecognitionTrial;
+
+        private Td.Api.Chats _groupsInCommon;
+        public Td.Api.Chats GroupsInCommon
+        {
+            get => _groupsInCommon;
+            set => Set(ref _groupsInCommon, value);
+        }
+
+        private SponsoredMessage _sponsoredMessage;
+        public SponsoredMessage SponsoredMessage
+        {
+            get => _sponsoredMessage;
+            set => Set(ref _sponsoredMessage, value);
+        }
+
+        private SponsoredMessage _pendingSponsoredMessage;
+        public SponsoredMessage PendingSponsoredMessage
+        {
+            get => _pendingSponsoredMessage;
+            set => Set(ref _pendingSponsoredMessage, value);
+        }
+
+        private SavedMessagesTags _savedMessagesTags;
+        public SavedMessagesTags SavedMessagesTags
+        {
+            get => _savedMessagesTags;
+            set => Set(ref _savedMessagesTags, value);
+        }
+
+        public void UpdateSavedMessagesTag(ReactionType tag, bool filterByTag, ReactionType lastTag)
+        {
+            bool TryGetLastVisibleMessageIdAndPixel(out long lastVisibleId, out double? lastVisiblePixel)
+            {
+                lastVisibleId = 0;
+                lastVisiblePixel = null;
+
+                var field = HistoryField;
+                if (field != null && !field.IsSuspended && TryGetLastVisibleMessageId(out lastVisibleId, out int lastVisibleIndex))
+                {
+                    if (lastVisibleId != 0)
+                    {
+                        var message = Items[lastVisibleIndex];
+                        if (message.InteractionInfo?.Reactions != null && message.InteractionInfo.Reactions.IsChosen(lastTag))
+                        {
+                            var container = field.ContainerFromIndex(lastVisibleIndex) as SelectorItem;
+                            if (container != null)
+                            {
+                                var transform = container.TransformToVisual(field);
+                                var position = transform.TransformPoint(new Point());
+
+                                lastVisiblePixel = field.ActualHeight - (position.Y + container.ActualHeight);
+                            }
+
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
+            }
+
+            if (lastTag != null && TryGetLastVisibleMessageIdAndPixel(out long lastVisibleId, out double? lastVisiblePixel))
+            {
+                _ = LoadMessageSliceAsync(null, lastVisibleId, VerticalAlignment.Bottom, lastVisiblePixel, onlyRemote: true);
+            }
+            else
+            {
+                _ = LoadMessageSliceAsync(null, long.MaxValue, VerticalAlignment.Bottom, onlyRemote: true);
+            }
+
+            if (_chat is Chat chat && chat.Type is ChatTypePrivate privata)
+            {
+                var item = ClientService.GetUser(privata.UserId);
+                var cache = ClientService.GetUserFull(privata.UserId);
+
+                if (cache != null)
+                {
+                    Delegate?.UpdateUser(chat, item, cache, false, false);
+                }
+                else
+                {
+                    ClientService.Send(new GetUserFullInfo(privata.UserId));
+                }
+            }
+
+            if (filterByTag is false && tag != null)
+            {
+                Search?.Search(Search.Query, null, tag, null);
+            }
+        }
+
+        public int UnreadCount
+        {
+            get
+            {
+                if (Type != DialogType.History || IsDirectMessagesGroup)
+                {
+                    return _forumTopic?.UnreadCount ?? 0;
+                }
+
+                return _chat?.UnreadCount ?? 0;
+            }
+        }
+
+        private bool _isSelectionEnabled;
+        public bool IsSelectionEnabled
+        {
+            get => _isSelectionEnabled;
+            set => ShowHideSelection(value);
+        }
+
+        public void ShowHideSelection(bool value, ReportChatSelection report = null)
+        {
+            if (_isSelectionEnabled != value)
+            {
+                Set(ref _isReportingMessages, report, nameof(IsReportingMessages));
+                Set(ref _isSelectionEnabled, value, nameof(IsSelectionEnabled));
+
+                if (value)
+                {
+                    DisposeSearch();
+                }
+                else
+                {
+                    SelectedItems.Clear();
+                }
+            }
+        }
+
+        public IFormattedTextInput TextField { get; set; }
+        public ChatHistoryView HistoryField { get; set; }
+
+        public void SetText(FormattedText text, bool focus = false)
+        {
+            if (text == null)
+            {
+                SetText(null, null, focus);
+            }
+            else
+            {
+                SetText(text.Text, text.Entities, focus);
+            }
+        }
+
+        public void SetText(string text, Vector<TextEntity> entities = null, bool focus = false)
+        {
+            var field = TextField;
+            if (field == null)
+            {
+                return;
+            }
+
+            var chat = Chat;
+            if (chat != null && chat.Type is ChatTypeSupergroup super && super.IsChannel && !string.IsNullOrEmpty(text))
+            {
+                var supergroup = ClientService.GetSupergroup(super.SupergroupId);
+                if (supergroup != null && !supergroup.CanPostMessages())
+                {
+                    return;
+                }
+            }
+
+            if (string.IsNullOrEmpty(text))
+            {
+                field.SetText(null);
+            }
+            else
+            {
+                field.SetText(new FormattedText(text, entities));
+            }
+
+            if (focus)
+            {
+                field.FocusInput(FocusState.Keyboard);
+            }
+        }
+
+        public void SetFollowingEnd(bool value)
+        {
+            HistoryField?.SetFollowingEnd(value);
+        }
+
+        public override FormattedText GetFormattedText(bool clear = false, bool parseMarkdown = true)
+        {
+            try
+            {
+                var field = TextField;
+                if (field == null)
+                {
+                    return string.Empty.AsFormattedText();
+                }
+
+                return field.GetFormattedText(clear, parseMarkdown);
+            }
+            catch
+            {
+                return string.Empty.AsFormattedText();
+            }
+        }
+
+        public bool IsEndReached()
+        {
+            return IsEndReached(Items);
+        }
+
+        public bool IsEndReached(IList<MessageViewModel> messages)
+        {
+            var lastMessage = _savedMessagesTopic?.LastMessage ?? _forumTopic?.LastMessage ?? _chat?.LastMessage;
+            if (lastMessage == null)
+            {
+                return messages.Empty();
+            }
+
+            var last = messages.LastOrDefault();
+            if (last?.Content is MessageAlbum album)
+            {
+                last = album.Messages.LastOrDefault();
+            }
+
+            if (last == null || last.Id == 0)
+            {
+                return true;
+            }
+
+            return lastMessage.Id == last.Id && lastMessage.ChatId == last.ChatId;
+        }
+
+        private bool _isChatEmpty;
+
+        private Sticker _greetingSticker;
+        public Sticker GreetingSticker
+        {
+            get => _greetingSticker;
+            set => Set(ref _greetingSticker, value);
+        }
+
+        public bool HasMoreItemsAtTop => IsSavedMessagesTab ? IsNewestSliceLoaded != true : IsOldestSliceLoaded != true;
+
+        private bool? _isNewestSliceLoaded;
+        public bool? IsNewestSliceLoaded
+        {
+            get => _isNewestSliceLoaded;
+            set => Set(ref _isNewestSliceLoaded, value);
+        }
+
+        public bool HasMoreItemsAtBottom => IsSavedMessagesTab ? IsOldestSliceLoaded != true : IsNewestSliceLoaded != true;
+
+        private bool? _isOldestSliceLoaded;
+        public bool? IsOldestSliceLoaded
+        {
+            get => _isOldestSliceLoaded;
+            set => Set(ref _isOldestSliceLoaded, value);
+        }
+
+        public bool HasUnreadMessages { get; private set; }
+
+        private bool _isEmpty = true;
+        public bool IsEmpty
+        {
+            get => _isEmpty && !_loadingSlice;
+            set
+            {
+                Set(ref _isEmpty, value);
+                RaisePropertyChanged(nameof(HasAccessToken));
+            }
+        }
+
+        public override bool IsLoading
+        {
+            get => _loadingSlice;
+            set
+            {
+                base.IsLoading = value;
+                RaisePropertyChanged(nameof(IsEmpty));
+                RaisePropertyChanged(nameof(HasAccessToken));
+            }
+        }
+
+        protected bool _loadingSlice;
+
+        protected Stack<long> _repliesStack = new();
+
+        public Stack<long> RepliesStack => _repliesStack;
+
+        private const int HistoryWindow = 200;
+
+        /// <summary>
+        /// Trims the end opposite to <paramref name="direction"/> back to the window, leaving
+        /// <paramref name="room"/> for what is about to be added at the growing end.
+        /// </summary>
+        /// <remarks>
+        /// The history is a window into the chat, not the chat: every path that grows one end owes
+        /// the other a trim, or a session that never scrolls up never stops growing. The removal
+        /// and whatever grows the list must agree on the anchor when they share a layout pass —
+        /// they do while the list follows the end, and not otherwise, which is why a slice load
+        /// trims before its request rather than after it.
+        /// </remarks>
+        private void TrimHistory(PanelScrollingDirection direction, int room = 0)
+        {
+            if (Items.Count + room <= HistoryWindow)
+            {
+                return;
+            }
+
+            Logger.Info($"{direction}, removing {Items.Count + room - HistoryWindow} of {Items.Count}");
+
+            if (direction == PanelScrollingDirection.Backward)
+            {
+                IsNewestSliceLoaded = false;
+            }
+            else
+            {
+                IsOldestSliceLoaded = false;
+            }
+
+            while (Items.Count + room > HistoryWindow)
+            {
+                Items.RemoveAt(direction == PanelScrollingDirection.Backward ? Items.Count - 1 : 0);
+            }
+
+            CheckPendingMessages("a trim");
+        }
+
+        /// <summary>
+        /// Trims the oldest end once a message has joined the newest one.
+        /// </summary>
+        /// <remarks>
+        /// Only while the list follows the end, where the removal and the insert share a layout
+        /// pass and want the same anchor; anywhere else they want opposite ones, and the growth is
+        /// bounded by how long the user reads before coming back to the end. Scheduled messages are
+        /// the whole list rather than a window into one, and nothing would load a trimmed one back.
+        /// </remarks>
+        private void TrimHistoryAfterInsert()
+        {
+            if (Type != DialogType.ScheduledMessages && HistoryField?.IsFollowingEnd is true)
+            {
+                TrimHistory(PanelScrollingDirection.Forward);
+            }
+        }
+
+        public virtual async Task LoadNextSliceAsync(PanelScrollingDirection direction)
+        {
+            // Backward => Going to top, to the past
+            // Forward => Going to bottom, to the present
+
+            if (IsSavedMessagesTab)
+            {
+                direction = direction == PanelScrollingDirection.Forward
+                    ? PanelScrollingDirection.Backward
+                    : PanelScrollingDirection.Forward;
+            }
+
+            if (Type is not DialogType.History and not DialogType.Thread and not DialogType.Pinned)
+            {
+                return;
+            }
+
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (_loadingSlice || _chat?.Id != chat.Id || Items.Count < 1)
+            {
+                return;
+            }
+
+            if (direction == PanelScrollingDirection.Backward && IsOldestSliceLoaded == true)
+            {
+                return;
+            }
+
+            _loadingSlice = true;
+            IsLoading = true;
+
+            Logger.Info($"{direction}, items: {Items.Count}, following: {HistoryField?.IsFollowingEnd}");
+
+            MessageViewModel fromMessage;
+            MessageViewModel anchor;
+            int offset;
+
+            if (direction == PanelScrollingDirection.Backward)
+            {
+                fromMessage = Items.Count > 0 ? Items[0] : null;
+                anchor = Items.First;
+                offset = 0;
+            }
+            else
+            {
+                fromMessage = null;
+                anchor = Items.Last;
+                offset = -Constants.HistoryLimit;
+            }
+
+            if (anchor == null)
+            {
+                _loadingSlice = false;
+                IsLoading = false;
+
+                return;
+            }
+
+            var fromMessageId = anchor.Id;
+
+            // Trimmed here rather than once the slice has landed, because the two touch opposite
+            // ends of the list: applied in one run of mutations they reach the panel with no layout
+            // between them, and a single anchor cannot both absorb the prepend and leave the
+            // removal alone. The request is what separates them.
+            TrimHistory(direction, Constants.HistoryLimit);
+
+            Function func;
+            if (Type == DialogType.Pinned)
+            {
+                func = new SearchChatMessages(chat.Id, TopicId, string.Empty, null, fromMessageId, offset, Constants.HistoryLimit, new SearchMessagesFilterPinned());
+            }
+            else if (IsSavedPollsTab)
+            {
+                func = new SearchChatMessages(chat.Id, TopicId, string.Empty, null, fromMessageId, offset, Constants.HistoryLimit, new SearchMessagesFilterPoll());
+            }
+            else if (Search?.SavedMessagesTag != null)
+            {
+                func = new SearchSavedMessages(SavedMessagesTopicId, Search.SavedMessagesTag, string.Empty, fromMessageId, offset, Constants.HistoryLimit);
+            }
+            else if (SavedMessagesTopic != null)
+            {
+                func = new GetSavedMessagesTopicHistory(SavedMessagesTopic.Id, fromMessageId, offset, Constants.HistoryLimit);
+            }
+            else if (DirectMessagesChatTopic != null)
+            {
+                func = new GetDirectMessagesChatTopicHistory(chat.Id, DirectMessagesChatTopic.Id, fromMessageId, offset, Constants.HistoryLimit);
+            }
+            else if (ForumTopic != null)
+            {
+                func = new GetForumTopicHistory(chat.Id, _forumTopic.Info.ForumTopicId, fromMessageId, offset, Constants.HistoryLimit);
+            }
+            else if (Thread != null)
+            {
+                func = new GetMessageThreadHistory(chat.Id, _thread.MessageThreadId, fromMessageId, offset, Constants.HistoryLimit);
+            }
+            else
+            {
+                func = new GetChatHistory(anchor.ChatId, fromMessageId, offset, Constants.HistoryLimit, false);
+            }
+
+            // Past the chat's oldest message the history may go on in the group it was upgraded
+            // from, so the header waits until that is known not to be the case.
+            var crossesUpgrade = CanContinueIntoUpgradedFrom && (direction == PanelScrollingDirection.Backward) != anchor.IsUpgradedFrom;
+
+            var tsc = new TaskCompletionSource<MessageCollection>();
+            async void handler(Object result)
+            {
+                if (result is FoundChatMessages foundChatMessages)
+                {
+                    result = await PreloadAlbumsAsync(chat.Id, foundChatMessages);
+                }
+
+                if (result is Messages messages)
+                {
+                    if (messages.MessagesValue.Count > 0 && messages.MessagesValue[^1].Content is MessageForumTopicCreated)
+                    {
+                        messages.MessagesValue = new Vector<Message>(messages.MessagesValue.AsSpan()[..^1]);
+                    }
+
+                    var endReached = messages.MessagesValue.Empty();
+                    if (endReached && direction == PanelScrollingDirection.Backward && !crossesUpgrade)
+                    {
+                        messages.MessagesValue = await AddHeaderAsync(messages.MessagesValue, fromMessage?.Get());
+                    }
+
+                    tsc.SetResult(new MessageCollection(this, Items.Keys, messages.MessagesValue, endReached, Type));
+                }
+                else
+                {
+                    tsc.SetResult(null);
+                }
+            }
+
+            ClientService.Send(func, handler);
+
+            var response = await tsc.Task;
+            if (response is { Count: 0 } && crossesUpgrade)
+            {
+                response = await LoadAcrossUpgradeAsync(chat, direction, fromMessage) ?? response;
+            }
+
+            if (response is MessageCollection replied)
+            {
+                if (replied.Count > 0)
+                {
+                    ProcessMessages(chat, replied);
+
+                    // Before the slice reaches the list rather than after: a slice joining at the
+                    // bottom of the panel must not be followed into, and the panel elects what it
+                    // tracks on the first change of a run.
+                    HistoryField?.PrepareSlice(direction);
+
+                    if (direction == PanelScrollingDirection.Backward)
+                    {
+                        Items.PrependSlice(replied, true, out bool empty);
+                    }
+                    else
+                    {
+                        Items.AppendSlice(replied, true, out bool empty);
+                    }
+                }
+
+                if (direction == PanelScrollingDirection.Backward)
+                {
+                    IsOldestSliceLoaded = replied.IsEndReached;
+                    UpdateDetectedLanguage();
+                }
+                else
+                {
+                    IsNewestSliceLoaded = replied.IsEndReached || IsEndReached();
+
+                    // The list only follows the end once the newest slice is loaded, and this is
+                    // the one path that makes that true without the view having moved since it
+                    // was last sampled, so nothing else would ask the question again.
+                    HistoryField?.UpdateFollowingEnd();
+                }
+            }
+
+            _loadingSlice = false;
+            IsLoading = false;
+            MessagesLoaded?.Invoke(this, new MessagesLoadedEventArgs(direction));
+
+            // Pinned messages are the chat's own, and an upgraded-from id would name the wrong one.
+            if (!anchor.IsUpgradedFrom)
+            {
+                PinnedMessages.LoadSlice(fromMessageId, direction);
+            }
+        }
+
+        protected async Task<Vector<Message>> AddHeaderAsync(Vector<Message> messages, Message previous)
+        {
+            if (previous != null && (previous.Content is MessageHeaderDate || (previous.Content is MessageText && previous.Id == 0)))
+            {
+                return messages;
+            }
+
+            var chat = _chat;
+            if (chat == null || Type != DialogType.History)
+            {
+                goto AddDate;
+            }
+
+            var user = ClientService.GetUser(chat);
+            if (user?.Type is not UserTypeBot)
+            {
+                if (user != null && chat.ActionBar is ChatActionBarReportAddBlock reportAddBlock && reportAddBlock.AccountInfo != null)
+                {
+                    var fullInfo = ClientService.GetUserFull(user.Id);
+                    fullInfo ??= await ClientService.SendAsync(new GetUserFullInfo(user.Id)) as UserFullInfo;
+
+                    return messages.With(new Message(0, new MessageSenderUser(user.Id), null, chat.Id, null, null, false, false, false, false, false, false, false, false, false, false, 0, 0, null, null, null, null, null, null, null, null, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageHeaderAccountInfo(), null, null));
+                }
+
+                goto AddDate;
+            }
+
+            if (chat.Id == ClientService.Options.VerificationCodesBotChatId)
+            {
+                var entities = ClientEx.GetTextEntities(Strings.VerifyChatInfo);
+                var text = new FormattedText(Strings.VerifyChatInfo, entities);
+
+                var content = new MessageText(text, null, null);
+
+                return messages.With(new Message(0, new MessageSenderUser(user.Id), null, chat.Id, null, null, false, false, false, false, false, false, false, false, false, false, 0, 0, null, null, null, null, null, null, null, null, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, content, null, null));
+            }
+            else
+            {
+                MessageContent content = null;
+                if (chat.Id == ClientService.Options.RepliesBotChatId)
+                {
+                    content = new MessageText(Strings.RepliesChatInfo.AsFormattedText(), null, null);
+                }
+                else if (chat.Id == ClientService.Options.VerificationCodesBotChatId)
+                {
+                    content = new MessageText(Strings.VerifyChatInfo.AsFormattedText(), null, null);
+                }
+                else
+                {
+                    var fullInfo = ClientService.GetUserFull(user.Id);
+                    fullInfo ??= await ClientService.SendAsync(new GetUserFullInfo(user.Id)) as UserFullInfo;
+
+                    if (fullInfo?.BotInfo?.Description.Length > 0)
+                    {
+                        var builder = new FormattedTextBuilder($"{Strings.BotInfoTitle}\n{fullInfo.BotInfo.Description}");
+                        builder.AddEntity(0, Strings.BotInfoTitle.Length, new TextEntityTypeBold());
+
+                        foreach (var entity in ClientEx.GetTextEntities(fullInfo.BotInfo.Description))
+                        {
+                            builder.AddEntity(entity.Offset + Strings.BotInfoTitle.Length + 1, entity.Length, entity.Type);
+                        }
+
+                        var text = builder.ToFormattedText();
+
+                        if (fullInfo.BotInfo.Animation != null)
+                        {
+                            content = new MessageAnimation(fullInfo.BotInfo.Animation, text, false, false, false);
+                        }
+                        else if (fullInfo.BotInfo.Photo != null)
+                        {
+                            content = new MessagePhoto(fullInfo.BotInfo.Photo, null, text, false, false, false);
+                        }
+                        else
+                        {
+                            content = new MessageText(text, null, null);
+                        }
+                    }
+                }
+
+                if (content != null)
+                {
+                    return messages.With(new Message(0, new MessageSenderUser(user.Id), null, chat.Id, null, null, false, false, false, false, false, false, false, false, false, false, 0, 0, null, null, null, null, null, null, null, null, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, content, null, null));
+                }
+            }
+
+        AddDate:
+            if (_forumTopic == null && _thread != null)
+            {
+                var mutable = messages.ToMutableVector();
+
+                var replied = _thread.Messages.OrderBy(x => x.Id).ToList();
+                var empty = previous == null;
+
+                previous = replied[0];
+
+                if (empty)
+                {
+                    mutable.Add(new Message(0, previous.SenderId, null, previous.ChatId, null, null, previous.IsOutgoing, false, false, false, false, previous.IsChannelPost, false, false, false, false, previous.Date, 0, null, null, null, null, null, null, null, previous.TopicId, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageCustomServiceAction(Strings.NoComments), null, null));
+                }
+                else
+                {
+                    mutable.Add(new Message(0, previous.SenderId, null, previous.ChatId, null, null, previous.IsOutgoing, false, false, false, false, previous.IsChannelPost, false, false, false, false, previous.Date, 0, null, null, null, null, null, null, null, previous.TopicId, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageCustomServiceAction(Strings.DiscussionStarted), null, null));
+                }
+
+                for (int i = replied.Count - 1; i >= 0; i--)
+                {
+                    mutable.Add(replied[i]);
+                }
+
+                messages = mutable;
+            }
+
+            if (previous != null && !IsSavedMessagesTab)
+            {
+                messages = messages.With(new Message(0, previous.SenderId, null, previous.ChatId, null, null, previous.IsOutgoing, false, false, false, false, previous.IsChannelPost, false, false, false, false, previous.Date, 0, null, null, null, null, null, null, null, previous.TopicId, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageHeaderDate(previous.Date), null, null));
+            }
+
+            return messages;
+        }
+
+        public async void PreviousSlice()
+        {
+            if (Type is DialogType.ScheduledMessages or DialogType.EventLog)
+            {
+                ScrollToBottom();
+            }
+            else if (_repliesStack.Count > 0)
+            {
+                await LoadMessageSliceAsync(null, _repliesStack.Pop());
+            }
+            else
+            {
+                await LoadLastSliceAsync();
+            }
+
+            TextField?.FocusInput(FocusState.Programmatic);
+        }
+
+        public Task LoadLastSliceAsync()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return Task.CompletedTask;
+            }
+
+            PinnedMessages.SetLocked(0);
+
+            var details = GetCurrentDetails();
+
+            if (TryGetLastVisibleMessageId(out long lastVisibleId, out int lastVisibleIndex))
+            {
+                // Find first valid non-visible message
+                var firstNonVisibleId = lastVisibleId;
+
+                for (int i = lastVisibleIndex + 1; i < Items.Count; i++)
+                {
+                    var message = Items[i];
+                    if (!message.IsSynthetic)
+                    {
+                        firstNonVisibleId = message.Id;
+                        break;
+                    }
+                }
+
+                if (firstNonVisibleId != 0 && firstNonVisibleId < details.LastReadInboxMessageId)
+                {
+                    return LoadMessageSliceAsync(null, details.LastReadInboxMessageId, VerticalAlignment.Top, disableAnimation: false);
+                }
+            }
+
+            return LoadMessageSliceAsync(null, details.LastMessageId, VerticalAlignment.Bottom, disableAnimation: false);
+        }
+
+        private bool TryGetLastVisibleMessageId(out long id, out int index)
+        {
+            var field = HistoryField;
+            if (field != null)
+            {
+                var panel = field.ItemsPanelRoot as ItemsStackPanel;
+                if (panel != null && panel.LastVisibleIndex >= 0 && panel.LastVisibleIndex < Items.Count && Items.Count > 0)
+                {
+                    // The chat's own messages only: these ids are compared with and stored next to
+                    // the chat's, where an upgraded-from one would name a different message.
+                    for (int i = panel.LastVisibleIndex; i >= panel.FirstVisibleIndex; i--)
+                    {
+                        var item = Items[i];
+                        if (!item.IsSynthetic && !item.IsUpgradedFrom)
+                        {
+                            if (item.Content is MessageAlbum album)
+                            {
+                                item = album.Messages.LastOrDefault();
+                            }
+
+                            id = item.Id;
+                            index = i;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            id = -1;
+            index = -1;
+            return false;
+        }
+
+        private bool TryGetFirstVisibleMessageId(out long id)
+        {
+            var field = HistoryField;
+            if (field != null)
+            {
+                var panel = field.ItemsPanelRoot as ItemsStackPanel;
+                if (panel != null && panel.FirstVisibleIndex >= 0 && panel.FirstVisibleIndex < Items.Count && Items.Count > 0)
+                {
+                    for (int i = panel.FirstVisibleIndex; i <= panel.LastVisibleIndex; i++)
+                    {
+                        var item = Items[i];
+                        if (item.Id == 0 || item.IsUpgradedFrom)
+                        {
+                            continue;
+                        }
+
+                        if (item.Content is MessageAlbum album)
+                        {
+                            item = album.Messages.FirstOrDefault();
+                        }
+
+                        id = item.Id;
+                        return true;
+                    }
+                }
+            }
+
+            id = -1;
+            return false;
+        }
+
+        // This is to notify the view to update bindings
+        public event EventHandler Initialized;
+
+        public event EventHandler<MessagesLoadedEventArgs> MessagesLoaded;
+
+        protected void NotifyInitialized()
+        {
+            Initialized?.Invoke(this, EventArgs.Empty);
+            Initialized = null;
+        }
+
+        public async Task LoadMessageSliceAsync(long? previousId, long fromMessageId, VerticalAlignment alignment = VerticalAlignment.Center, double? pixel = null, ScrollIntoViewAlignment? direction = null, bool? disableAnimation = null, TextQuote highlight = null, int checklistTaskId = 0, string pollOptionId = "", int fromDateOffset = 0, bool onlyRemote = false)
+        {
+            if (Type is not DialogType.History and not DialogType.Thread and not DialogType.Pinned)
+            {
+                NotifyInitialized();
+                return;
+            }
+            else if (Type is DialogType.Thread)
+            {
+                NotifyInitialized();
+            }
+
+            var chat = _chat;
+            if (chat == null)
+            {
+                NotifyInitialized();
+                return;
+            }
+
+            long firstVisibleId = 0;
+            long lastVisibleId = 0;
+            if (direction == null && TryGetFirstVisibleMessageId(out firstVisibleId) && TryGetLastVisibleMessageId(out lastVisibleId, out _))
+            {
+                direction = firstVisibleId < fromMessageId ? ScrollIntoViewAlignment.Default : ScrollIntoViewAlignment.Leading;
+            }
+
+            if (alignment == VerticalAlignment.Bottom && pixel == null)
+            {
+                pixel = int.MaxValue;
+            }
+
+            if (onlyRemote is false && Items.TryGetValue(GetKey(chat.Id, fromMessageId), out MessageViewModel already))
+            {
+                if (alignment == VerticalAlignment.Center && false)
+                {
+                    var index = Items.IndexOf(already);
+                    if (index < 25 && IsOldestSliceLoaded is not true)
+                    {
+                        await LoadNextSliceAsync(PanelScrollingDirection.Backward);
+                    }
+                    else if (Items.Count - index < 25 && IsNewestSliceLoaded is not true)
+                    {
+                        await LoadNextSliceAsync(PanelScrollingDirection.Forward);
+                    }
+                }
+                else if (alignment == VerticalAlignment.Top && !onlyRemote)
+                {
+                    var details = GetCurrentDetails();
+
+                    // If we're loading the last message and it has been read already
+                    // then we want to align it at bottom, as it might be taller than the window height
+                    if (fromMessageId == details.LastMessageId)
+                    {
+                        alignment = VerticalAlignment.Bottom;
+                        pixel = null;
+                    }
+                }
+
+                HistoryField?.ScrollToItem(already, alignment, alignment == VerticalAlignment.Center ? new MessageBubbleHighlightOptions(fromMessageId, highlight, checklistTaskId, pollOptionId) : null, pixel, direction ?? ScrollIntoViewAlignment.Leading, disableAnimation);
+
+                if (previousId.HasValue && !_repliesStack.Contains(previousId.Value))
+                {
+                    _repliesStack.Push(previousId.Value);
+                }
+
+                NotifyInitialized();
+                return;
+            }
+
+            var loadMore = PanelScrollingDirection.None;
+
+            if (_loadingSlice || _chat?.Id != chat.Id)
+            {
+                NotifyInitialized();
+                return;
+            }
+
+            _loadingSlice = true;
+            IsOldestSliceLoaded = null;
+            IsNewestSliceLoaded = null;
+            IsLoading = true;
+
+            System.Diagnostics.Debug.WriteLine("DialogViewModel: LoadMessageSliceAsync");
+
+            var func = Task.Run(() => LoadMessageSliceImpl(chat, fromMessageId, fromDateOffset, alignment, direction, pixel));
+
+            if (alignment != VerticalAlignment.Center)
+            {
+                var wait = await Task.WhenAny(func, Task.Delay(200));
+                if (wait != func)
+                {
+                    NotifyInitialized();
+                }
+            }
+
+            var response = await func;
+            if (response is LoadSliceResult slice)
+            {
+                _groupedMessages.Clear();
+
+                fromMessageId = slice.FromMessageId;
+                pixel = slice.Pixel;
+                alignment = slice.Alignment;
+
+                SetFollowingEnd(slice.IsFollowingEnd);
+
+                var messages = slice.Items;
+                var endReached = IsEndReached(messages);
+
+                ProcessMessages(chat, messages);
+
+                if (IsSavedPollsTab && messages.Count > 0)
+                {
+                    var previous = messages[^1];
+                    messages.Add(CreateMessage(new Message(0, previous.SenderId, null, previous.ChatId, null, null, previous.IsOutgoing, false, false, false, false, previous.IsChannelPost, false, false, false, false, previous.Date, 0, null, null, null, null, null, null, null, previous.TopicId, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageHeaderDate(previous.Date), null, null)));
+                }
+                else if (endReached && messages.Count > 0)
+                {
+                    var previous = messages[^1];
+
+                    if (IsSavedMessagesTab)
+                    {
+                        messages.Add(CreateMessage(new Message(0, previous.SenderId, null, previous.ChatId, null, null, previous.IsOutgoing, false, false, false, false, previous.IsChannelPost, false, false, false, false, previous.Date, 0, null, null, null, null, null, null, null, previous.TopicId, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageHeaderDate(previous.Date), null, null)));
+                        messages.Add(CreateMessage(new Message(0, previous.SenderId, null, previous.ChatId, null, null, previous.IsOutgoing, false, false, false, false, previous.IsChannelPost, false, false, false, false, previous.Date, 0, null, null, null, null, null, null, null, previous.TopicId, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageCustomServiceAction(Strings.SavedMessagesProfileHint), null, null)));
+                    }
+                    else if (IsForum && ForumTopic == null && chat.Type is ChatTypePrivate privata && ClientService.TryGetUser(chat, out User user) && user.Type is UserTypeBot { AllowsUsersToCreateTopics: true })
+                    {
+                        var newThread = CreateMessage(new Message(long.MaxValue, new MessageSenderUser(privata.UserId), null, previous.ChatId, null, null, false, false, false, false, false, false, false, false, false, false, int.MaxValue, 0, null, null, null, null, null, null, null, null, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageHeaderNewThread(), null, null));
+                        newThread.IsSynthetic = true;
+
+                        messages.Add(newThread);
+                        fromMessageId = long.MaxValue;
+                    }
+                }
+
+                // The panel scrolls a reset it is tracking the end for to the last element
+                // (BeginTrackingOnRefresh), so a slice loaded around some other message has to say
+                // so before it lands.
+                if (!slice.IsFollowingEnd)
+                {
+                    HistoryField?.ReleaseAnchor();
+                }
+
+                Items.ReplaceSlice(messages);
+
+                CheckPendingMessages("a slice load");
+
+                MessagesCount = slice.TotalCount;
+                HasUnreadMessages = slice.IsUnread;
+
+                if (Type == DialogType.Pinned)
+                {
+                    RaisePropertyChanged(nameof(LastSeen));
+                }
+
+                NotifyInitialized();
+
+                IsOldestSliceLoaded = null;
+                IsNewestSliceLoaded = endReached;
+
+                if (Items.TryGetValue(GetKey(chat.Id, fromMessageId), out already))
+                {
+                    HistoryField?.ScrollToItem(already, alignment, alignment == VerticalAlignment.Center ? new MessageBubbleHighlightOptions(fromMessageId, highlight, checklistTaskId, pollOptionId) : null, pixel, direction ?? ScrollIntoViewAlignment.Leading, disableAnimation);
+
+                    if (previousId.HasValue && !_repliesStack.Contains(previousId.Value))
+                    {
+                        _repliesStack.Push(previousId.Value);
+                    }
+                }
+                else
+                {
+                    //if (maxId == 0)
+                    //{
+                    if (_thread != null && alignment == VerticalAlignment.Top)
+                    {
+                        ScrollToTop();
+                    }
+                    else
+                    {
+                        ScrollToBottom();
+                    }
+                    //}
+
+                    HistoryField?.Resume();
+                }
+
+                // If the response contains a single item, immediately load more in the past
+                if (slice.Items.Count == 1)
+                {
+                    loadMore = PanelScrollingDirection.Backward;
+                }
+
+                UpdateDetectedLanguage();
+            }
+            else
+            {
+                NotifyInitialized();
+
+                IsOldestSliceLoaded = true;
+                IsNewestSliceLoaded = true;
+
+                HistoryField?.Resume();
+            }
+
+            _loadingSlice = false;
+            IsLoading = false;
+            MessagesLoaded?.Invoke(this, new MessagesLoadedEventArgs(PanelScrollingDirection.None));
+
+            PinnedMessages.LoadSlice(fromMessageId);
+
+            if (loadMore != PanelScrollingDirection.None)
+            {
+                await LoadNextSliceAsync(loadMore);
+            }
+
+            await AddSponsoredMessagesAsync();
+        }
+
+        protected void RaiseMessagesLoaded(PanelScrollingDirection direction)
+        {
+            MessagesLoaded?.Invoke(this, new MessagesLoadedEventArgs(direction));
+        }
+
+        private async Task<Messages> PreloadAlbumsAsync(long chatId, FoundChatMessages foundChatMessages)
+        {
+            var messages = new MutableVector<Message>(foundChatMessages.Messages);
+
+            for (int i = messages.Count - 1; i >= 0; i--)
+            {
+                var message = messages[i];
+                if (message.MediaAlbumId == 0)
+                {
+                    continue;
+                }
+
+                Function func;
+                if (DirectMessagesChatTopic != null)
+                {
+                    func = new GetDirectMessagesChatTopicHistory(chatId, DirectMessagesChatTopic.Id, message.Id, -10, 10);
+                }
+                else if (ForumTopic != null)
+                {
+                    func = new GetForumTopicHistory(chatId, _forumTopic.Info.ForumTopicId, message.Id, -10, 10);
+                }
+                else
+                {
+                    func = new GetChatHistory(chatId, message.Id, -10, 10, false);
+                }
+
+                var response = await ClientService.SendAsync(func);
+                if (response is Messages album
+                    && album.MessagesValue.Count > 1
+                    && album.MessagesValue[^1].Id == message.Id)
+                {
+                    for (int j = album.MessagesValue.Count - 2; j >= 0; j--)
+                    {
+                        var part = album.MessagesValue[j];
+                        if (part.MediaAlbumId == message.MediaAlbumId)
+                        {
+                            messages.Insert(i, album.MessagesValue[j]);
+                        }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return new Messages(foundChatMessages.TotalCount, messages);
+        }
+
+        private async Task<LoadSliceResult> LoadMessageSliceImpl(Chat chat, long fromMessageId, int fromDateOffset, VerticalAlignment alignment, ScrollIntoViewAlignment? direction, double? pixel)
+        {
+            fromMessageId = fromMessageId == long.MaxValue ? 0 : fromMessageId;
+
+            Task<Object> func;
+            if (Type == DialogType.Pinned)
+            {
+                func = ClientService.SendAsync(new SearchChatMessages(chat.Id, TopicId, string.Empty, null, fromMessageId, Constants.HistoryOffset, Constants.HistoryLimit, new SearchMessagesFilterPinned()));
+            }
+            else if (IsSavedPollsTab)
+            {
+                func = ClientService.SendAsync(new SearchChatMessages(chat.Id, TopicId, string.Empty, null, fromMessageId, Constants.HistoryOffset, Constants.HistoryLimit, new SearchMessagesFilterPoll()));
+            }
+            else if (Search?.SavedMessagesTag != null && Search.FilterByTag)
+            {
+                func = ClientService.SendAsync(new SearchSavedMessages(SavedMessagesTopicId, Search.SavedMessagesTag, string.Empty, fromMessageId, Constants.HistoryOffset, Constants.HistoryLimit));
+            }
+            else if (SavedMessagesTopic != null)
+            {
+                func = ClientService.SendAsync(new GetSavedMessagesTopicHistory(SavedMessagesTopic.Id, fromMessageId, Constants.HistoryOffset, Constants.HistoryLimit));
+            }
+            else if (DirectMessagesChatTopic != null)
+            {
+                func = ClientService.SendAsync(new GetDirectMessagesChatTopicHistory(chat.Id, DirectMessagesChatTopic.Id, fromMessageId, Constants.HistoryOffset, Constants.HistoryLimit));
+            }
+            else if (ForumTopic != null)
+            {
+                func = ClientService.SendAsync(new GetForumTopicHistory(chat.Id, _forumTopic.Info.ForumTopicId, fromMessageId, Constants.HistoryOffset, Constants.HistoryLimit));
+            }
+            else if (Thread != null)
+            {
+                // MaxId == 0 means that the thread was never opened
+                if (fromMessageId == 0 || Thread.Messages.Any(x => x.Id == fromMessageId))
+                {
+                    func = ClientService.SendAsync(new GetMessageThreadHistory(chat.Id, _thread.MessageThreadId, 1, Constants.HistoryOffset, Constants.HistoryLimit));
+                }
+                else
+                {
+                    func = ClientService.SendAsync(new GetMessageThreadHistory(chat.Id, _thread.MessageThreadId, fromMessageId, Constants.HistoryOffset, Constants.HistoryLimit));
+                }
+            }
+            else
+            {
+                async Task<Object> GetChatHistoryAsync(long chatId, long fromMessageId, int offset, int limit, bool onlyLocal)
+                {
+                    var response = await ClientService.SendAsync(new GetChatHistory(chatId, fromMessageId, offset, limit, onlyLocal));
+                    if (response is Messages messages && onlyLocal)
+                    {
+                        var count = messages.MessagesValue.Count;
+                        var outOfRange = fromMessageId != 0 && count > 0 && messages.MessagesValue[^1].Id > fromMessageId;
+
+                        if (outOfRange || count < 5)
+                        {
+                            var force = await ClientService.SendAsync(new GetChatHistory(chatId, fromMessageId, offset, limit, count > 0 && !outOfRange));
+                            if (force is Messages forceMessages)
+                            {
+                                if (forceMessages.MessagesValue.Count == 0 && count > 0 && !outOfRange)
+                                {
+                                    force = await ClientService.SendAsync(new GetChatHistory(chatId, fromMessageId, offset, limit, false));
+
+                                    if (force is Messages forceMessages2)
+                                    {
+                                        return forceMessages2;
+                                    }
+                                }
+                                else
+                                {
+                                    return forceMessages;
+                                }
+                            }
+                        }
+                    }
+
+                    return response;
+                }
+
+                func = GetChatHistoryAsync(chat.Id, fromMessageId, Constants.HistoryOffset, Constants.HistoryLimit, alignment == VerticalAlignment.Top);
+            }
+
+            var response = await func;
+            if (response is FoundChatMessages foundChatMessages)
+            {
+                response = await PreloadAlbumsAsync(chat.Id, foundChatMessages);
+            }
+
+            if (response is Messages messages)
+            {
+                var firstVisibleIndex = -1;
+                var firstVisibleItem = default(Message);
+
+                var unread = false;
+
+                if (alignment != VerticalAlignment.Center)
+                {
+                    var details = GetCurrentDetails();
+
+                    bool Included(long id)
+                    {
+                        return true;
+                        return messages.MessagesValue.Count > 0 && messages.MessagesValue[0].Id >= id && messages.MessagesValue[^1].Id <= id;
+                    }
+
+                    // If we're loading from the last read message
+                    // then we want to skip it to align first unread message at top
+                    if (details.LastReadInboxMessageId != 0 && details.LastReadInboxMessageId != details.LastMessageId && Included(fromMessageId) && Included(details.LastReadInboxMessageId) /*maxId >= lastReadMessageId*/)
+                    {
+                        var target = default(Message);
+                        var index = -1;
+
+                        for (int i = messages.MessagesValue.Count - 1; i >= 0; i--)
+                        {
+                            var current = messages.MessagesValue[i];
+                            if (current.Id > details.LastReadInboxMessageId && current.Id < long.MaxValue)
+                            {
+                                if (index == -1)
+                                {
+                                    firstVisibleIndex = i;
+                                    firstVisibleItem = current;
+                                }
+
+                                if ((target == null || target.IsOutgoing) && !current.IsOutgoing)
+                                {
+                                    target = current;
+                                    index = i;
+                                }
+                                else if (current.IsOutgoing)
+                                {
+                                    target = current;
+                                    index = -1;
+                                }
+                            }
+                            else if (firstVisibleIndex == -1 && i == 0)
+                            {
+                                firstVisibleIndex = i;
+                                firstVisibleItem = current;
+                            }
+                        }
+
+                        if (target != null)
+                        {
+                            if (index >= 0 && index < messages.MessagesValue.Count - 1)
+                            {
+                                var marker = new Message(0, target.SenderId, null, target.ChatId, null, null, target.IsOutgoing, false, false, false, false, target.IsChannelPost, false, false, false, false, target.Date, 0, null, null, null, null, null, null, null, target.TopicId, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageHeaderUnread(), null, null);
+                                messages.MessagesValue = messages.MessagesValue.With(index + 1, marker);
+                                unread = true;
+                            }
+                            else if (fromMessageId == details.LastReadInboxMessageId)
+                            {
+                                Logger.Debug("Looking for first unread message, can't find it");
+                            }
+
+                            if (fromMessageId == details.LastReadInboxMessageId && pixel == null)
+                            {
+                                fromMessageId = target.Id;
+                                pixel = 28 + 48;
+                            }
+                        }
+                    }
+
+                    if (firstVisibleItem != null && pixel == null)
+                    {
+                        fromMessageId = firstVisibleItem.Id;
+                    }
+
+                    // If we're loading the last message and it has been read already
+                    // then we want to align it at bottom, as it might be taller than the window height
+                    if (fromMessageId == details.LastMessageId && pixel == null && !unread)
+                    {
+                        alignment = VerticalAlignment.Bottom;
+                        pixel = null;
+                    }
+                }
+
+                if (firstVisibleIndex == -1)
+                {
+                    firstVisibleIndex = fromDateOffset != 0
+                        ? messages.MessagesValue.FindLastIndex(m => m.Date >= fromDateOffset)
+                        : messages.MessagesValue.FindIndex(m => m.Id == fromMessageId);
+
+                    if (firstVisibleIndex != -1)
+                    {
+                        if (fromDateOffset != 0)
+                            fromMessageId = messages.MessagesValue[firstVisibleIndex].Id;
+                        else
+                            unread = false;
+                    }
+                }
+
+                IEnumerable<Message> values;
+                bool following;
+                if (alignment == VerticalAlignment.Bottom)
+                {
+                    following = true;
+                    values = messages.MessagesValue;
+                }
+                else if (alignment == VerticalAlignment.Top)
+                {
+                    if (unread)
+                    {
+                        firstVisibleIndex++;
+                    }
+
+                    following = false;
+                    values = firstVisibleIndex == -1 || messages.MessagesValue.Count == firstVisibleIndex + 1
+                        ? messages.MessagesValue
+                        : messages.MessagesValue.Take(firstVisibleIndex + 1);
+                }
+                else
+                {
+                    following = direction == ScrollIntoViewAlignment.Default;
+                    values = messages.MessagesValue;
+                }
+
+                if (values is Vector<Message> temp)
+                {
+                    if (_forumTopic == null && _thread != null && (fromMessageId == 0 || _thread.Messages.Any(x => x.Id == fromMessageId)))
+                    {
+                        values = await AddHeaderAsync(temp, temp.Count > 0 ? temp[^1] : null);
+                    }
+                    else if (temp.Empty())
+                    {
+                        values = await AddHeaderAsync(temp, null);
+                    }
+                }
+
+                var replied = new MessageCollection(this, null, values, false, Type);
+                return new LoadSliceResult(replied, fromMessageId, following, alignment, pixel, unread, messages.TotalCount);
+            }
+
+            return null;
+        }
+
+        private class LoadSliceResult
+        {
+            public LoadSliceResult(MessageCollection items, long fromMessageId, bool following, VerticalAlignment alignment, double? pixel, bool unread, int totalCount)
+            {
+                Items = items;
+                FromMessageId = fromMessageId;
+                IsFollowingEnd = following;
+                Alignment = alignment;
+                Pixel = pixel;
+                IsUnread = unread;
+                TotalCount = totalCount;
+            }
+
+            public MessageCollection Items { get; }
+
+            public long FromMessageId { get; }
+
+            public bool IsFollowingEnd { get; }
+
+            public VerticalAlignment Alignment { get; }
+
+            public double? Pixel { get; }
+
+            public bool IsUnread { get; }
+
+            public int TotalCount { get; }
+        }
+
+        private Task AddSponsoredMessagesAsync()
+        {
+            return Task.CompletedTask;
+        }
+
+
+        public async Task LoadScheduledSliceAsync()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (_loadingSlice)
+            {
+                return;
+            }
+
+            _loadingSlice = true;
+            IsOldestSliceLoaded = null;
+            IsNewestSliceLoaded = null;
+            IsLoading = true;
+
+            Logger.Info();
+
+            var response = await ClientService.SendAsync(new GetChatScheduledMessages(chat.Id));
+            if (response is Messages messages)
+            {
+                _groupedMessages.Clear();
+
+                if (messages.MessagesValue.Count > 0)
+                {
+                    SetFollowingEnd(true);
+                }
+
+                // The slice walks its source newest-first, inserting each one at the top,
+                // so it has to be handed the reverse of the order it produces.
+                var replied = new MessageCollection(this, null, messages.MessagesValue.OrderByDescending(x => x.Id), true, Type);
+                ProcessMessages(chat, replied);
+
+                var target = replied.FirstOrDefault();
+                if (target != null)
+                {
+                    replied.Insert(0, CreateMessage(new Message(0, target.SenderId, null, target.ChatId, null, target.SchedulingState, target.IsOutgoing, false, false, false, false, target.IsChannelPost, false, false, false, false, target.Date, 0, null, null, null, null, null, null, null, target.TopicId, null, 0, 0, 0, null, 0, 0, string.Empty, 0, string.Empty, 0, 0, null, string.Empty, new MessageHeaderDate(target.Date), null, null)));
+                }
+
+                Items.ReplaceSlice(replied);
+
+                IsOldestSliceLoaded = true;
+                IsNewestSliceLoaded = true;
+            }
+
+            _loadingSlice = false;
+            IsLoading = false;
+        }
+
+        public virtual Task LoadEventLogSliceAsync(string query = "")
+        {
+            return Task.CompletedTask;
+        }
+
+        public virtual Task LoadQuickReplyShortcutSliceAsync()
+        {
+            return Task.CompletedTask;
+        }
+
+        public virtual Task LoadWelcomeMessageSliceAsync()
+        {
+            return Task.CompletedTask;
+        }
+
+        public async Task LoadDateSliceAsync(int dateOffset)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var response = await ClientService.SendAsync(new GetChatMessageByDate(chat.Id, dateOffset));
+            if (response is Message message)
+            {
+                await LoadMessageSliceAsync(null, message.Id, fromDateOffset: dateOffset, onlyRemote: true);
+            }
+            else
+            {
+                response = await ClientService.SendAsync(new GetChatHistory(chat.Id, 1, -1, 1, false));
+                if (response is Messages messages && messages.MessagesValue.Count > 0)
+                {
+                    await LoadMessageSliceAsync(null, messages.MessagesValue[0].Id);
+                }
+            }
+        }
+
+        public void ScrollToBottom()
+        {
+            //if (IsFirstSliceLoaded)
+            {
+                var field = HistoryField;
+                if (field == null)
+                {
+                    return;
+                }
+
+                field.ScrollToBottom();
+            }
+        }
+
+        public void ScrollToTop()
+        {
+            //if (IsFirstSliceLoaded)
+            {
+                var field = HistoryField;
+                if (field == null)
+                {
+                    return;
+                }
+
+                field.ScrollToTop();
+            }
+        }
+
+        public MessageCollection Items { get; }
+
+        public MessageViewModel CreateMessage(Message message, bool forLanguageStatistics = false)
+        {
+            if (message == null)
+            {
+                return null;
+            }
+
+            var upgradedFrom = IsUpgradedFromChat(message.ChatId);
+
+            // A message of the upgraded-from group belongs to that chat, not to this one.
+            var model = new MessageViewModel(ClientService, _messageDelegateWeak, upgradedFrom ? null : _chat, _forumTopic, _directMessagesChatTopic, message, true);
+            model.IsUpgradedFrom = upgradedFrom;
+
+            if (forLanguageStatistics)
+            {
+                UpdateLanguageStatistics(model);
+            }
+
+            return model;
+        }
+
+        public PinnedMessageViewModel CreatePinnedMessage(Message message, int index)
+        {
+            if (message == null)
+            {
+                return null;
+            }
+
+            return new PinnedMessageViewModel(ClientService, _messageDelegateWeak, _chat, message, index);
+        }
+
+        protected void ProcessMessages(Chat chat, IList<MessageViewModel> messages, bool returnAlbumRoot = false)
+        {
+            ProcessAlbums(messages, returnAlbumRoot);
+
+            // Removing from a MessageCollection also drops the date or topic separator that
+            // the removal orphans, and that one can sit above the item, so an index taken
+            // before a removal no longer points where it did. Collect and remove by identity
+            // once the walk is over; the list is only allocated if something is actually dropped.
+            List<MessageViewModel> discard = null;
+
+            for (int i = 0; i < messages.Count; i++)
+            {
+                var message = messages[i];
+                if (message.Content is MessageForumTopicCreated or MessageChatUpgradeFrom && Type == DialogType.Thread)
+                {
+                    (discard ??= new()).Add(message);
+                    continue;
+                }
+                else if (message.Content is MessageChatUpgradeFrom upgradeFrom)
+                {
+                    if (ClientService.TryGetBasicGroup(upgradeFrom.BasicGroupId, out BasicGroup basicGroup))
+                    {
+                        // TODO: check if group is accessible
+                    }
+                    else
+                    {
+                        (discard ??= new()).Add(message);
+                        continue;
+                    }
+                }
+
+                if (_contentOverrides.TryGetValue(message.CombinedId, out MessageContent content))
+                {
+                    message.Content = content;
+                }
+
+                if (message.Content is MessageDice dice)
+                {
+                    if (message.Id > chat.LastReadInboxMessageId)
+                    {
+                        message.GeneratedContentUnread = true;
+                    }
+                    else if (!message.GeneratedContentUnread)
+                    {
+                        message.GeneratedContentUnread = dice.IsInitialState();
+                    }
+                }
+                else if (message.Content is MessageStakeDice stakeDice)
+                {
+                    if (message.Id > chat.LastReadInboxMessageId)
+                    {
+                        message.GeneratedContentUnread = true;
+                    }
+                    else if (!message.GeneratedContentUnread)
+                    {
+                        message.GeneratedContentUnread = stakeDice.IsInitialState();
+                    }
+                }
+                else if (message.Id > chat.LastReadInboxMessageId)
+                {
+                    message.GeneratedContentUnread = true;
+                }
+
+                if (message.Content is MessagePaidMedia paidMedia)
+                {
+                    message.Content = new MessagePaidAlbum(paidMedia);
+                }
+                else if (message.Content is MessageStory story)
+                {
+                    message.Content = new MessageAsyncStory
+                    {
+                        ViaMention = story.ViaMention,
+                        StoryId = story.StoryId,
+                        StoryPosterChatId = story.StoryPosterChatId
+                    };
+                }
+                else if (message.Content is MessageContact contact && contact.Contact.PhoneNumber == "999888777666")
+                {
+                    message.SenderId = new MessageSenderUser(contact.Contact.UserId);
+                    message.Content = new MessageChatAddMembers(new[] { contact.Contact.UserId });
+                }
+
+                if (message.EffectId != 0)
+                {
+                    if (message.Id > chat.LastReadInboxMessageId)
+                    {
+                        message.GeneratedContentUnread = true;
+                    }
+
+                    message.Effect = ClientService.LoadMessageEffect(message.EffectId, message.GeneratedContentUnread);
+
+                    if (message.Effect == null)
+                    {
+                        if (_messageEffects.TryGetValue(message.EffectId, out var hashSet))
+                        {
+                            hashSet.Add(message.Id);
+                        }
+                        else
+                        {
+                            _messageEffects[message.EffectId] = new HashSet<long>
+                            {
+                                message.Id
+                            };
+                        }
+                    }
+                }
+
+                if (message.SuggestedPostInfo != null)
+                {
+                    message.ReplyMarkup = message.SuggestedPostInfo.ToReplyMarkup(message.IsOutgoing);
+                }
+
+                if (IsTranslating)
+                {
+                    _translateService.Translate(message, Settings.Translate.To);
+                }
+
+                ProcessEmoji(message);
+                ProcessReplies(message);
+            }
+
+            if (discard != null)
+            {
+                foreach (var message in discard)
+                {
+                    messages.Remove(message);
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ProcessEmoji(MessageViewModel message)
+        {
+            if (ClientService.Options.DisableAnimatedEmoji)
+            {
+                return;
+            }
+
+            if (message.Content is MessageText text && text.LinkPreview == null)
+            {
+                if (text.Text.Entities.Count == 0 && Emoji.TryCountEmojis(text.Text.Text, out int count, 3))
+                {
+                    message.GeneratedContent = new MessageBigEmoji(text.Text, count);
+                }
+                else if (text.Text.Entities.Count > 0 && Emoji.TryCountCustomEmojis(text.Text, out count))
+                {
+                    message.GeneratedContent = new MessageBigEmoji(text.Text, count);
+                }
+                else
+                {
+                    message.GeneratedContent = null;
+                }
+            }
+            else
+            {
+                message.GeneratedContent = null;
+            }
+        }
+
+        private void ProcessAlbums(IList<MessageViewModel> slice, bool returnAlbumRoot)
+        {
+            Dictionary<long, Tuple<MessageViewModel, long>> groups = null;
+            Dictionary<long, long> newGroups = null;
+
+            // Deferred for the same reason as in ProcessMessages, which also keeps the
+            // slice[i] assignments below addressing what they were written against.
+            List<MessageViewModel> discard = null;
+
+            for (int i = 0; i < slice.Count; i++)
+            {
+                var message = slice[i];
+                if (message.MediaAlbumId == 0)
+                {
+                    continue;
+                }
+
+                var groupedId = message.MediaAlbumId;
+
+                _groupedMessages.TryGetValue(groupedId, out MessageViewModel group);
+
+                if (group == null)
+                {
+                    var media = new MessageAlbum(message.Content is MessagePhoto or MessageVideo);
+
+                    var groupBase = new Message();
+                    groupBase.ChatId = message.ChatId;
+                    groupBase.Content = media;
+                    groupBase.Date = message.Date;
+                    groupBase.SenderId = message.SenderId;
+                    groupBase.ForwardInfo = message.ForwardInfo;
+
+                    group = CreateMessage(groupBase);
+
+                    slice[i] = group;
+                    newGroups ??= new();
+                    newGroups[groupedId] = groupedId;
+                    _groupedMessages[groupedId] = group;
+                }
+                else if (returnAlbumRoot)
+                {
+                    slice[i] = group;
+                }
+                else
+                {
+                    (discard ??= new()).Add(message);
+                }
+
+                if (group.Content is MessageAlbum album)
+                {
+                    groups ??= new();
+                    groups[groupedId] = Tuple.Create(group, group.Id);
+
+                    album.Messages.Add(message);
+                }
+            }
+
+            if (discard != null)
+            {
+                foreach (var message in discard)
+                {
+                    slice.Remove(message);
+                }
+            }
+
+            if (groups != null)
+            {
+                foreach (var group in groups.Values)
+                {
+                    if (group.Item1.Content is MessageAlbum album)
+                    {
+                        album.Invalidate();
+
+                        var first = album.Messages.FirstOrDefault();
+                        if (first != null)
+                        {
+                            group.Item1.IsFirst = first.IsFirst;
+                            group.Item1.IsLast = album.Messages[^1].IsLast;
+
+                            group.Item1.UpdateAlbum(first);
+                        }
+                    }
+
+                    if (newGroups != null && newGroups.ContainsKey(group.Item1.MediaAlbumId))
+                    {
+                        continue;
+                    }
+
+                    Items.UpdateMessageAlbum(group.Item1);
+
+                    Handle(new UpdateMessageContent(group.Item1.ChatId, group.Item2, group.Item1.Content));
+                    Handle(new UpdateMessageEdited(group.Item1.ChatId, group.Item2, group.Item1.EditDate, group.Item1.ReplyMarkup));
+                    Handle(new UpdateMessageInteractionInfo(group.Item1.ChatId, group.Item2, group.Item1.InteractionInfo));
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ProcessReplies(MessageViewModel message)
+        {
+            if (message.ReplyTo is MessageReplyToMessage replyToMessage)
+            {
+                if (_thread?.ChatId == replyToMessage.ChatId &&
+                    _thread?.Messages[^1].Id == replyToMessage.MessageId &&
+                    replyToMessage.Quote == null)
+                {
+                    message.ReplyToState = MessageReplyToState.Hidden;
+                    return;
+                }
+                else if (replyToMessage.Origin != null)
+                {
+                    message.ReplyToState = MessageReplyToState.None;
+                    message.ReplyToItem = replyToMessage;
+                    return;
+                }
+            }
+
+            if (message.ReplyTo is not null ||
+                message.Content is MessagePinMessage or
+                MessageGameScore or
+                MessagePaymentSuccessful or
+                MessageChecklistTasksAdded or
+                MessageChecklistTasksDone or
+                MessagePollOptionAdded or
+                MessagePollOptionDeleted or
+                MessageSuggestedPostPaid or
+                MessageSuggestedPostRefunded)
+            {
+                message.ReplyToState = message.Content is MessageGiveawayWinners
+                    ? MessageReplyToState.Hidden
+                    : MessageReplyToState.Loading;
+
+                ClientService.GetReplyTo(message, response =>
+                {
+                    if (response is Message result)
+                    {
+                        message.ReplyToItem = CreateMessage(result);
+                        message.ReplyToState = message.Content is MessageGiveawayWinners
+                            ? MessageReplyToState.Hidden
+                            : MessageReplyToState.None;
+
+                        if (IsTranslating)
+                        {
+                            _translateService.Translate(message.ReplyToItem as MessageViewModel, Settings.Translate.To);
+                        }
+                    }
+                    else if (response is Story story)
+                    {
+                        message.ReplyToItem = story;
+                        message.ReplyToState = MessageReplyToState.None;
+                    }
+                    else
+                    {
+                        message.ReplyToState = MessageReplyToState.Deleted;
+                    }
+
+                    BeginOnUIThread(() => Handle(message,
+                        bubble =>
+                        {
+                            bubble.UpdateMessageReply(message);
+
+                            if (message.SuggestedPostInfo != null)
+                            {
+                                bubble.UpdateMessageSuggestedPostInfo(message);
+                            }
+                        },
+                        service => service.UpdateMessage(message)));
+                });
+            }
+            else if (message.Content is MessageAsyncStory asyncStory)
+            {
+                asyncStory.State = MessageStoryState.Loading;
+
+                ClientService.GetStory(asyncStory.StoryPosterChatId, asyncStory.StoryId, response =>
+                {
+                    if (response is Story story)
+                    {
+                        asyncStory.Story = story;
+                        asyncStory.State = MessageStoryState.None;
+
+                        if (story.Content is StoryContentPhoto photo)
+                        {
+                            message.GeneratedContent = new MessagePhoto(photo.Photo, null, null, false, false, false);
+                        }
+                        else if (story.Content is StoryContentVideo video)
+                        {
+                            message.GeneratedContent = new MessageVideo(new Video((int)video.Video.Duration, video.Video.Width, video.Video.Height, "video.mp4", "video/mp4", video.Video.HasStickers, true, video.Video.Minithumbnail, video.Video.Thumbnail, video.Video.Video), Array.Empty<AlternativeVideo>(), Array.Empty<VideoStoryboard>(), null, 0, null, false, false, false);
+                        }
+                    }
+                    else
+                    {
+                        asyncStory.State = MessageStoryState.Expired;
+                    }
+
+                    BeginOnUIThread(() => Handle(message,
+                        bubble => { bubble.UpdateMessageHeader(message); bubble.UpdateMessageContent(message); },
+                        service => service.UpdateMessage(message)));
+                });
+            }
+        }
+
+        protected override async Task OnNavigatedToAsync(object parameter, NavigationMode mode, NavigationState state)
+        {
+            _navigatedFrom = false;
+
+            if (parameter is ChatMessageTopic chatMessageTopic)
+            {
+                parameter = chatMessageTopic.ChatId;
+
+                if (Type == DialogType.History)
+                {
+                    Type = DialogType.Thread;
+                }
+
+                if (chatMessageTopic.MessageTopic is MessageTopicSavedMessages savedMessages)
+                {
+                    if (ClientService.TryGetSavedMessagesTopic(savedMessages.SavedMessagesTopicId, out var topic))
+                    {
+                        SavedMessagesTopic = topic;
+                        TopicId = new MessageTopicSavedMessages(topic.Id);
+                    }
+                    else
+                    {
+                        return;
+                    }
+
+                    if (ClientService.TryGetChat(SavedMessagesTopic.Type, out Chat savedMessagesChat))
+                    {
+                        ClientService.LoadFullInfo(savedMessagesChat);
+                    }
+                }
+                else if (chatMessageTopic.MessageTopic is MessageTopicForum forum)
+                {
+                    if (ClientService.TryGetForumTopic(chatMessageTopic.ChatId, forum.ForumTopicId, out ForumTopic forumTopic))
+                    {
+                        ForumTopic = forumTopic;
+                    }
+                    else
+                    {
+                        ForumTopic = await ClientService.SendAsync(new GetForumTopic(chatMessageTopic.ChatId, forum.ForumTopicId)) as ForumTopic;
+                    }
+
+                    if (ForumTopic != null)
+                    {
+                        parameter = chatMessageTopic.ChatId;
+                        TopicId = new MessageTopicForum(_forumTopic.Info.ForumTopicId);
+                    }
+                    else
+                    {
+                        return;
+                    }
+                }
+                else if (chatMessageTopic.MessageTopic is MessageTopicDirectMessages directMessagesChat)
+                {
+                    if (ClientService.TryGetDirectMessagesChatTopic(chatMessageTopic.ChatId, directMessagesChat.DirectMessagesChatTopicId, out DirectMessagesChatTopic feedbeckChatTopic))
+                    {
+                        DirectMessagesChatTopic = feedbeckChatTopic;
+                        TopicId = new MessageTopicDirectMessages(DirectMessagesChatTopic.Id);
+                    }
+                    else
+                    {
+                        DirectMessagesChatTopic = await ClientService.SendAsync(new GetDirectMessagesChatTopic(chatMessageTopic.ChatId, directMessagesChat.DirectMessagesChatTopicId)) as DirectMessagesChatTopic;
+                        TopicId = new MessageTopicDirectMessages(DirectMessagesChatTopic.Id);
+                    }
+
+                    if (ClientService.TryGetChat(DirectMessagesChatTopic.SenderId, out Chat directMessagesChatChat))
+                    {
+                        ClientService.LoadFullInfo(directMessagesChatChat);
+                    }
+                    else if (ClientService.TryGetUser(DirectMessagesChatTopic.SenderId, out User directMessagesChatUser))
+                    {
+                        ClientService.Send(new GetUserFullInfo(directMessagesChatUser.Id));
+                    }
+                }
+                else if (chatMessageTopic.MessageTopic is MessageTopicThread thread)
+                {
+                    Thread = await ClientService.SendAsync(new GetMessageThread(chatMessageTopic.ChatId, thread.MessageThreadId)) as MessageThreadInfo;
+
+                    if (Thread != null)
+                    {
+                        parameter = Thread.ChatId;
+                        TopicId = new MessageTopicThread(Thread.MessageThreadId);
+                    }
+                    else
+                    {
+                        return;
+                    }
+                }
+            }
+            else if (parameter is ChatBusinessRepliesIdNavigationArgs businessRepliesIdArgs)
+            {
+                QuickReplyShortcut = ClientService.GetQuickReplyShortcut(businessRepliesIdArgs.QuickReplyShortcut);
+                QuickReplyShortcut ??= new QuickReplyShortcut(-1, businessRepliesIdArgs.QuickReplyShortcut, null, 0);
+                parameter = ClientService.Options.MyId;
+            }
+
+            var chat = ClientService.GetChat((long)parameter);
+            chat ??= await ClientService.SendAsync(new GetChat((long)parameter)) as Chat;
+
+            if (chat == null)
+            {
+                return;
+            }
+
+            _upgradedFromChatId = 0;
+            _upgradedFromResolved = false;
+
+            Chat = chat;
+            IsForum = Type == DialogType.History && ClientService.IsForum(chat);
+            IsDirectMessagesGroup = Type == DialogType.History && ClientService.IsDirectMessagesGroup(chat);
+
+            if (HasProtectedContent)
+            {
+                Delegate?.DisableScreenCapture();
+            }
+
+            SetFollowingEnd(true);
+            SetTranslating();
+
+            if (state.TryRemove("access_token", out string accessToken))
+            {
+                AccessToken = accessToken;
+            }
+
+            if (state.TryRemove("search", out string search))
+            {
+                SearchExecute(search);
+            }
+
+#pragma warning disable CS4014
+            if (Type == DialogType.ScheduledMessages)
+            {
+                Logger.Debug(string.Format("{0} - Loading scheduled messages", chat.Id));
+
+                NotifyInitialized();
+                LoadScheduledSliceAsync();
+            }
+            else if (Type == DialogType.EventLog)
+            {
+                Logger.Debug(string.Format("{0} - Loading event log", chat.Id));
+
+                NotifyInitialized();
+                LoadEventLogSliceAsync();
+            }
+            else if (Type == DialogType.BusinessReplies)
+            {
+                Logger.Debug(string.Format("{0} - Loading business replies", chat.Id));
+
+                NotifyInitialized();
+                LoadQuickReplyShortcutSliceAsync();
+            }
+            else if (Type == DialogType.WelcomeMessages)
+            {
+                Logger.Debug(string.Format("{0} - Loading welcome messages", chat.Id));
+
+                NotifyInitialized();
+                LoadWelcomeMessageSliceAsync();
+            }
+            else if (IsSavedMessagesTab)
+            {
+                Logger.Debug(string.Format("{0} - Loading messages from last", chat.Id));
+                LoadMessageSliceAsync(null, 0, VerticalAlignment.Bottom);
+            }
+            else if (state.TryRemove("message_id", out long navigation))
+            {
+                var details = GetCurrentDetails();
+
+                Settings.Chats.Clear(chat.Id, details.TopicId);
+                Logger.Debug(string.Format("{0} - Loading messages from specific id", chat.Id));
+
+                state.TryRemove("highlight", out TextQuote quote);
+                state.TryRemove("checklist_task_id", out int checklistTaskId);
+                state.TryRemove("poll_option_id", out string pollOptionId);
+                LoadMessageSliceAsync(null, navigation, highlight: quote, checklistTaskId: checklistTaskId, pollOptionId: pollOptionId);
+            }
+            else if (state.TryRemove("prepared_message", out Function preparedMessage))
+            {
+                // TODO: this is quite terrible
+                IsOldestSliceLoaded = true;
+                IsNewestSliceLoaded = true;
+                NotifyInitialized();
+                _ = SendMessageAsync(preparedMessage);
+            }
+            else
+            {
+                var status = ClientService.GetChatMemberStatus(chat, out _);
+                if (status is ChatMemberStatusLeft)
+                {
+                    Logger.Debug(string.Format("{0} - Loading messages from zero", chat.Id));
+                    LoadMessageSliceAsync(null, long.MaxValue, VerticalAlignment.Top);
+                }
+                else
+                {
+                    var details = GetCurrentDetails();
+
+                    // Read, not consumed: the chat may well be closed again before it has settled
+                    // anywhere worth recording, and this is then still the best answer there is.
+                    bool TryGet(out long lastVisibleId)
+                    {
+                        var a = Settings.Chats.TryGet(chat.Id, details.TopicId, ChatSetting.ReadInboxMaxId, out long readInboxMaxId);
+                        var b = Settings.Chats.TryGet(chat.Id, details.TopicId, ChatSetting.Index, out lastVisibleId);
+                        var c = Settings.Chats.TryGet(chat.Id, details.TopicId, ChatSetting.LastMessageId, out long lastMessageId);
+
+                        if (!a || !b)
+                        {
+                            return false;
+                        }
+
+                        if (readInboxMaxId != details.LastReadInboxMessageId)
+                        {
+                            return false;
+                        }
+
+                        if (lastVisibleId == lastMessageId)
+                        {
+                            return lastMessageId == details.LastMessageId;
+                        }
+
+                        return true;
+                    }
+
+                    if (TryGet(out long lastVisibleId))
+                    {
+                        if (Settings.Chats.TryGet(chat.Id, details.TopicId, ChatSetting.Pixel, out double pixel))
+                        {
+                            Logger.Info(string.Format("{0} - Loading messages from specific pixel", chat.Id));
+                            LoadMessageSliceAsync(null, lastVisibleId, VerticalAlignment.Bottom, pixel);
+                        }
+                        else
+                        {
+                            Logger.Info(string.Format("{0} - Loading messages from specific id, pixel missing", chat.Id));
+                            LoadMessageSliceAsync(null, lastVisibleId, VerticalAlignment.Bottom);
+                        }
+                    }
+                    else /*if (chat.UnreadCount > 0)*/
+                    {
+                        // The read marker has moved on since, so the position describes a place
+                        // the user has already been past. Nothing will make it valid again.
+                        Settings.Chats.Clear(chat.Id, details.TopicId);
+
+                        Logger.Info(string.Format("{0} - Loading messages from LastReadInboxMessageId: {1}", chat.Id, chat.LastReadInboxMessageId));
+                        LoadMessageSliceAsync(null, details.LastReadInboxMessageId, VerticalAlignment.Top);
+                    }
+                }
+            }
+#pragma warning restore CS4014
+
+            if (chat.IsMarkedAsUnread)
+            {
+                ClientService.Send(new ToggleChatIsMarkedAsUnread(chat.Id, false));
+            }
+
+            ClientService.Send(new OpenChat(chat.Id));
+            ClientService.AddRecentlyOpenedChat(chat.Id);
+
+            Delegate?.UpdateChat(chat);
+            Delegate?.UpdateChatActions(chat, ClientService.GetChatActions(chat.Id));
+
+            UpdateChatActionBar(chat);
+
+            if (chat.Type is ChatTypePrivate privata)
+            {
+                var item = ClientService.GetUser(privata.UserId);
+                var cache = ClientService.GetUserFull(privata.UserId);
+
+                Delegate?.UpdateUser(chat, item, cache, false, _accessToken != null);
+
+                ClientService.Send(new GetUserFullInfo(privata.UserId));
+
+                if (cache != null)
+                {
+                    UpdateEmptyState(item, cache, false);
+                }
+
+                if (privata.UserId == ClientService.Options.MyId)
+                {
+                    ClientService.Send(new GetSavedMessagesTags(SavedMessagesTopicId), result =>
+                    {
+                        if (result is SavedMessagesTags tags)
+                        {
+                            BeginOnUIThread(() => SavedMessagesTags = tags);
+                        }
+                    });
+                }
+            }
+            else if (chat.Type is ChatTypeSecret secretType)
+            {
+                var secret = ClientService.GetSecretChat(secretType.SecretChatId);
+                var item = ClientService.GetUser(secretType.UserId);
+                var cache = ClientService.GetUserFull(secretType.UserId);
+
+                Delegate?.UpdateSecretChat(chat, secret);
+                Delegate?.UpdateUser(chat, item, cache, true, false);
+                Delegate?.UpdateUserEmptyState(chat, null, null, null);
+
+                ClientService.Send(new GetUserFullInfo(secret.UserId));
+            }
+            else if (chat.Type is ChatTypeBasicGroup basic)
+            {
+                var item = ClientService.GetBasicGroup(basic.BasicGroupId);
+                var cache = ClientService.GetBasicGroupFull(basic.BasicGroupId);
+
+                Delegate?.UpdateBasicGroup(chat, item, cache);
+                Delegate?.UpdateUserEmptyState(chat, null, null, null);
+
+                ClientService.Send(new GetBasicGroupFullInfo(basic.BasicGroupId));
+                _messageDelegate.UpdateAdministrators(chat);
+            }
+            else if (chat.Type is ChatTypeSupergroup super)
+            {
+                var item = ClientService.GetSupergroup(super.SupergroupId);
+                var cache = ClientService.GetSupergroupFull(super.SupergroupId);
+
+                Delegate?.UpdateSupergroup(chat, item, cache);
+                Delegate?.UpdateSupergroupEmptyState(chat, item);
+                Delegate?.UpdateUserEmptyState(chat, null, null, null);
+
+                ClientService.Send(new GetSupergroupFullInfo(super.SupergroupId));
+                _messageDelegate.UpdateAdministrators(chat);
+            }
+
+            UpdateGroupCall(chat, chat.VideoChat.GroupCallId);
+
+            ShowReplyMarkup(chat);
+            ShowDraftMessage(chat);
+            ShowSwitchInline(state);
+            ShowReplyTo(state);
+            ShowForward(state);
+
+            if (Type is DialogType.History or DialogType.Thread && state.TryRemove("package", out DataPackageView package))
+            {
+                await HandlePackageAsync(package);
+            }
+            else if (Type is DialogType.History && state.TryRemove("videoChat", out string videoChat))
+            {
+                _voipService.JoinGroupCall(NavigationService, chat.Id, videoChat);
+            }
+        }
+
+        readonly struct ChatMessageTopicDetails
+        {
+            public readonly long ChatId;
+            public readonly MessageTopic TopicId;
+            public readonly long LastMessageId;
+            public readonly long LastReadInboxMessageId;
+
+            public ChatMessageTopicDetails(long chatId, MessageTopic topicId, long lastMessageId, long lastReadInboxMessageId)
+            {
+                ChatId = chatId;
+                TopicId = topicId;
+                LastMessageId = lastMessageId;
+                LastReadInboxMessageId = lastReadInboxMessageId;
+            }
+        }
+
+        private ChatMessageTopicDetails GetCurrentDetails()
+        {
+            MessageTopic topicId;
+            long lastMessageId;
+            long lastReadInboxMessageId;
+
+            if (SavedMessagesTopic != null)
+            {
+                topicId = new MessageTopicSavedMessages(SavedMessagesTopic.Id);
+                lastMessageId = SavedMessagesTopic.LastMessage?.Id ?? long.MaxValue;
+                lastReadInboxMessageId = SavedMessagesTopic.LastMessage?.Id ?? long.MaxValue;
+            }
+            else if (DirectMessagesChatTopic != null)
+            {
+                topicId = new MessageTopicDirectMessages(DirectMessagesChatTopic.Id);
+                lastMessageId = DirectMessagesChatTopic.LastMessage?.Id ?? long.MaxValue;
+                lastReadInboxMessageId = DirectMessagesChatTopic.LastReadInboxMessageId;
+            }
+            else if (ForumTopic != null)
+            {
+                topicId = new MessageTopicForum(ForumTopic.Info.ForumTopicId);
+                lastMessageId = ForumTopic.LastMessage?.Id ?? long.MaxValue;
+                lastReadInboxMessageId = ForumTopic.LastReadInboxMessageId;
+            }
+            else if (Thread != null)
+            {
+                topicId = new MessageTopicThread(Thread.MessageThreadId);
+                lastMessageId = Thread.ReplyInfo?.LastMessageId ?? long.MaxValue;
+                lastReadInboxMessageId = Thread.ReplyInfo?.LastReadInboxMessageId ?? long.MaxValue;
+            }
+            else
+            {
+                topicId = null;
+                lastMessageId = Chat.LastMessage?.Id ?? long.MaxValue;
+                lastReadInboxMessageId = Chat.LastReadInboxMessageId;
+            }
+
+            // TODO: verify this is valid in all cases
+            if (lastReadInboxMessageId == 0 && Thread == null)
+            {
+                lastReadInboxMessageId = lastMessageId;
+            }
+
+            return new ChatMessageTopicDetails(Chat.Id, topicId, lastMessageId, lastReadInboxMessageId);
+        }
+
+        /// <summary>
+        /// Where the history was standing the last time it came to rest. Geometry only: whether it
+        /// is worth keeping depends on the read markers, which are read when it is saved.
+        /// </summary>
+        private ScrollingPosition? _scrollingPosition;
+
+        private readonly record struct ScrollingPosition(long LastVisibleId, double? Pixel);
+
+        /// <summary>
+        /// Samples where the history is standing, for <see cref="OnNavigatedFrom"/> to save.
+        /// </summary>
+        /// <remarks>
+        /// Taken while the view is at rest rather than derived on the way out. Switching chats
+        /// quickly closes one before its restore has landed, and a scroll still in flight answers
+        /// with an artifact — which used to overwrite the position that was right. Nothing is
+        /// recorded until there is an answer, so a chat closed before it settles keeps what it had.
+        /// </remarks>
+        public void UpdateScrollingPosition()
+        {
+            if (Type is not DialogType.History and not DialogType.Thread || IsSavedMessagesTab)
+            {
+                return;
+            }
+
+            var field = HistoryField;
+            if (field == null || field.IsSuspended)
+            {
+                return;
+            }
+
+            try
+            {
+                if (!TryGetLastVisibleMessageId(out long lastVisibleId, out int lastVisibleIndex))
+                {
+                    return;
+                }
+
+                double? pixel = null;
+
+                if (field.ContainerFromIndex(lastVisibleIndex) is ListViewItem container)
+                {
+                    var position = container.TransformToVisual(field).TransformPoint(new Point());
+                    pixel = field.ActualHeight - (position.Y + container.ActualHeight);
+                }
+
+                _scrollingPosition = new ScrollingPosition(lastVisibleId, pixel);
+            }
+            catch
+            {
+                // All the remote procedure calls must be wrapped in a try-catch block. The last
+                // sample stands: it is a position this chat really was at, unlike anything that
+                // could be derived from a view that just failed to answer.
+            }
+        }
+
+        private bool _navigatedFrom;
+
+        protected override void OnNavigatedFrom(NavigationState suspensionState, bool suspending)
+        {
+            _navigatedFrom = true;
+
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            ClearPendingMessages();
+
+            _lastSeenTimer?.Stop();
+            _groupedMessages.Clear();
+            _chatActionManager = null;
+
+            SelectedItems.Clear();
+
+            IsSelectionEnabled = false;
+
+            ClientService.Send(new CloseChat(chat.Id));
+
+            if (Type is not DialogType.History and not DialogType.Thread || IsSavedMessagesTab)
+            {
+                return;
+            }
+
+            UpdateScrollingPosition();
+
+            // Only a position the history was actually seen resting at is written. Without one it
+            // never settled while this chat was open — a fast switch, or a restore still in flight
+            // — and whatever is already saved describes it better than anything derivable now.
+            if (_scrollingPosition is ScrollingPosition scrolling)
+            {
+                var details = GetCurrentDetails();
+
+                void Remove(string reason)
+                {
+                    Settings.Chats.Clear(chat.Id, details.TopicId);
+                    Logger.Info(string.Format("{0} - Removing scrolling position, {1}", chat.Id, reason));
+                }
+
+                if (scrolling.LastVisibleId == 0)
+                {
+                    Remove("as last item is not valid");
+                }
+                else if (scrolling.LastVisibleId == chat.LastMessage?.Id && scrolling.Pixel >= -5)
+                {
+                    Remove("as last item is chat.LastMessage");
+                }
+                else
+                {
+                    Settings.Chats[chat.Id, details.TopicId, ChatSetting.ReadInboxMaxId] = details.LastReadInboxMessageId;
+                    Settings.Chats[chat.Id, details.TopicId, ChatSetting.Index] = scrolling.LastVisibleId;
+
+                    if (scrolling.Pixel is double pixel)
+                    {
+                        Settings.Chats[chat.Id, details.TopicId, ChatSetting.Pixel] = pixel;
+                        Logger.Info(string.Format("{0} - Saving scrolling position, message: {1}, pixel: {2}", chat.Id, scrolling.LastVisibleId, pixel));
+                    }
+                    else
+                    {
+                        Settings.Chats.TryRemove(chat.Id, details.TopicId, ChatSetting.Pixel, out double _);
+                        Logger.Info(string.Format("{0} - Saving scrolling position, message: {1}, pixel: none", chat.Id, scrolling.LastVisibleId));
+                    }
+                }
+            }
+            else
+            {
+                Logger.Info(string.Format("{0} - Keeping scrolling position, as the history never settled", chat.Id));
+            }
+
+            SaveDraft(false, true);
+        }
+
+        private void ShowSwitchInline(IDictionary<string, object> state)
+        {
+            if (Type == DialogType.History && state.TryGet("switch_query", out string query) && state.TryGet("switch_bot", out long userId))
+            {
+                state.Remove("switch_query");
+                state.Remove("switch_bot");
+
+                var bot = ClientService.GetUser(userId);
+                if (bot == null || !bot.HasActiveUsername(out string username))
+                {
+                    return;
+                }
+
+                SetText(string.Format("@{0} {1}", username, query), focus: true);
+                ResolveInlineBot(username, query);
+            }
+            else if (Type == DialogType.History && state.TryGet("draft", out FormattedText draft))
+            {
+                state.Remove("draft");
+
+                SetText(draft, focus: true);
+            }
+        }
+
+        private void ShowReplyTo(IDictionary<string, object> state)
+        {
+            if (Type is DialogType.History or DialogType.Thread && state.TryGet("reply_to", out MessageViewModel message))
+            {
+                state.TryGet("reply_to_quote", out InputTextQuote quote);
+                state.TryGet("reply_to_task_id", out int taskId);
+                state.TryGet("reply_to_option_id", out string optionId);
+
+                state.Remove("reply_to");
+                state.Remove("reply_to_quote");
+                state.Remove("reply_to_task_id");
+                state.Remove("reply_to_option_id");
+
+                // We arrive here from "Reply in another chat", so we assume the message can be replied in another chat
+                ComposerHeader = new MessageComposerHeader(ClientService)
+                {
+                    ReplyTo = new MessageComposerReplyTo(message, quote, taskId, optionId ?? string.Empty, true),
+                    Forwarding = _composerHeader?.Forwarding
+                };
+
+                TextField?.FocusInput(FocusState.Keyboard);
+            }
+        }
+
+        private void ShowForward(IDictionary<string, object> state)
+        {
+            if (Type is DialogType.History or DialogType.Thread && state.TryGet("forward", out MessageComposerForwarding forwarding))
+            {
+                state.Remove("forward");
+                ShowForward(forwarding);
+            }
+        }
+
+        /// <summary>
+        /// Stages a forward in this composer, keeping everything else the header holds: only where
+        /// the messages come from is new, and the draft has already had its say.
+        /// </summary>
+        private void ShowForward(MessageComposerForwarding forwarding)
+        {
+            var header = _composerHeader;
+
+            ComposerHeader = new MessageComposerHeader(ClientService)
+            {
+                Editing = header?.Editing,
+                ReplyTo = header?.ReplyTo,
+                SuggestedPostInfo = header?.SuggestedPostInfo,
+                LinkPreview = header?.LinkPreview,
+                LinkPreviewUrl = header?.LinkPreviewUrl,
+                LinkPreviewOptions = header?.LinkPreviewOptions,
+                LinkPreviewDisabled = header?.LinkPreviewDisabled ?? false,
+                Forwarding = forwarding
+            };
+
+            TextField?.FocusInput(FocusState.Keyboard);
+        }
+
+        private async void ShowReplyMarkup(Chat chat)
+        {
+            if (chat.ReplyMarkupMessageId == 0 || Type != DialogType.History)
+            {
+                Delegate?.UpdateChatReplyMarkup(chat, null);
+            }
+            else
+            {
+                var response = await ClientService.SendAsync(new GetMessage(chat.Id, chat.ReplyMarkupMessageId));
+                if (response is Message message)
+                {
+                    Delegate?.UpdateChatReplyMarkup(chat, CreateMessage(message));
+                }
+                else
+                {
+                    Delegate?.UpdateChatReplyMarkup(chat, null);
+                }
+            }
+        }
+
+        public void ShowDraft()
+        {
+            var chat = _chat;
+            if (chat != null)
+            {
+                ShowDraftMessage(chat);
+            }
+        }
+
+        private DraftMessage _draft;
+
+        private DraftMessage GetDraftMessage()
+        {
+            if (ForumTopic != null)
+            {
+                return ForumTopic.DraftMessage;
+            }
+            else if (DirectMessagesChatTopic != null)
+            {
+                return DirectMessagesChatTopic.DraftMessage;
+            }
+            else if (Thread != null)
+            {
+                return Thread.DraftMessage;
+            }
+
+            return Chat.DraftMessage;
+        }
+
+        private async void ShowDraftMessage(Chat chat, bool force = true)
+        {
+            var draft = GetDraftMessage();
+
+            if (!force)
+            {
+                var current = GetFormattedText(false, false);
+
+                var prev = _draft?.Content as DraftMessageContentText;
+                var next = draft?.Content as DraftMessageContentText;
+
+                if (prev != null && !prev.Text.AreTheSame(current))
+                {
+                    return;
+                }
+                else if (next != null && prev != null && next.Text.AreTheSame(prev.Text))
+                {
+                    return;
+                }
+                else if (next != null && next.Text.AreTheSame(current))
+                {
+                    return;
+                }
+            }
+
+            // A draft has no room for a staged forward, so it has nothing to say about one either:
+            // whatever the composer is holding survives the header the draft rebuilds.
+            MessageComposerHeader FromDraft(MessageComposerReplyTo replyTo)
+            {
+                var forwarding = _composerHeader?.Forwarding;
+                if (replyTo == null && forwarding == null)
+                {
+                    return null;
+                }
+
+                return new MessageComposerHeader(ClientService)
+                {
+                    ReplyTo = replyTo,
+                    Forwarding = forwarding
+                };
+            }
+
+            if (draft?.Content == null || Type is not DialogType.History and not DialogType.Thread)
+            {
+                _draft = null;
+
+                Delegate?.UpdateChatDraft(chat, null);
+                ComposerHeader = FromDraft(null);
+            }
+            else
+            {
+                _draft = draft;
+
+                if (draft.ReplyTo is InputMessageReplyToMessage replyToMessage)
+                {
+                    var response = await ClientService.SendAsync(new GetMessage(chat.Id, replyToMessage.MessageId));
+                    if (response is Message message)
+                    {
+                        var properties = await ClientService.SendAsync(new GetMessageProperties(message.ChatId, message.Id)) as MessageProperties;
+
+                        ComposerHeader = FromDraft(new MessageComposerReplyTo(CreateMessage(message), replyToMessage.Quote, replyToMessage.ChecklistTaskId, replyToMessage.PollOptionId, properties?.CanBeRepliedInAnotherChat ?? false));
+
+                        goto UpdateText;
+                    }
+                }
+                else if (draft.ReplyTo is InputMessageReplyToExternalMessage replyToExternalMessage)
+                {
+                    var response = await ClientService.SendAsync(new GetMessage(replyToExternalMessage.ChatId, replyToExternalMessage.MessageId));
+                    if (response is Message message)
+                    {
+                        var properties = await ClientService.SendAsync(new GetMessageProperties(message.ChatId, message.Id)) as MessageProperties;
+
+                        ComposerHeader = FromDraft(new MessageComposerReplyTo(CreateMessage(message), replyToExternalMessage.Quote, replyToExternalMessage.ChecklistTaskId, replyToExternalMessage.PollOptionId, properties?.CanBeRepliedInAnotherChat ?? false));
+
+                        goto UpdateText;
+                    }
+                }
+
+                ComposerHeader = FromDraft(null);
+
+            UpdateText:
+                Delegate?.UpdateChatDraft(chat, draft);
+            }
+        }
+
+        private IAutocompleteCollection _autocomplete;
+        public IAutocompleteCollection Autocomplete
+        {
+            get => _autocomplete;
+            set
+            {
+                Set(ref _autocomplete, value);
+                Delegate?.UpdateAutocomplete(_chat, value);
+            }
+        }
+
+        private bool _hasBotCommands;
+        public bool HasBotCommands
+        {
+            get => _hasBotCommands && BotCommands != null;
+            set => Set(ref _hasBotCommands, value);
+        }
+
+        private bool _hasEphemeralBotCommands;
+        public bool HasEphemeralBotCommands
+        {
+            get => _hasEphemeralBotCommands && BotCommands != null;
+            set => Set(ref _hasEphemeralBotCommands, value);
+        }
+
+        private List<BotCommandFullInfo> _botCommands;
+        public List<BotCommandFullInfo> BotCommands
+        {
+            get => _botCommands;
+            set => Set(ref _botCommands, value);
+        }
+
+        public void SaveDraft()
+        {
+            SaveDraft(false, false);
+        }
+
+        public void SaveDraft(bool clear, bool force)
+        {
+            if (Type is not DialogType.History and not DialogType.Thread || (_navigatedFrom && !force))
+            {
+                return;
+            }
+
+            if (_isSelectionEnabled && !clear)
+            {
+                return;
+            }
+
+            var embedded = _composerHeader;
+            if (embedded != null && embedded.Editing != null)
+            {
+                return;
+            }
+
+            var chat = Chat;
+            if (chat == null || chat.DraftMessage?.Content is DraftMessageContentRichMessage || RestrictsNewChats)
+            {
+                return;
+            }
+
+            if (chat.Type is ChatTypeSupergroup super && super.IsChannel)
+            {
+                var supergroup = ClientService.GetSupergroup(super.SupergroupId);
+                if (supergroup != null && !supergroup.CanPostMessages())
+                {
+                    return;
+                }
+            }
+
+            var formattedText = GetFormattedText(clear, false);
+            if (formattedText == null)
+            {
+                return;
+            }
+
+            var replyToMessageId = 0L;
+            var replyToChatId = 0L;
+            var replyToTaskId = 0;
+            var replyToOptionId = string.Empty;
+            var quote = default(InputTextQuote);
+
+            if (embedded != null && embedded.ReplyTo != null)
+            {
+                replyToMessageId = embedded.ReplyTo.Message.Id;
+                replyToChatId = embedded.ReplyTo.Message.ChatId;
+                replyToTaskId = embedded.ReplyTo.ChecklistTaskId;
+                replyToOptionId = embedded.ReplyTo.PollOptionId;
+                quote = embedded.ReplyTo.Quote;
+
+                if (replyToChatId == chat.Id)
+                {
+                    replyToChatId = 0;
+                }
+            }
+
+            DraftMessage draft = null;
+            if (!string.IsNullOrWhiteSpace(formattedText.Text) || replyToMessageId != 0)
+            {
+                if (formattedText.Text.Length > ClientService.Options.MessageTextLengthMax * 4)
+                {
+                    formattedText = formattedText.Substring(0, ClientService.Options.MessageTextLengthMax * 4);
+                }
+
+                InputMessageReplyTo inputReply = replyToMessageId != 0
+                    ? replyToChatId == chat.Id || replyToChatId == 0
+                    ? new InputMessageReplyToMessage(replyToMessageId, quote, replyToTaskId, replyToOptionId)
+                    : new InputMessageReplyToExternalMessage(replyToChatId, replyToMessageId, quote, replyToTaskId, replyToOptionId)
+                    : null;
+
+                draft = new DraftMessage(inputReply, 0, new DraftMessageContentText(formattedText, null), 0, embedded?.SuggestedPostInfo);
+            }
+
+            _draft = draft;
+            ClientService.Send(new SetChatDraftMessage(_chat.Id, OutgoingTopicId, draft));
+        }
+
+        #region Reply 
+
+        private MessageComposerHeader _composerHeader;
+        public MessageComposerHeader ComposerHeader
+        {
+            get => _composerHeader;
+            set
+            {
+                Set(ref _composerHeader, value);
+                Delegate?.UpdateComposerHeader(_chat, value);
+            }
+        }
+
+        public bool DisableWebPagePreview
+        {
+            get
+            {
+                // Force disable if needed
+
+                var chat = _chat;
+                if (chat?.Type is ChatTypeSecret && !Settings.IsSecretPreviewsEnabled)
+                {
+                    return true;
+                }
+
+                return false;
+            }
+        }
+
+        public void ClearReply()
+        {
+            var header = _composerHeader;
+            if (header == null)
+            {
+                return;
+            }
+
+            if (header.SuggestedPostInfo != null)
+            {
+                ComposerHeader = new MessageComposerHeader(ClientService)
+                {
+                    Editing = header.Editing,
+                    ReplyTo = header.ReplyTo,
+                    Forwarding = header.Forwarding,
+                    LinkPreviewUrl = header.LinkPreviewUrl,
+                    LinkPreview = header.LinkPreview,
+                    LinkPreviewDisabled = header.LinkPreviewDisabled
+                };
+            }
+            else if (header.LinkPreview != null)
+            {
+                ComposerHeader = new MessageComposerHeader(ClientService)
+                {
+                    Editing = header.Editing,
+                    ReplyTo = header.ReplyTo,
+                    Forwarding = header.Forwarding,
+                    SuggestedPostInfo = header.SuggestedPostInfo,
+                    LinkPreviewUrl = header.LinkPreviewUrl,
+                    LinkPreview = null,
+                    LinkPreviewDisabled = true
+                };
+            }
+            else if (header.Forwarding != null && header.Editing == null)
+            {
+                // Peeled off in the order the header shows them, so the X always dismisses what the
+                // user is looking at.
+                ClearForwarding(header);
+            }
+            else
+            {
+                if (header.Editing != null)
+                {
+                    var chat = _chat;
+                    if (chat != null)
+                    {
+                        ShowDraftMessage(chat);
+                    }
+                    else
+                    {
+                        ComposerHeader = null;
+                        SetText(null, false);
+                    }
+                }
+                else
+                {
+                    if (header.ReplyTo?.Message.ReplyMarkup is ReplyMarkupForceReply)
+                    {
+                        ClientService.Send(new DeleteChatReplyMarkup(header.ReplyTo.Message.ChatId, header.ReplyTo.Message.Id));
+                    }
+
+                    ComposerHeader = null;
+                }
+            }
+
+            TextField?.FocusInput(FocusState.Programmatic);
+        }
+
+        /// <summary>
+        /// A composer snapshot that remembers the header it was read from, so that the clear can
+        /// tell whether the user has moved on since.
+        /// </summary>
+        private sealed class DialogComposerSnapshot : ComposerSnapshot
+        {
+            public MessageComposerHeader Header { get; init; }
+        }
+
+        protected override ComposerSnapshot PeekComposer()
+        {
+            return PeekComposer(forwarding: false);
+        }
+
+        /// <param name="forwarding">
+        /// Whether the send is the one that carries a staged forward. Only the composer's own send
+        /// is: everything else — a sticker, a file, an inline result — leaves it where it is.
+        /// </param>
+        private ComposerSnapshot PeekComposer(bool forwarding)
+        {
+            var header = _composerHeader;
+            if (header == null)
+            {
+                return ComposerSnapshot.None;
+            }
+
+            return new DialogComposerSnapshot
+            {
+                Header = header,
+                ReplyTo = header.ReplyTo?.ToInput(this),
+                LinkPreview = CopyLinkPreviewOptions(header.LinkPreviewOptions),
+                Forwarding = forwarding ? header.Forwarding : null
+            };
+        }
+
+        /// <summary>
+        /// The header is replaced wholesale on every change, but its link preview options are not:
+        /// the composer flyout writes through the live instance, and the same one is carried into
+        /// each replacement. Copying is what makes the snapshot a snapshot.
+        /// </summary>
+        private static LinkPreviewOptions CopyLinkPreviewOptions(LinkPreviewOptions options)
+        {
+            if (options == null)
+            {
+                return null;
+            }
+
+            return new LinkPreviewOptions(options.IsDisabled, options.Url, options.ForceSmallMedia, options.ForceLargeMedia, options.ShowAboveText);
+        }
+
+        /// <summary>
+        /// Consumes the header a send was built from. Does nothing if the user has replaced it in
+        /// the meantime — what they set after asking to send is theirs to keep.
+        /// </summary>
+        /// <param name="notify">
+        /// Whether the view is told. It normally isn't: ChatView dismisses the header along with the
+        /// outgoing bubble's send-out animation. A scheduled message never lands in the list, so
+        /// nothing would dismiss it.
+        /// </param>
+        /// <param name="keepForwarding">
+        /// Whether a staged forward survives the send. It does for every send but the one carrying
+        /// it, and the view is always told when it does: what the header was showing has gone, and
+        /// the forward left behind is what it shows now.
+        /// </param>
+        private void ClearComposer(MessageComposerHeader header, bool notify, bool keepForwarding)
+        {
+            if (header == null || _composerHeader != header)
+            {
+                return;
+            }
+
+            if (keepForwarding && header.Forwarding != null)
+            {
+                ComposerHeader = new MessageComposerHeader(ClientService)
+                {
+                    Forwarding = header.Forwarding
+                };
+            }
+            // A forward that has been consumed is always dismissed here. The send-out animation
+            // that would otherwise do it runs off a SendingId of 1, which only a message the
+            // composer wrote carries — a forward would leave the header up for good.
+            else if (notify || header.Forwarding != null)
+            {
+                ComposerHeader = null;
+            }
+            else
+            {
+                _composerHeader = null;
+            }
+
+            if (header.ReplyTo?.Message.ReplyMarkup is ReplyMarkupForceReply)
+            {
+                ClientService.Send(new DeleteChatReplyMarkup(header.ReplyTo.Message.ChatId, header.ReplyTo.Message.Id));
+            }
+        }
+
+        private void ClearComposer()
+        {
+            ClearComposer(_composerHeader, true, keepForwarding: true);
+        }
+
+        /// <summary>
+        /// Takes the staged forward off the composer and leaves everything else the header holds —
+        /// for the two ways a forward goes away without being sent: dismissed, or moved elsewhere.
+        /// </summary>
+        private void ClearForwarding(MessageComposerHeader header)
+        {
+            if (header == null || _composerHeader != header)
+            {
+                return;
+            }
+
+            var replacement = new MessageComposerHeader(ClientService)
+            {
+                Editing = header.Editing,
+                ReplyTo = header.ReplyTo,
+                SuggestedPostInfo = header.SuggestedPostInfo,
+                LinkPreview = header.LinkPreview,
+                LinkPreviewUrl = header.LinkPreviewUrl,
+                LinkPreviewOptions = header.LinkPreviewOptions,
+                LinkPreviewDisabled = header.LinkPreviewDisabled
+            };
+
+            ComposerHeader = replacement.IsEmpty && replacement.LinkPreview == null ? null : replacement;
+        }
+
+        #endregion
+
+        public async void SendMessage(string args)
+        {
+            await SendTextAsync(args);
+        }
+
+        /// <summary>
+        /// Sends what the composer is holding: applies it to the message being edited if there is
+        /// one, sends the rich draft if that is what it holds, and otherwise asks the user to
+        /// confirm and sends it.
+        /// </summary>
+        /// <param name="formattedText">
+        /// Read from the text field but deliberately not consumed there: a user staring at a modal
+        /// asking them to pay must still be able to see what they wrote. Emptying the field is this
+        /// method's job, once the send is past the point of no return.
+        /// </param>
+        /// <returns>False if the user backed out, leaving the composer exactly as it was.</returns>
+        public async Task<bool> SendComposerTextAsync(PreparedText formattedText, SchedulingState schedule = SchedulingState.Auto, bool? silent = null, long effectId = 0)
+        {
+            if (Chat is not Chat chat || formattedText == null)
+            {
+                return false;
+            }
+
+            // The one read of the composer this send gets. Everything below decides from it, so
+            // that what goes out is what the user was looking at when they pressed send. It is also
+            // the only read that takes the staged forward: no other send carries one.
+            var composer = PeekComposer(forwarding: true);
+
+            var applied = await TryEditMessageAsync(formattedText, composer);
+            if (applied || string.IsNullOrEmpty(formattedText.Text))
+            {
+                // Committing an edit is all this press does: it changes a message that already
+                // exists, and the forward is left staged for a send of its own.
+                var carrier = applied ? PeekComposer() : composer;
+
+                if (chat.DraftMessage?.Content is DraftMessageContentRichMessage richMessage)
+                {
+                    SendRichMessage(richMessage, carrier, schedule, silent, effectId);
+                    return true;
+                }
+
+                if (carrier.Forwarding == null)
+                {
+                    return true;
+                }
+
+                return await SendForwardOnlyAsync(carrier, schedule, silent, effectId);
+            }
+
+            var plan = await PrepareSendAsync(composer, CountMessages(formattedText), schedule, silent, formattedText.UpdateOrderOfInstalledStickerSets, effectId);
+            if (plan == null)
+            {
+                return false;
+            }
+
+            // Committed: the header went with the plan, and the text goes now. The view is told
+            // before the field is emptied, so that it still sees what the user pressed send on.
+            Delegate?.ComposerSending();
+            SetFormattedText(null);
+
+            await SendTextAsync(formattedText, plan);
+
+            // What the user typed goes out before what they staged to forward.
+            await SendForwardedMessagesAsync(plan);
+            return true;
+        }
+
+        /// <summary>
+        /// Sends a forward the composer is holding with nothing of the user's own in front of it —
+        /// the send button is theirs to press with an empty text field whenever one is staged.
+        /// </summary>
+        /// <returns>False if the user backed out, leaving the composer exactly as it was.</returns>
+        private async Task<bool> SendForwardOnlyAsync(ComposerSnapshot composer, SchedulingState schedule, bool? silent, long effectId)
+        {
+            var plan = await PrepareSendAsync(composer, 0, schedule, silent, false, effectId);
+            if (plan == null)
+            {
+                return false;
+            }
+
+            Delegate?.ComposerSending();
+
+            await SendForwardedMessagesAsync(plan);
+            return true;
+        }
+
+        private async void SendRichMessage(DraftMessageContentRichMessage richMessage, ComposerSnapshot composer, SchedulingState schedule, bool? silent, long effectId)
+        {
+            // A free user sends the plain text the blocks flatten to, and is shown the promo when
+            // they don't flatten to anything — before the composer is consumed either way.
+            FormattedText flattened = null;
+
+            if (IsPremiumAvailable && !IsPremium && !PageBlockHelper.TryGetFormattedText(richMessage.Message, out flattened))
+            {
+                ToastPopup.ShowFeaturePromo(NavigationService, new PremiumFeatureRichMessages());
+                return;
+            }
+
+            var plan = await PrepareSendAsync(composer, flattened != null ? CountMessages(flattened) : 1, schedule, silent, false, effectId);
+            if (plan == null)
+            {
+                return;
+            }
+
+            Delegate?.ComposerSending();
+
+            if (flattened != null)
+            {
+                await SendTextAsync(flattened, plan);
+            }
+            else
+            {
+                await SendMessageAsync(plan, new InputMessageRichMessage(PageBlockHelper.ToInputRichMessage(richMessage.Message), true));
+            }
+
+            await SendForwardedMessagesAsync(plan);
+        }
+
+        protected override Function CreateSendMessage(long chatId, MessageTopic topicId, InputMessageReplyTo replyTo, MessageSendOptions messageSendOptions, InputMessageContent inputMessageContent)
+        {
+            if (QuickReplyShortcut != null)
+            {
+                if (replyTo is InputMessageReplyToMessage replyToMessage)
+                {
+                    return new AddQuickReplyShortcutMessage(QuickReplyShortcut.Name, replyToMessage.MessageId, inputMessageContent);
+                }
+
+                return new AddQuickReplyShortcutMessage(QuickReplyShortcut.Name, 0, inputMessageContent);
+            }
+            else if (Type == DialogType.WelcomeMessages)
+            {
+                return new AddChatWelcomeMessage(chatId, inputMessageContent);
+            }
+
+            if (IsForum && ForumTopic == null && Chat.Type is ChatTypePrivate)
+            {
+                var response = ClientService.SendAsync(new CreateForumTopic(chatId, Strings.BotForumNewTopic, true, new ForumTopicIcon(0x6FB9F0, 0))).Result;
+                if (response is ForumTopicInfo info)
+                {
+                    topicId = new MessageTopicForum(info.ForumTopicId);
+
+                    var function = base.CreateSendMessage(chatId, topicId, replyTo, messageSendOptions, inputMessageContent);
+                    var state = new NavigationState
+                    {
+                        { "prepared_message", function }
+                    };
+
+                    NavigationService.NavigateToChat(chatId, topic: topicId, force: false, state: state);
+                    return null;
+                }
+            }
+
+            if (replyTo is InputMessageReplyToEphemeralMessage ephemeralMessage)
+            {
+                return new SendEphemeralMessage(chatId, topicId, ephemeralMessage.ReceiverUserId, new InputMessageReplyToMessage(ephemeralMessage.MessageId, ephemeralMessage.Quote, ephemeralMessage.ChecklistTaskId, ephemeralMessage.PollOptionId), messageSendOptions?.SendingId ?? 0, messageSendOptions?.OnlyPreview ?? false, inputMessageContent);
+            }
+            else if (HasEphemeralBotCommands)
+            {
+                var caption = inputMessageContent switch
+                {
+                    InputMessageText text => text.Text,
+                    _ => null
+                };
+
+                if (caption?.Text.StartsWith("/") is true)
+                {
+                    var split = caption.Text[1..].Split(' ');
+                    split = split[0].Split('@');
+
+                    if (split.Length == 2)
+                    {
+                        foreach (var command in BotCommands.Where(x => string.Equals(x.Command, split[0], StringComparison.OrdinalIgnoreCase)))
+                        {
+                            if (ClientService.TryGetUser(command.BotUserId, out User botUser))
+                            {
+                                if (botUser.HasActiveUsername(split[1], out _))
+                                {
+                                    return new SendEphemeralMessage(chatId, topicId, command.BotUserId, null, messageSendOptions?.SendingId ?? 0, messageSendOptions?.OnlyPreview ?? false, inputMessageContent);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return base.CreateSendMessage(chatId, topicId, replyTo, messageSendOptions, inputMessageContent);
+        }
+
+        protected override Function CreateSendMessageAlbum(long chatId, MessageTopic topicId, InputMessageReplyTo replyTo, MessageSendOptions messageSendOptions, Vector<InputMessageContent> inputMessageContent)
+        {
+            if (QuickReplyShortcut != null)
+            {
+                if (replyTo is InputMessageReplyToMessage replyToMessage)
+                {
+                    return new AddQuickReplyShortcutMessageAlbum(QuickReplyShortcut.Name, replyToMessage.MessageId, inputMessageContent);
+                }
+
+                return new AddQuickReplyShortcutMessageAlbum(QuickReplyShortcut.Name, 0, inputMessageContent);
+            }
+
+            if (IsForum && ForumTopic == null && ClientService.TryGetUser(Chat, out User user) && user.Type is UserTypeBot { AllowsUsersToCreateTopics: true })
+            {
+                var response = ClientService.SendAsync(new CreateForumTopic(chatId, Strings.BotForumNewTopic, true, new ForumTopicIcon(0x6FB9F0, 0))).Result;
+                if (response is ForumTopicInfo info)
+                {
+                    topicId = new MessageTopicForum(info.ForumTopicId);
+
+                    var function = base.CreateSendMessageAlbum(chatId, topicId, replyTo, messageSendOptions, inputMessageContent);
+                    var state = new NavigationState
+                    {
+                        { "prepared_message", function }
+                    };
+
+                    NavigationService.NavigateToChat(chatId, topic: topicId, force: false, state: state);
+                    return null;
+                }
+            }
+
+            return base.CreateSendMessageAlbum(chatId, topicId, replyTo, messageSendOptions, inputMessageContent);
+        }
+
+        protected override Function CreateForwardMessages(long chatId, MessageTopic topicId, long fromChatId, Vector<long> messageIds, MessageSendOptions messageSendOptions, bool sendCopy, bool removeCaption)
+        {
+            // A quick reply shortcut and a welcome message are both written through their own
+            // functions, and neither of those can carry a forward.
+            if (QuickReplyShortcut != null || Type == DialogType.WelcomeMessages)
+            {
+                return null;
+            }
+
+            return base.CreateForwardMessages(chatId, topicId, fromChatId, messageIds, messageSendOptions, sendCopy, removeCaption);
+        }
+
+        /// <summary>
+        /// Applies the send to the message the composer is editing, if there is one.
+        /// Returns true when it did, meaning the send has been consumed and no new message is to be sent.
+        /// </summary>
+        private async Task<bool> TryEditMessageAsync(FormattedText formattedText, ComposerSnapshot composer)
+        {
+            if (Chat is not Chat chat)
+            {
+                return false;
+            }
+
+            var linkPreview = composer?.LinkPreview;
+            var header = (composer as DialogComposerSnapshot)?.Header;
+            if (header?.Editing == null)
+            {
+                return false;
+            }
+
+            // Nothing asks the user to confirm an edit, so pressing send commits it right here.
+            Delegate?.ComposerSending();
+
+            var editing = header.Editing.Message;
+
+            var factory = header.Editing.Media;
+            if (factory is InputMessageContent input)
+            {
+                var topicId = editing.TopicId;
+                if (topicId is MessageTopicSavedMessages)
+                {
+                    topicId = null;
+                }
+
+                var options = new MessageSendOptions(header.SuggestedPostInfo, false, false, 0, false, null, 0, 0, true);
+
+                var response = await ClientService.SendAsync(new SendMessage(editing.ChatId, topicId, null, options, input));
+                if (response is Message preview)
+                {
+                    _contentOverrides[editing.CombinedId] = preview.Content;
+                    Aggregator.Publish(new UpdateMessageContent(editing.ChatId, editing.Id, preview.Content));
+
+                    ComposerHeader = null;
+                    ClientService.Send(new EditMessageMedia(editing.ChatId, editing.Id, input));
+                }
+            }
+            else
+            {
+                _contentOverrides.Remove(editing.CombinedId);
+
+                var textContent = editing.Content is MessageText or MessageAnimatedEmoji or MessageBigEmoji;
+                if (textContent && string.IsNullOrEmpty(formattedText.Text))
+                {
+                    ShowDraftMessage(chat);
+                    DeleteMessage(editing);
+                }
+                else
+                {
+                    Function function;
+                    if (QuickReplyShortcut != null)
+                    {
+                        if (textContent)
+                        {
+                            function = new EditQuickReplyMessage(QuickReplyShortcut.Id, editing.Id, new InputMessageText(formattedText, linkPreview, true));
+                        }
+                        else
+                        {
+                            // TODO
+                            function = new EditQuickReplyMessage(QuickReplyShortcut.Id, editing.Id, new InputMessageText(formattedText, linkPreview, true));
+                        }
+                    }
+                    else if (Type == DialogType.WelcomeMessages)
+                    {
+                        if (textContent)
+                        {
+                            function = new EditChatWelcomeMessage(ChatId, (int)editing.Id, new InputMessageText(formattedText, linkPreview, true));
+                        }
+                        else
+                        {
+                            // TODO
+                            function = new EditChatWelcomeMessage(ChatId, (int)editing.Id, new InputMessageText(formattedText, linkPreview, true));
+                        }
+                    }
+                    else if (textContent)
+                    {
+                        function = new EditMessageText(chat.Id, editing.Id, new InputMessageText(formattedText, linkPreview, true));
+                    }
+                    else
+                    {
+                        function = new EditMessageCaption(chat.Id, editing.Id, formattedText, editing.ShowCaptionAboveMedia());
+                    }
+
+                    var response = await ClientService.SendAsync(function);
+                    if (response is Message message)
+                    {
+                        ShowDraftMessage(chat);
+                        Aggregator.Publish(new UpdateMessageSendSucceeded(message, editing.Id));
+                    }
+                    else if (response is Ok)
+                    {
+                        // TODO: quick reply
+                        // No draft to fall back on here, so the field has to be emptied by hand —
+                        // every other branch that commits goes through ShowDraftMessage.
+                        ComposerHeader = null;
+                        SetFormattedText(null);
+                    }
+                    else if (response is Error error)
+                    {
+                        if (error.MessageEquals(ErrorType.MESSAGE_NOT_MODIFIED))
+                        {
+                            ShowDraftMessage(chat);
+                        }
+                        else
+                        {
+                            // TODO: ...
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        protected override Task AfterSendMessageAsync()
+        {
+            return LoadLastSliceAsync();
+        }
+
+        #region Set default message sender
+
+        public async void SetSender(ChatMessageSender messageSender)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (messageSender.NeedsPremium && !IsPremium)
+            {
+                await ShowPopupAsync(Strings.SelectSendAsPeerPremiumHint, Strings.AppName, Strings.OK);
+                return;
+            }
+
+            ClientService.Send(new SetChatMessageSender(chat.Id, messageSender.Sender));
+        }
+
+        #endregion
+
+        #region Gift premium
+
+        public void GiftPremium()
+        {
+        }
+
+        #endregion
+
+        #region Suggest post
+
+        public async void SuggestPost()
+        {
+            var popup = new SuggestPostPopup(ClientService, ComposerHeader?.SuggestedPostInfo);
+
+            var confirm = await ShowPopupAsync(popup);
+            if (confirm == ContentDialogResult.Primary)
+            {
+                ComposerHeader = new MessageComposerHeader(ClientService)
+                {
+                    SuggestedPostInfo = popup.SuggestedPostInfo,
+                    ReplyTo = ComposerHeader?.ReplyTo,
+                    Forwarding = ComposerHeader?.Forwarding,
+                };
+            }
+        }
+
+        #endregion
+
+        #region Join channel
+
+        public async void JoinChannel()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var response = await ClientService.SendAsync(new JoinChat(chat.Id));
+            MessageHelper.HandleChatJoinResult(ClientService, NavigationService, chat.Id, chat.Type is ChatTypeSupergroup { IsChannel: true }, response);
+        }
+
+        #endregion
+
+        #region Toggle mute
+
+        public void Mute()
+        {
+            ToggleMute(false);
+        }
+
+        public void Unmute()
+        {
+            ToggleMute(true);
+        }
+
+        public void ToggleMute()
+        {
+            ToggleMute(ClientService.Notifications.IsMuted(_chat));
+        }
+
+        private void ToggleMute(bool unmute)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            _notificationsService.SetMuteFor(chat, unmute ? 0 : 632053052, XamlRoot);
+        }
+
+        #endregion
+
+        #region Toggle silent
+
+        public void ToggleSilent()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            ClientService.Send(new ToggleChatDefaultDisableNotification(chat.Id, !chat.DefaultDisableNotification));
+        }
+
+        #endregion
+
+        #region Report Spam
+
+        public void RemoveActionBar()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            ClientService.Send(new RemoveChatActionBar(chat.Id));
+        }
+
+        public async void ReportUser()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var popup = new ContentPopup();
+            var content = new StackPanel();
+            var reportSpam = new CheckBox { Content = Strings.DeleteReportSpam, IsChecked = true, Margin = new Thickness(0, 16, 0, 0) };
+            var deleteChat = new CheckBox { Content = Strings.DeleteThisChat, IsChecked = true, Margin = new Thickness(0, 0, 0, -4) };
+
+            var text = new TextBlock
+            {
+                Style = BootStrapper.Current.Resources["BodyTextBlockStyle"] as Style
+            };
+
+            TextBlockHelper.SetMarkdown(text, string.Format(Strings.BlockUserAlert, chat.Title));
+
+            content.Children.Add(text);
+            content.Children.Add(reportSpam);
+            content.Children.Add(deleteChat);
+
+            popup.Title = string.Format(Strings.BlockUserTitle, chat.Title);
+            popup.Content = content;
+            popup.PrimaryButtonText = Strings.ClearButton;
+            popup.SecondaryButtonText = Strings.Cancel;
+
+            var confirm = await ShowPopupAsync(popup);
+            if (confirm != ContentDialogResult.Primary)
+            {
+                return;
+            }
+
+            if (reportSpam.IsChecked is true)
+            {
+                Report();
+            }
+
+            if (chat.Type is ChatTypePrivate privata)
+            {
+                ClientService.Send(new SetMessageSenderBlockList(new MessageSenderUser(privata.UserId), new BlockListMain()));
+            }
+            else if (chat.Type is ChatTypeSecret secret)
+            {
+                ClientService.Send(new SetMessageSenderBlockList(new MessageSenderUser(secret.UserId), new BlockListMain()));
+            }
+
+            if (deleteChat.IsChecked is true)
+            {
+                ClientService.Send(new DeleteChatHistory(chat.Id, true, false));
+            }
+        }
+
+        public async void ReportSpam()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+            else if (chat.Type is ChatTypePrivate or ChatTypeSecret)
+            {
+                ReportUser();
+                return;
+            }
+
+            var title = Strings.AppName;
+            var message = Strings.ReportSpamAlert;
+
+            if (chat.Type is ChatTypeSupergroup supergroup)
+            {
+                message = supergroup.IsChannel ? Strings.ReportSpamAlertChannel : Strings.ReportSpamAlertGroup;
+            }
+            else if (chat.Type is ChatTypeBasicGroup)
+            {
+                message = Strings.ReportSpamAlertGroup;
+            }
+
+            var confirm = await ShowPopupAsync(message, title, Strings.OK, Strings.Cancel);
+            if (confirm != ContentDialogResult.Primary)
+            {
+
+                return;
+            }
+
+            Report();
+
+            if (chat.Type is ChatTypeBasicGroup or ChatTypeSupergroup)
+            {
+                ClientService.Send(new LeaveChat(chat.Id));
+            }
+            else if (chat.Type is ChatTypePrivate privata)
+            {
+                ClientService.Send(new SetMessageSenderBlockList(new MessageSenderUser(privata.UserId), new BlockListMain()));
+            }
+            else if (chat.Type is ChatTypeSecret secret)
+            {
+                ClientService.Send(new SetMessageSenderBlockList(new MessageSenderUser(secret.UserId), new BlockListMain()));
+            }
+
+            ClientService.Send(new DeleteChatHistory(chat.Id, true, false));
+        }
+
+        #endregion
+
+        public async void DeleteDraft()
+        {
+            var confirm = await ShowPopupAsync(Strings.ArticleDeleteDraftMessage, Strings.ArticleDeleteDraftTitle, Strings.Delete, Strings.Cancel, destructive: true);
+            if (confirm == ContentDialogResult.Primary)
+            {
+                ClientService.Send(new SetChatDraftMessage(_chat.Id, OutgoingTopicId, null));
+            }
+        }
+
+        public async void OpenTextEditor()
+        {
+            var text = GetFormattedText();
+
+            var tcs = new TaskCompletionSource<FormattedText>();
+            var popup = new TextEditorPopup(ClientService, NavigationService, text, tcs);
+
+            await ShowPopupAsync(popup);
+            text = await tcs.Task;
+
+            TextField?.FocusInput(FocusState.Keyboard);
+
+            if (text != null)
+            {
+                SetFormattedText(text);
+            }
+        }
+
+        public async void SendRichMessage()
+        {
+            long messageId;
+            RichMessage message;
+
+            var draft = GetDraftMessage();
+            if (draft?.Content is DraftMessageContentRichMessage richMessage)
+            {
+                messageId = 0;
+                message = richMessage.Message;
+            }
+            else
+            {
+                var text = GetFormattedText();
+
+                messageId = _composerHeader?.Editing?.Message.Id ?? 0;
+                message = new RichMessage(PageBlockHelper.ToPageBlocks(text), false, true);
+            }
+
+            // Carry the current reply into the editor; send options are picked with their defaults on send.
+            NavigationService.NavigateToTextEditor(ChatId, OutgoingTopicId, messageId, message, PeekComposer().ReplyTo);
+        }
+
+        /// <summary>
+        /// Opens the rich editor on what the text field held with <paramref name="blocks"/>
+        /// spliced in — where a paste ends up when the pasted content says more than a
+        /// message's text and entities can.
+        /// </summary>
+        public void PasteRichMessage(FormattedText before, Vector<PageBlock> blocks, FormattedText after)
+        {
+            var composed = new MutableVector<PageBlock>();
+
+            // A rich draft holds more than the text field can show, so it — not the
+            // field — is what the paste lands in. Same source of truth as SendRichMessage.
+            var draft = GetDraftMessage();
+            if (draft?.Content is DraftMessageContentRichMessage richMessage)
+            {
+                composed.AddRange(richMessage.Message.Blocks);
+                composed.AddRange(blocks);
+            }
+            else
+            {
+                composed.AddRange(PageBlockHelper.ToPageBlocks(before));
+                composed.AddRange(blocks);
+                composed.AddRange(PageBlockHelper.ToPageBlocks(after));
+            }
+
+            var message = new RichMessage(composed, false, true);
+
+            // The field keeps its text: the editor is a separate window, and nothing is
+            // sent until it says so — same as SendRichMessage above.
+            NavigationService.NavigateToTextEditor(ChatId, OutgoingTopicId, 0, message, PeekComposer().ReplyTo);
+        }
+
+        public void Boost()
+        {
+            Boost(0);
+        }
+
+        public async void Boost(int requiredLevel)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var response1 = await ClientService.SendAsync(new GetChatBoostFeatures(chat.Type is ChatTypeSupergroup { IsChannel: true }));
+            var response2 = await ClientService.SendAsync(new GetAvailableChatBoostSlots());
+            var response3 = await ClientService.SendAsync(new GetChatBoostStatus(chat.Id));
+
+            if (response1 is ChatBoostFeatures features && response2 is ChatBoostSlots slots && response3 is ChatBoostStatus status)
+            {
+                ShowPopup(new ChatBoostFeaturesPopup(ClientService, NavigationService, chat, status, slots, features, ChatBoostFeature.None, requiredLevel));
+            }
+        }
+
+        #region Delete and Exit
+
+        public async void DeleteChat()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            Logger.Info(chat.Type);
+
+            var updated = await ClientService.SendAsync(new GetChat(chat.Id)) as Chat ?? chat;
+            var dialog = new DeleteChatPopup(ClientService, updated, null, false);
+
+            var confirm = await ShowPopupAsync(dialog);
+            if (confirm == ContentDialogResult.Primary)
+            {
+                var check = dialog.IsChecked == true;
+
+                if (updated.Type is ChatTypeSecret secret)
+                {
+                    await ClientService.SendAsync(new CloseSecretChat(secret.SecretChatId));
+                }
+                else if (updated.Type is ChatTypeBasicGroup or ChatTypeSupergroup)
+                {
+                    await ClientService.SendAsync(new LeaveChat(updated.Id));
+                }
+
+                var user = ClientService.GetUser(updated);
+                if (user != null && user.Type is UserTypeRegular)
+                {
+                    ClientService.Send(new DeleteChatHistory(updated.Id, true, check));
+                }
+                else
+                {
+                    if (updated.Type is ChatTypePrivate privata && check)
+                    {
+                        await ClientService.SendAsync(new SetMessageSenderBlockList(new MessageSenderUser(privata.UserId), new BlockListMain()));
+                    }
+
+                    ClientService.Send(new DeleteChatHistory(updated.Id, true, false));
+                }
+            }
+        }
+
+        public async void ViewAsChats()
+        {
+            if (Chat is not Chat chat)
+            {
+                return;
+            }
+
+            await ClientService.SendAsync(new ToggleChatViewAsTopics(chat.Id, true));
+
+            var target = typeof(ProfilePage);
+            var parameter = new ChatMessageTopic(chat.Id, null);
+
+            NavigationService.GoBackAt(0, false);
+
+            NavigationService.Frame.BackStack.Add(new PageStackEntry(target, parameter, null));
+            NavigationService.GoBack(infoOverride: new SlideNavigationTransitionInfo { Effect = SlideNavigationTransitionEffect.FromLeft });
+            NavigationService.Frame.ForwardStack.Clear();
+        }
+
+        public async void ViewAsTopics()
+        {
+            if (Chat is not Chat chat)
+            {
+                return;
+            }
+
+            await ClientService.SendAsync(new ToggleChatViewAsTopics(chat.Id, true));
+            NavigationService.GoBackAt(0);
+        }
+
+        public async void CreateTopic()
+        {
+            if (Chat is not Chat chat)
+            {
+                return;
+            }
+
+            var popup = new SupergroupTopicPopup(ClientService, null);
+
+            var confirm = await ShowPopupAsync(popup);
+            if (confirm == ContentDialogResult.Primary)
+            {
+                var response = await ClientService.SendAsync(new CreateForumTopic(chat.Id, popup.SelectedName, false, popup.SelectedIcon));
+                if (response is ForumTopicInfo info)
+                {
+                    NavigationService.NavigateToChat(chat, topic: new MessageTopicForum(info.ForumTopicId), force: false, clearBackStack: true);
+                }
+            }
+        }
+
+        public void OpenProfile(INavigationService navigationService)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (chat.Id == ClientService.Options.RepliesBotChatId
+                || chat.Id == ClientService.Options.VerificationCodesBotChatId
+                || Type == DialogType.EventLog
+                || Type == DialogType.Pinned
+                || Type == DialogType.BusinessReplies
+                || Type == DialogType.WelcomeMessages
+                || Type == DialogType.ScheduledMessages)
+            {
+                return;
+            }
+
+            if (SavedMessagesTopic != null || ForumTopic != null)
+            {
+                navigationService.Navigate(typeof(ProfilePage), new ChatMessageTopic(chat.Id, TopicId), infoOverride: new SlideNavigationTransitionInfo { Effect = SlideNavigationTransitionEffect.FromRight });
+            }
+            else if (DirectMessagesChatTopic != null)
+            {
+                navigationService.NavigateToSender(DirectMessagesChatTopic.SenderId, infoOverride: new SlideNavigationTransitionInfo { Effect = SlideNavigationTransitionEffect.FromRight });
+            }
+            else if (IsDirectMessagesGroup && ClientService.TryGetSupergroupFull(chat, out SupergroupFullInfo fullInfo))
+            {
+                navigationService.Navigate(typeof(ProfilePage), fullInfo.DirectMessagesChatId, infoOverride: new SlideNavigationTransitionInfo { Effect = SlideNavigationTransitionEffect.FromRight });
+            }
+            else if (ChatId == ClientService.Options.MyId)
+            {
+                navigationService.Navigate(typeof(ProfilePage), new ChatMessageTopic(chat.Id, null), infoOverride: new SlideNavigationTransitionInfo { Effect = SlideNavigationTransitionEffect.FromRight });
+            }
+            else
+            {
+                navigationService.Navigate(typeof(ProfilePage), chat.Id, infoOverride: new SlideNavigationTransitionInfo { Effect = SlideNavigationTransitionEffect.FromRight });
+            }
+        }
+
+        public void DeleteTopic()
+        {
+            if (SavedMessagesTopic != null)
+            {
+                DeleteSavedMessagesTopic(SavedMessagesTopic);
+            }
+            else if (DirectMessagesChatTopic != null)
+            {
+                DeleteDirectMessagesChatTopic(DirectMessagesChatTopic);
+            }
+        }
+
+        private async void DeleteSavedMessagesTopic(SavedMessagesTopic topic)
+        {
+            string message;
+            string title;
+            string primary;
+
+            if (topic.Type is SavedMessagesTopicTypeMyNotes)
+            {
+                message = Strings.ClearHistoryMyNotesMessage;
+                title = Strings.ClearHistoryMyNotesTitle;
+                primary = Strings.Delete;
+            }
+            else
+            {
+                var chatTitle = ClientService.GetTitle(topic);
+
+                message = string.Format(Strings.ClearHistoryMessageSingle, chatTitle);
+                title = string.Format(Strings.ClearHistoryTitleSingle, chatTitle);
+                primary = Strings.Remove;
+            }
+
+            var confirm = await ShowPopupAsync(message, title, primary, Strings.Cancel, destructive: true);
+            if (confirm == ContentDialogResult.Primary)
+            {
+                NavigationService.GoBack();
+                ClientService.Send(new DeleteSavedMessagesTopicHistory(topic.Id));
+            }
+        }
+
+        private async void DeleteDirectMessagesChatTopic(DirectMessagesChatTopic topic)
+        {
+            var message = string.Format(Strings.AreYouSureClearHistoryWithUser, ClientService.GetTitle(topic.SenderId));
+            var title = Strings.ClearHistory;
+
+            var confirm = await ShowPopupAsync(message, title, Strings.Delete, Strings.Cancel, destructive: true);
+            if (confirm == ContentDialogResult.Primary)
+            {
+                NavigationService.GoBack();
+                ClientService.Send(new DeleteDirectMessagesChatTopicHistory(ChatId, topic.Id));
+            }
+        }
+
+        #endregion
+
+        #region Clear history
+
+        public async void ClearHistory()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            Logger.Info(chat.Type);
+
+            var updated = await ClientService.SendAsync(new GetChat(chat.Id)) as Chat ?? chat;
+            var dialog = new DeleteChatPopup(ClientService, updated, null, true);
+
+            var confirm = await ShowPopupAsync(dialog);
+            if (confirm == ContentDialogResult.Primary)
+            {
+                ClientService.Send(new DeleteChatHistory(updated.Id, false, dialog.IsChecked));
+            }
+        }
+
+        #endregion
+
+        #region Call
+
+        public void VoiceCall()
+        {
+            Call(false);
+        }
+
+        public void VideoCall()
+        {
+            Call(true);
+        }
+
+        public async void Call(bool video)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (ClientService.TryGetUserFull(chat, out UserFullInfo userFull))
+            {
+                if (userFull.CanBeCalled)
+                {
+                    _voipService.StartPrivateCall(NavigationService, chat, video);
+                }
+                else
+                {
+                    var confirm = await ShowPopupAsync(string.Format(Strings.CallForbiddenInviteLinkText, chat.Title), Strings.CallForbiddenInviteLinkTitle, Strings.CallForbiddenInviteLinkButton, Strings.Cancel);
+                    if (confirm == ContentDialogResult.Primary)
+                    {
+                        var response = await ClientService.SendAsync(new CreateGroupCall(null));
+                        if (response is GroupCallInfo info && ClientService.TryGetGroupCall(info.GroupCallId, out GroupCall groupCall))
+                        {
+                            // Not a composer send: it borrows nothing from it and must not clear it.
+                            var plan = await PrepareSendAsync(ComposerSnapshot.None, 1, SchedulingState.Auto, null, false, 0);
+                            if (plan == null)
+                            {
+                                return;
+                            }
+
+                            await SendMessageAsync(plan, new InputMessageText(groupCall.InviteLink.AsFormattedText(), null, false));
+                        }
+                    }
+                }
+            }
+            else
+            {
+                _voipService.JoinGroupCall(NavigationService, chat.Id);
+            }
+        }
+
+        #endregion
+
+        #region Unpin message
+
+        public async void HidePinnedMessage()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (chat.CanPinMessages(ClientService))
+            {
+                var confirm = await ShowPopupAsync(Strings.UnpinMessageAlert, Strings.AppName, Strings.OK, Strings.Cancel);
+                if (confirm == ContentDialogResult.Primary)
+                {
+                    if (DirectMessagesChatTopic != null)
+                    {
+                        ClientService.Send(new UnpinAllDirectMessagesChatTopicMessages(chat.Id, DirectMessagesChatTopic.Id));
+                    }
+                    else if (ForumTopic != null)
+                    {
+                        ClientService.Send(new UnpinAllForumTopicMessages(chat.Id, ForumTopic.Info.ForumTopicId));
+                    }
+                    else
+                    {
+                        ClientService.Send(new UnpinAllChatMessages(chat.Id));
+                    }
+
+                    Delegate?.UpdatePinnedMessage(chat, false);
+                }
+            }
+            else
+            {
+                Settings.SetChatPinnedMessage(chat.Id, int.MaxValue);
+                Delegate?.UpdatePinnedMessage(chat, false);
+            }
+        }
+
+        public void ShowPinnedMessage()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            Settings.SetChatPinnedMessage(chat.Id, 0);
+
+            if (TryGetFirstVisibleMessageId(out long firstVisibleId))
+            {
+                PinnedMessages.LoadSlice(firstVisibleId);
+            }
+        }
+
+        public void OpenPinnedMessages()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (TopicId != null)
+            {
+                NavigationService.Navigate(typeof(ChatPinnedPage), new ChatMessageTopic(chat.Id, TopicId));
+            }
+            else
+            {
+                NavigationService.Navigate(typeof(ChatPinnedPage), chat.Id);
+            }
+        }
+
+        #endregion
+
+        public void HideSponsoredMessage(MessageViewModel message = null)
+        {
+            if (message != null)
+            {
+                Items.Remove(message);
+            }
+            for (int index = Items.Count - 1; index >= 0; index--)
+            {
+                if (Items[index].Content is MessageSponsored)
+                {
+                    Items.RemoveAt(index);
+                }
+            }
+            PendingSponsoredMessage = null;
+            SponsoredMessage = null;
+        }
+
+        public void ViewSponsoredMessage()
+        {
+        }
+
+        #region Unblock
+
+        public async void Unblock()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var privata = chat.Type as ChatTypePrivate;
+            if (privata == null)
+            {
+                return;
+            }
+
+            var user = ClientService.GetUser(privata.UserId);
+            if (user.Type is UserTypeBot)
+            {
+                await ClientService.SendAsync(new SetMessageSenderBlockList(new MessageSenderUser(user.Id), null));
+                Start();
+            }
+            else
+            {
+                var confirm = await ShowPopupAsync(Strings.AreYouSureUnblockContact, Strings.AppName, Strings.OK, Strings.Cancel);
+                if (confirm != ContentDialogResult.Primary)
+                {
+                    return;
+                }
+
+                ClientService.Send(new SetMessageSenderBlockList(new MessageSenderUser(user.Id), null));
+            }
+        }
+
+        #endregion
+
+        #region Switch
+
+        public async void ActivateInlineBot()
+        {
+            if (InlineBotResults?.Button is not InlineQueryResultsButton button || _currentInlineBot is not User currentInlineBot)
+            {
+                return;
+            }
+
+            if (button.Type is InlineQueryResultsButtonTypeStartBot startBot)
+            {
+                var response = await ClientService.SendAsync(new CreatePrivateChat(currentInlineBot.Id, false));
+                if (response is Chat chat)
+                {
+                    SetText(null, false);
+
+                    ClientService.Send(new SendBotStartMessage(currentInlineBot.Id, chat.Id, startBot.Parameter));
+                    NavigationService.NavigateToChat(chat);
+                }
+            }
+            else if (button.Type is InlineQueryResultsButtonTypeWebApp webApp)
+            {
+                var response = await ClientService.SendAsync(new GetWebAppUrl(currentInlineBot.Id, webApp.Url, new WebAppOpenParameters(Window.ThemeParameters, Constants.WebAppHostName, new WebAppOpenModeFullSize())));
+                if (response is WebAppUrl webAppUrl)
+                {
+                    NavigationService.NavigateToWebApp(currentInlineBot, webAppUrl, source: new OpenUrlSourceChat(ChatId, null));
+                }
+            }
+        }
+
+        #endregion
+
+        #region Share my contact
+
+        public void ShareMyContact()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var user = ClientService.GetUser(chat);
+            if (user == null)
+            {
+                return;
+            }
+
+            ClientService.Send(new SharePhoneNumber(user.Id));
+        }
+
+        #endregion
+
+        #region Unarchive
+
+        public void Unarchive()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            ClientService.Send(new AddChatToList(chat.Id, new ChatListMain()));
+            ClientService.Send(new SetChatNotificationSettings(chat.Id, new ChatNotificationSettings
+            {
+                UseDefaultDisableMentionNotifications = true,
+                UseDefaultDisablePinnedMessageNotifications = true,
+                UseDefaultMuteFor = true,
+                UseDefaultShowPreview = true,
+                UseDefaultSound = true
+            }));
+        }
+
+        #endregion
+
+        #region Invite
+
+        public void Invite()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (chat.Type is ChatTypeSupergroup or ChatTypeBasicGroup)
+            {
+                ShowPopup(new ChooseChatsPopup(), new ChooseChatsConfigurationInviteToChat(chat.Id));
+            }
+        }
+
+        #endregion
+
+        #region Add contact
+
+        public void AddToContacts()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var user = ClientService.GetUser(chat);
+            if (user == null)
+            {
+                return;
+            }
+
+            NavigationService.Navigate(typeof(UserEditPage), user.Id);
+        }
+
+        #endregion
+
+        #region Start
+
+        public void Start()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var bot = GetStartingBot();
+            if (bot == null)
+            {
+                return;
+            }
+
+            var token = _accessToken;
+
+            AccessToken = null;
+            ClientService.Send(new SendBotStartMessage(bot.Id, chat.Id, token ?? string.Empty));
+        }
+
+        private User GetStartingBot()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return null;
+            }
+
+            if (chat.Type is ChatTypePrivate privata)
+            {
+                return ClientService.GetUser(privata.UserId);
+            }
+
+            //var user = _with as TLUser;
+            //if (user != null && user.IsBot)
+            //{
+            //    return user;
+            //}
+
+            //var chat = _with as TLChatBase;
+            //if (chat != null)
+            //{
+            //    // TODO
+            //    //return this._bot;
+            //}
+
+            return null;
+        }
+
+        #endregion
+
+        #region Show read date
+
+        public async void ShowReadDate()
+        {
+            if (ClientService.TryGetUser(_chat, out User user))
+            {
+                var popup = new ChangePrivacyPopup(user, ChangePrivacyType.ReadDate, IsPremium, IsPremiumAvailable);
+
+                var confirm = await ShowPopupAsync(popup);
+                if (confirm == ContentDialogResult.Primary)
+                {
+                    ClientService.Send(new SetReadDatePrivacySettings(new ReadDatePrivacySettings(true)));
+                    ShowToast(Strings.PremiumReadSet, ToastPopupIcon.Info);
+                }
+                else if (confirm == ContentDialogResult.Secondary && IsPremiumAvailable && !IsPremium)
+                {
+                    NavigationService.ShowPromo(new PremiumSourceFeature(new PremiumFeatureAdvancedChatManagement()));
+                }
+            }
+        }
+
+        #endregion
+
+        #region Search
+
+        public void SearchExecute(string query, MessageSender from = null)
+        {
+            if (Search == null || !string.IsNullOrEmpty(query) || from != null)
+            {
+                Search = new ChatSearchViewModel(ClientService, NavigationService, Settings, Aggregator, this, query, from);
+            }
+            else
+            {
+                // TODO: focus and select search bar
+                Search = null;
+            }
+        }
+
+        #endregion
+
+        #region Jump to date
+
+        public async void JumpDate()
+        {
+            var dialog = new CalendarPopup(ClientService, ChatId, TopicId);
+            dialog.MaxDate = DateTimeOffset.Now.Date;
+            //dialog.SelectedDates.Add(BindConvert.Current.DateTime(message.Date));
+
+            var confirm = await ShowPopupAsync(dialog);
+            if (confirm == ContentDialogResult.Primary && dialog.SelectedDates.Count > 0)
+            {
+                var first = dialog.SelectedDates.FirstOrDefault();
+                var offset = first.Date.ToUnixTimeSeconds();
+
+                await LoadDateSliceAsync(offset);
+            }
+        }
+
+        #endregion
+
+        #region Group stickers
+
+        private void GroupStickersExecute()
+        {
+            //var channel = With as TLChannel;
+            //if (channel == null)
+            //{
+            //    return;
+            //}
+
+            //var channelFull = Full as TLChannelFull;
+            //if (channelFull == null)
+            //{
+            //    return;
+            //}
+
+            //if ((channel.IsCreator || (channel.HasAdminRights && channel.AdminRights.IsChangeInfo)) && channelFull.IsCanSetStickers)
+            //{
+            //    NavigationService.Navigate(typeof(SupergroupEditStickerSetPage), channel.ToPeer());
+            //}
+            //else
+            //{
+            //    Stickers.HideGroup(channelFull);
+            //}
+        }
+
+        #endregion
+
+        #region Read mentions
+
+        public void ReadMentions()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (ForumTopic != null)
+            {
+                ClientService.Send(new ReadAllForumTopicMentions(chat.Id, ForumTopic.Info.ForumTopicId));
+            }
+            else
+            {
+                ClientService.Send(new ReadAllChatMentions(chat.Id));
+            }
+        }
+
+        #endregion
+
+        #region Read reactions
+
+        public void ReadReactions()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (DirectMessagesChatTopic != null)
+            {
+                ClientService.Send(new ReadAllDirectMessagesChatTopicReactions(chat.Id, DirectMessagesChatTopic.Id));
+            }
+            else if (ForumTopic != null)
+            {
+                ClientService.Send(new ReadAllForumTopicReactions(chat.Id, ForumTopic.Info.ForumTopicId));
+            }
+            else
+            {
+                ClientService.Send(new ReadAllChatReactions(chat.Id));
+            }
+        }
+
+        #endregion
+
+        #region Read poll votes
+
+        public void ReadPollVotes()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (ForumTopic != null)
+            {
+                ClientService.Send(new ReadAllForumTopicPollVotes(chat.Id, ForumTopic.Info.ForumTopicId));
+            }
+            else
+            {
+                ClientService.Send(new ReadAllChatPollVotes(chat.Id));
+            }
+        }
+
+        #endregion
+
+        #region Read messages
+
+        public void ReadMessages()
+        {
+            RepliesStack.Clear();
+            PreviousSlice();
+        }
+
+        #endregion
+
+        #region Mute for
+
+        public async void MuteFor(int? value)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (value is int update)
+            {
+                _notificationsService.SetMuteFor(chat, update, XamlRoot);
+            }
+            else
+            {
+                var muteFor = Settings.Notifications.GetMuteFor(chat);
+                var popup = new ChatMutePopup(muteFor);
+
+                var confirm = await ShowPopupAsync(popup);
+                if (confirm != ContentDialogResult.Primary)
+                {
+                    return;
+                }
+
+                if (muteFor != popup.Value)
+                {
+                    _notificationsService.SetMuteFor(chat, popup.Value, XamlRoot);
+                }
+            }
+        }
+
+        public void SetSound(bool silent)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            _notificationsService.SetSound(chat, silent, XamlRoot);
+        }
+
+        #endregion
+
+        #region Report Chat
+
+        private ReportChatSelection _isReportingMessages;
+        public ReportChatSelection IsReportingMessages
+        {
+            get => _isReportingMessages;
+            set => Set(ref _isReportingMessages, value);
+        }
+
+        public async void Report()
+        {
+            await ReportAsync(Array.Empty<long>());
+        }
+
+        private async Task ReportAsync(Vector<long> messages)
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            ReportChatPopup popup;
+            if (IsReportingMessages is ReportChatSelection selection)
+            {
+                popup = new ReportChatPopup(ClientService, NavigationService, chat.Id, IsReportingMessages?.Option, messages, selection.Text);
+            }
+            else
+            {
+                popup = new ReportChatPopup(ClientService, NavigationService, chat.Id, null, messages, string.Empty);
+            }
+
+            var report = await popup.ReportAsync();
+            if (report?.Result is ReportChatResultMessagesRequired)
+            {
+                ShowHideSelection(true, report);
+            }
+            else if (IsReportingMessages != null)
+            {
+                ShowHideSelection(false);
+            }
+        }
+
+        #endregion
+
+        #region Set timer
+
+        public async void SetTimer()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            var dialog = new ChatTtlPopup(chat.Type is ChatTypeSecret ? ChatTtlType.Secret : ChatTtlType.Normal);
+            dialog.Value = chat.MessageAutoDeleteTime;
+
+            var confirm = await ShowPopupAsync(dialog);
+            if (confirm != ContentDialogResult.Primary || chat.MessageAutoDeleteTime == dialog.Value)
+            {
+                return;
+            }
+
+            ClientService.Send(new SetChatMessageAutoDeleteTime(chat.Id, dialog.Value));
+        }
+
+        #endregion
+
+        #region Set theme
+
+        public void ChangeTheme()
+        {
+            Delegate?.ChangeTheme();
+        }
+
+        #endregion
+
+        #region Scheduled messages
+
+        public void ShowScheduled()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            NavigationService.NavigateToChat(chat, scheduled: true);
+        }
+
+        #endregion
+
+        #region Unpin Messages
+
+        public async void UnpinMessages()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (chat.CanPinMessages(ClientService))
+            {
+                var confirm = await ShowPopupAsync(Strings.UnpinMessageAlert, Strings.AppName, Strings.OK, Strings.Cancel);
+                if (confirm == ContentDialogResult.Primary)
+                {
+                    if (DirectMessagesChatTopic != null)
+                    {
+                        ClientService.Send(new UnpinAllDirectMessagesChatTopicMessages(chat.Id, DirectMessagesChatTopic.Id));
+                    }
+                    else if (ForumTopic != null)
+                    {
+                        ClientService.Send(new UnpinAllForumTopicMessages(chat.Id, ForumTopic.Info.ForumTopicId));
+                    }
+                    else
+                    {
+                        ClientService.Send(new UnpinAllChatMessages(chat.Id));
+                    }
+
+                    Delegate?.UpdatePinnedMessage(chat, false);
+                }
+            }
+            else
+            {
+                Settings.SetChatPinnedMessage(chat.Id, int.MaxValue);
+                Delegate?.UpdatePinnedMessage(chat, false);
+            }
+        }
+
+        #endregion
+
+        #region Action
+
+        protected virtual void FilterExecute()
+        {
+
+        }
+
+        public async void Action()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            if (ClientService.FreezeState.IsFrozen)
+            {
+                ShowPopup(new FrozenPopup(ClientService.FreezeState));
+            }
+            else if (Search?.SavedMessagesTag != null)
+            {
+                Search.FilterByTag = !Search.FilterByTag;
+            }
+            else if (Type == DialogType.EventLog)
+            {
+                FilterExecute();
+            }
+            else if (SavedMessagesTopic != null)
+            {
+                if (SavedMessagesTopic.Type is SavedMessagesTopicTypeSavedFromChat savedFromChat && ClientService.TryGetChat(savedFromChat.ChatId, out Chat savedChat))
+                {
+                    NavigationService.NavigateToChat(savedChat);
+                }
+            }
+            else if (Type == DialogType.Pinned)
+            {
+                UnpinMessages();
+            }
+            else if (chat.Type is ChatTypePrivate privata)
+            {
+                var user = ClientService.GetUser(privata.UserId);
+                if (user == null)
+                {
+                    return;
+                }
+
+                if (user.Type is UserTypeDeleted)
+                {
+                    DeleteChat();
+                }
+                else if (chat.Id == ClientService.Options.RepliesBotChatId || chat.Id == ClientService.Options.VerificationCodesBotChatId)
+                {
+                    ToggleMute();
+                }
+                else if (chat.BlockList is BlockListMain)
+                {
+                    Unblock();
+                }
+                else if (user.Type is UserTypeBot)
+                {
+                    Start();
+                }
+            }
+            else if (chat.Type is ChatTypeBasicGroup basic)
+            {
+                var group = ClientService.GetBasicGroup(basic.BasicGroupId);
+                if (group == null)
+                {
+                    return;
+                }
+
+                if (group.UpgradedToSupergroupId != 0)
+                {
+                    var response = await ClientService.SendAsync(new CreateSupergroupChat(group.UpgradedToSupergroupId, false));
+                    if (response is Chat migratedChat)
+                    {
+                        NavigationService.NavigateToChat(migratedChat);
+                    }
+                }
+                else if (group.Status is ChatMemberStatusLeft or ChatMemberStatusBanned)
+                {
+                    // Delete and exit
+                    DeleteChat();
+                }
+                else if (group.Status is ChatMemberStatusCreator creator && !creator.IsMember)
+                {
+                    JoinChannel();
+                }
+            }
+            else if (chat.Type is ChatTypeSupergroup super)
+            {
+                var group = ClientService.GetSupergroup(super.SupergroupId);
+                if (group == null)
+                {
+                    return;
+                }
+
+                if (group.IsChannel)
+                {
+                    if (Constants.DEBUG)
+                    {
+                        ClientService.Send(new AddLocalMessage(chat.Id, new MessageSenderChat(chat.Id), null, true, new InputMessageContact(new Contact("999888777666", "SIMILAR", "CHANNELS", string.Empty, ClientService.Options.MyId))));
+                        return;
+                    }
+
+                    if (group.Status is ChatMemberStatusLeft || (group.Status is ChatMemberStatusCreator creator && !creator.IsMember))
+                    {
+                        JoinChannel();
+                    }
+                    else
+                    {
+                        ToggleMute();
+                    }
+                }
+                else
+                {
+                    if (group.Status is ChatMemberStatusLeft || (group.Status is ChatMemberStatusRestricted restricted && !restricted.IsMember) || (group.Status is ChatMemberStatusCreator creator && !creator.IsMember))
+                    {
+                        JoinChannel();
+                    }
+                    else if (group.Status is ChatMemberStatusBanned)
+                    {
+                        DeleteChat();
+                    }
+                    else if (ClientService.TryGetSupergroupFull(group.Id, out SupergroupFullInfo fullInfo))
+                    {
+                        if (fullInfo.MyBoostCount < fullInfo.UnrestrictBoostCount)
+                        {
+                            Boost(fullInfo.UnrestrictBoostCount);
+                        }
+                    }
+                }
+            }
+        }
+
+        #endregion
+
+        #region Join requests
+
+        public async void ShowJoinRequests()
+        {
+            var popup = new ChatJoinRequestsPopup(ClientService, NavigationService, Settings, Aggregator, _chat, string.Empty);
+            await ShowPopupAsync(popup);
+        }
+
+        #endregion
+
+        #region Group calls
+
+        public void JoinGroupCall()
+        {
+            var chat = _chat;
+            if (chat == null)
+            {
+                return;
+            }
+
+            _voipService.JoinGroupCall(NavigationService, chat.Id);
+        }
+
+        #endregion
+    }
+
+    public partial class BotCommandFullInfo(long userId, BotCommand command)
+    {
+        public long BotUserId { get; set; } = userId;
+
+        /// <summary>
+        /// Text of the bot command
+        /// </summary>
+        public string Command { get; set; } = command.Command;
+        /// <summary>
+        /// Represents a command supported by a bot
+        /// </summary>
+        public string Description { get; set; } = command.Description;
+        /// <summary>
+        /// True, if the command must send an ephemeral message instead of a regular one
+        /// </summary>
+        public bool IsEphemeral { get; set; } = command.IsEphemeral;
+    }
+
+    [Flags]
+    public enum DialogType
+    {
+        History,
+        Thread,
+        Pinned,
+        ScheduledMessages,
+        BusinessReplies,
+        WelcomeMessages,
+        EventLog
+    }
+}

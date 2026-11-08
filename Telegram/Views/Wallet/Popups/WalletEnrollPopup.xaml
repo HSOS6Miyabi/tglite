@@ -1,0 +1,57 @@
+﻿<controls:ModalPopup x:Class="Telegram.Views.Wallet.Popups.WalletEnrollPopup"
+                     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                     xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                     xmlns:controls="using:Telegram.Controls"
+                     mc:Ignorable="d">
+
+    <StackPanel>
+        <TextBlock x:Name="SubtitleLabel"
+                   Text="{CustomResource WalletProtectInfo}"
+                   Style="{StaticResource BodyTextBlockStyle}"
+                   Margin="0,0,0,16" />
+
+        <RadioButton x:Name="HelloOption"
+                     GroupName="WalletProtection"
+                     Visibility="Collapsed"
+                     Margin="0,0,0,8">
+            <StackPanel>
+                <TextBlock Text="{CustomResource WalletProtectWindowsHello}"
+                           Style="{StaticResource BaseTextBlockStyle}"
+                           TextWrapping="Wrap" />
+                <TextBlock Text="{CustomResource WalletProtectWindowsHelloInfo}"
+                           Style="{StaticResource InfoBodyTextBlockStyle}"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+        </RadioButton>
+
+        <RadioButton x:Name="PasscodeOption"
+                     GroupName="WalletProtection"
+                     Margin="0,0,0,8">
+            <StackPanel>
+                <TextBlock x:Name="PasscodeTitle"
+                           Text="{CustomResource WalletProtectPasscodeLock}"
+                           Style="{StaticResource BaseTextBlockStyle}"
+                           TextWrapping="Wrap" />
+                <TextBlock x:Name="PasscodeSubtitle"
+                           Text="{CustomResource WalletProtectPasscodeLockInfo}"
+                           Style="{StaticResource InfoBodyTextBlockStyle}"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+        </RadioButton>
+
+        <RadioButton x:Name="NoneOption"
+                     GroupName="WalletProtection">
+            <StackPanel>
+                <TextBlock Text="{CustomResource WalletProtectDontAsk}"
+                           Style="{StaticResource BaseTextBlockStyle}"
+                           Foreground="{ThemeResource DangerButtonForeground}"
+                           TextWrapping="Wrap" />
+                <TextBlock Text="{CustomResource WalletProtectDontAskInfo}"
+                           Style="{StaticResource InfoBodyTextBlockStyle}"
+                           TextWrapping="Wrap" />
+            </StackPanel>
+        </RadioButton>
+    </StackPanel>
+</controls:ModalPopup>

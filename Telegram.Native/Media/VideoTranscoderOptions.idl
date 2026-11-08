@@ -1,0 +1,61 @@
+import "Media/VideoTranscoderLayer.idl";
+
+namespace Telegram.Native.Media
+{
+    [default_interface]
+    runtimeclass VideoTranscoderOptions
+    {
+        VideoTranscoderOptions();
+
+        String InputPath;
+        String OutputPath;
+
+        // In milliseconds of the source; a stop time of 0 is its end.
+        Int64 StartTime;
+        Int64 StopTime;
+
+        // Leaves the audio out.
+        Boolean Mute;
+
+        Int32 OutputWidth;
+        Int32 OutputHeight;
+
+        // From the source's upright pixels, once its own rotation is applied, to the output's.
+        Windows.Foundation.Numerics.Matrix3x2 Transform;
+
+        // What the output shows where the frame does not cover it: a vertical gradient, top to
+        // bottom. Black by default.
+        Windows.UI.Color BackgroundTop;
+        Windows.UI.Color BackgroundBottom;
+
+        // In bits per second.
+        Int32 VideoBitrate;
+
+        // In bits per second; 0 is 128 kbps.
+        Int32 AudioBitrate;
+
+        // Folds the sound into a single channel.
+        Boolean MonoAudio;
+
+        // Frames past this rate are dropped; 0 keeps them all.
+        Int32 MaxFrameRate;
+
+        // Lets a hardware encoder be tried before Windows' software one.
+        Boolean HardwareEncoding;
+
+        // Outside the ellipse the output fits, the frame blurred and darkened: a video note's
+        // corners, which only a player that shows the whole square ever sees.
+        Boolean RoundBlur;
+
+        // Held for StillDuration milliseconds in place of the video at InputPath, which is then not
+        // read: premultiplied BGRA, StillWidth by StillHeight, upright. The output has no audio and
+        // runs at MaxFrameRate, or at 30 frames a second when that is 0.
+        Windows.Storage.Streams.IBuffer StillPixels;
+        Int32 StillWidth;
+        Int32 StillHeight;
+        Int64 StillDuration;
+
+        // Drawn over every frame, each over the ones added before it.
+        void AddLayer(VideoTranscoderLayer layer);
+    }
+}

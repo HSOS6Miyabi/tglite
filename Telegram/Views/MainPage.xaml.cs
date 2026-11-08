@@ -1,0 +1,4542 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using Microsoft.Graphics.Canvas.Geometry;
+using Microsoft.UI.Xaml.Controls;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Numerics;
+using System.Threading;
+using System.Threading.Tasks;
+using Telegram.Collections;
+using Telegram.Common;
+using Telegram.Composition;
+using Telegram.Controls;
+using Telegram.Controls.Cells;
+using Telegram.Controls.Gallery;
+using Telegram.Controls.Media;
+using Telegram.Controls.Messages;
+using Telegram.Controls.Views;
+using Telegram.Native;
+using Telegram.Navigation;
+using Telegram.Navigation.Services;
+using Telegram.Services;
+using Telegram.Services.Settings;
+using Telegram.Services.Updates;
+using Telegram.Streams;
+using Telegram.Td.Api;
+using Telegram.ViewModels;
+using Telegram.ViewModels.Delegates;
+using Telegram.ViewModels.Drawers;
+using Telegram.Views.Create;
+using Telegram.Views.Host;
+using Telegram.Views.Popups;
+using Telegram.Views.Settings;
+using Windows.ApplicationModel.DataTransfer;
+using Windows.Foundation;
+using Windows.UI;
+using Windows.UI.Composition;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Automation;
+using Windows.UI.Xaml.Automation.Peers;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Controls.Primitives;
+using Windows.UI.Xaml.Documents;
+using Windows.UI.Xaml.Hosting;
+using Windows.UI.Xaml.Input;
+using Windows.UI.Xaml.Media;
+using Windows.UI.Xaml.Media.Animation;
+using Windows.UI.Xaml.Navigation;
+
+namespace Telegram.Views
+{
+    public sealed partial class MainPage : CorePage, IRootContentPage, INavigatingPage, IChatListDelegate, INavigationHost
+    {
+        private MainViewModel _viewModel;
+        public MainViewModel ViewModel => _viewModel ??= DataContext as MainViewModel;
+
+        public RootWindow Root { get; set; }
+
+        private readonly IClientService _clientService;
+
+        private readonly DispatcherTimer _memoryUsageTimer;
+        private double _memoryUsage;
+        private double _sharedCommitUsage;
+        private double _videoMemoryUsage;
+        private double _sharedMemoryUsage;
+        private uint _handles;
+
+        // Leak watch. A step this big in the SETTLED heap is worth interrupting for; smaller ones
+        // are indistinguishable from a big chat being opened.
+        private const long MemoryStepThreshold = 30 * 1024 * 1024;
+        private long _memoryFloor;
+        private int _memoryGen2 = -1;
+        private bool _memorySettling;
+
+        private bool _unloaded;
+
+        private readonly ThemeShadowEx _navigationShadow;
+
+        public MainPage()
+        {
+            InitializeComponent();
+#if INSTRUMENTATION
+            // Here rather than at the first analysis: a window can be closed, and its tree captured,
+            // long before anyone asks for a report.
+            Telegram.Common.Instrumentation.Detached = DebugDetachedOf;
+#endif
+            DataContext = LifetimeService.Current.ActiveItem.Resolve<MainViewModel>();
+
+            var queue = DispatcherQueue.GetForCurrentThread();
+
+            _drain = new DispatcherDrain<UpdateChatCell>(handler => queue.TryEnqueue(handler), Handle);
+            _clientService = ViewModel.ClientService;
+
+            ViewModel.Chats.Delegate = this;
+            LifetimeService.Current.Playback.SourceChanged += OnPlaybackSourceChanged;
+
+            InitializeLock();
+
+            UpdateChatFolders();
+            UpdateNavigationBar();
+
+            VisualUtilities.DropShadow(UpdateShadow);
+
+            RootGrid.CreateInsetClip(0, -40, 0, 0);
+
+            ChatsList.RegisterPropertyChangedCallback(ListViewBase.SelectionModeProperty, List_SelectionModeChanged);
+
+            //var show = !((TLViewModelBase)ViewModel).Settings.CollapseArchivedChats;
+            //ArchivedChatsCompactPanel.Visibility = show ? Visibility.Collapsed : Visibility.Visible;
+            ArchivedChatsPanel.Visibility = ((ViewModelBase)ViewModel).Settings.HideArchivedChats
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+
+            ElementCompositionPreview.SetIsTranslationEnabled(ManagePanel, true);
+            ElementCompositionPreview.SetIsTranslationEnabled(DialogsPanel, true);
+            ElementCompositionPreview.SetIsTranslationEnabled(SearchField, true);
+
+            _navigationShadow = new ThemeShadowEx(Navigation, 16);
+
+            if (AppSettings.Diagnostics.ShowMemoryUsage)
+            {
+                _memoryUsageTimer = new DispatcherTimer();
+                _memoryUsageTimer.Interval = TimeSpan.FromSeconds(1);
+                _memoryUsageTimer.Tick += MemoryUsageTimer_Tick;
+                _memoryUsageTimer.Start();
+
+                MemoryUsageTimer_Tick(null, null);
+            }
+
+            if (Constants.DEBUG)
+            {
+                FocusManager.GettingFocus += OnGettingFocus;
+            }
+        }
+
+        private void OnGettingFocus(object sender, GettingFocusEventArgs args)
+        {
+            Logger.Info(string.Format("New: {0}, Old: {1}, {2}, {3} ~> {4}",
+                args.NewFocusedElement?.GetType().Name ?? "null",
+                args.OldFocusedElement?.GetType().Name ?? "null",
+                args.Direction, args.InputDevice, args.FocusState));
+        }
+
+        private readonly int[] _lastCollectionCount = new int[3]
+        {
+            GC.CollectionCount(0),
+            GC.CollectionCount(1),
+            GC.CollectionCount(2)
+        };
+
+#if NET9_0_OR_GREATER
+        private TimeSpan _lastPauseDuration = GC.GetTotalPauseDuration();
+        private long _lastCollectionIndex = GC.GetGCMemoryInfo().Index;
+#endif
+
+        /// <summary>
+        /// How long the process spent suspended for collection since the last tick, and how long
+        /// in total. A collection suspends every managed thread, so this is the UI thread's share
+        /// of it as much as anyone's - what a frame that never rendered was doing.
+        /// </summary>
+        /// <remarks>
+        /// Four nanoseconds to ask, against the twenty-seven GetTotalMemory above it costs, so at
+        /// one hertz it is free. Not on .NET Native, where neither this nor GCMemoryInfo exists -
+        /// the collection counts in PollGC are what that build has.
+        /// </remarks>
+        private string PollPause()
+        {
+#if NET9_0_OR_GREATER
+            var total = GC.GetTotalPauseDuration();
+            var elapsed = total - _lastPauseDuration;
+
+            _lastPauseDuration = total;
+
+            if (elapsed > TimeSpan.Zero)
+            {
+                // Which collection it was, and whether it stopped the world: a background gen2
+                // suspends twice for a moment, where a blocking one is the whole pause. Only the
+                // last collection is described, so a tick that saw two reports the later one.
+                var info = GC.GetGCMemoryInfo();
+                var collections = info.Index - _lastCollectionIndex;
+
+                _lastCollectionIndex = info.Index;
+
+                return string.Format(", {0:N0}/{1:N0} ms GC ({2}gen{3}{4})",
+                    elapsed.TotalMilliseconds,
+                    total.TotalMilliseconds,
+                    collections > 1 ? collections + "x " : string.Empty,
+                    info.Generation,
+                    info.Concurrent ? string.Empty : " blocking");
+            }
+
+            return string.Format(", {0:N0} ms GC", total.TotalMilliseconds);
+#else
+            return string.Empty;
+#endif
+        }
+
+        private string PollGC()
+        {
+#if WINUI3
+            // GarbageCollectionMonitor is not built for this flavour: it tracks CoreWindow
+            // activation and the UWP suspend/resume events, and has neither here. The other two
+            // call sites are already behind #if !NET9_0_OR_GREATER, so this is the only one.
+            var occurred = string.Empty;
+#else
+            var occurred = GarbageCollectionMonitor.Debug();
+#endif
+            var first = true;
+
+            for (int i = 0; i <= 2; i++)
+            {
+                int count = GC.CollectionCount(i);
+                if (count != _lastCollectionCount[i])
+                {
+                    _lastCollectionCount[i] = count;
+
+                    if (first)
+                        occurred += " (";
+
+                    first = false;
+                    occurred += i.ToString();
+                }
+            }
+
+            if (!first)
+                occurred += ")";
+
+            return occurred;
+        }
+
+        private void MemoryUsageTimer_Tick(object sender, object e)
+        {
+            // AppMemoryUsage, the two commits summed, cannot tell a composition surface leak from a
+            // heap one: surfaces are shared with DWM, so they land in the shared commit, each with a
+            // handle.
+            NativeUtils.GetMemoryUsage(out ulong privateCommit, out ulong sharedCommit, out ulong dedicatedVideo, out ulong sharedVideo, out uint handles);
+
+            var memoryUsage = Math.Round(privateCommit / 1024.0 / 1024.0);
+            var sharedCommitUsage = Math.Round(sharedCommit / 1024.0 / 1024.0);
+            var videoMemoryUsage = Math.Round(dedicatedVideo / 1024.0 / 1024.0);
+            var sharedMemoryUsage = Math.Round(sharedVideo / 1024.0 / 1024.0);
+            //var occurred = PollGC();
+            var paused = PollPause();
+
+            //double unmanaged = currentProcess.NativeHeap / 1024.0 / 1024.0;
+            double managed = GC.GetTotalMemory(false) / 1024.0 / 1024.0; // currentProcess.ManagedHeap / 1024.0 / 1024.0;
+
+            if (memoryUsage != _memoryUsage || sharedCommitUsage != _sharedCommitUsage || videoMemoryUsage != _videoMemoryUsage || sharedMemoryUsage != _sharedMemoryUsage || handles != _handles)
+            {
+                MemoryLabel.Text = $"- {memoryUsage + sharedCommitUsage:F0} MB ({memoryUsage:F0} private, {sharedCommitUsage:F0} shared), resident {videoMemoryUsage:F0} VRAM + {sharedMemoryUsage:F0} RAM, {handles} handles, {managed:F0} MB" + paused /*+ occurred*/ + WindowContent.DebugInline();
+            }
+
+            _memoryUsage = memoryUsage;
+            _sharedCommitUsage = sharedCommitUsage;
+            _handles = handles;
+            _videoMemoryUsage = videoMemoryUsage;
+            _sharedMemoryUsage = sharedMemoryUsage;
+
+            DetectMemoryStep();
+        }
+
+        /// <summary>
+        /// Notices the managed heap stepping up and staying there, which is the shape of a leak
+        /// rather than of garbage. GetTotalMemory(false) once a second is mostly uncollected
+        /// garbage and a step in it means nothing, so this samples only after a gen2 collection -
+        /// a settled number, for free, without forcing anything.
+        /// </summary>
+        private void DetectMemoryStep()
+        {
+            var gen2 = GC.CollectionCount(2);
+            if (gen2 != _memoryGen2)
+            {
+                // Background GC bumps the count when the collection STARTS, so the heap is only
+                // settled a tick later.
+                _memoryGen2 = gen2;
+                _memorySettling = true;
+                return;
+            }
+
+            if (!_memorySettling)
+            {
+                return;
+            }
+
+            _memorySettling = false;
+
+            var settled = GC.GetTotalMemory(false);
+
+            if (_memoryFloor == 0 || settled < _memoryFloor)
+            {
+                _memoryFloor = settled;
+                return;
+            }
+
+            if (settled - _memoryFloor < MemoryStepThreshold)
+            {
+                return;
+            }
+
+            // The page is the only part of this worth reading: the timestamp says WHEN, and this
+            // says where the app was when it happened.
+            var message = string.Format("Managed heap {0:F0} MB -> {1:F0} MB over {2} gen2 collections, on {3}",
+                _memoryFloor / 1024d / 1024d,
+                settled / 1024d / 1024d,
+                gen2,
+                MasterDetail?.NavigationService?.Frame?.Content?.GetType().Name ?? "no page");
+
+            // Re-arm at the new level, so the NEXT step of the same size reports too instead of
+            // every tick from here on.
+            _memoryFloor = settled;
+
+            if (_memoryFloor / 1024d / 1024d > 60)
+            {
+                // Logger.Error and not TrackError: nothing crashed, and a crash report would say
+                // otherwise. This exists to put a timestamp in the log that the tail can be read
+                // around - a timer tick's stack would say nothing.
+                Logger.Error(message);
+                ToastPopup.Show(XamlRoot, message, ToastPopupIcon.Error);
+            }
+        }
+
+        public INavigationService NavigationService => MasterDetail.NavigationService;
+
+        protected override void OnNavigatedTo(NavigationEventArgs e)
+        {
+            Initialize();
+            NavigationService.Window.SetTitleBar(TitleBarHandle);
+        }
+
+        protected override void OnNavigatedFrom(NavigationEventArgs e)
+        {
+            NavigationService.Window.SetTitleBar(null);
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                Bindings.StopTracking();
+
+                var viewModel = _viewModel;
+                if (viewModel != null)
+                {
+                    viewModel.Settings.Delegate = null;
+                    viewModel.Chats.Delegate = null;
+                    viewModel.Topics.Delegate = null;
+
+                    viewModel.Aggregator.Unsubscribe(this);
+                    viewModel.Dispose();
+                }
+
+#if UNPACKAGED
+                // The next account's page reports its own downloads, which may be none.
+                TaskbarButton.SetProgress(0, 0);
+#endif
+
+                _drain.Dispose();
+
+                _archive?.Changed -= OnArchiveChanged;
+
+                LifetimeService.Current.Playback.SourceChanged -= OnPlaybackSourceChanged;
+
+                MasterDetail.NavigationService.FrameFacade.Navigated -= OnNavigated;
+                MasterDetail.NavigationService.Suspend();
+                MasterDetail.NavigationService.ClearCache();
+
+                MasterDetail.Dispose();
+                SettingsView?.Dispose();
+
+                Navigation.SelectionChanged -= Navigation_SelectionChanged;
+                Navigation.SelectedItem = null;
+
+                if (_memoryUsageTimer != null)
+                {
+                    _memoryUsageTimer.Tick -= MemoryUsageTimer_Tick;
+                    _memoryUsageTimer.Stop();
+                }
+
+                if (Constants.DEBUG)
+                {
+                    FocusManager.GettingFocus -= OnGettingFocus;
+                }
+            }
+            catch { }
+        }
+
+        protected override void OnLayoutMetricsChanged(SystemOverlayMetrics metrics)
+        {
+            TitleBarrr.ColumnDefinitions[0].Width = new GridLength(metrics.LeftInset > 0 ? 138 : 0, GridUnitType.Pixel);
+            TitleBarrr.ColumnDefinitions[4].Width = new GridLength(metrics.RightInset > 0 ? 138 : 0, GridUnitType.Pixel);
+
+            Grid.SetColumn(TitleBarLogo, metrics.LeftInset > 0 ? 3 : 1);
+            TitleText.FlowDirection = metrics.LeftInset > 0
+                ? FlowDirection.RightToLeft
+                : FlowDirection.LeftToRight;
+
+            Photo.HorizontalAlignment = metrics.LeftInset > 0
+                ? HorizontalAlignment.Right
+                : HorizontalAlignment.Left;
+
+            UpdateTitleBarMargins();
+
+            Stories.SystemOverlayLeftInset = metrics.LeftInset > 0 ? 138 : 0;
+            Stories.SystemOverlayRightInset = metrics.RightInset > 0 ? 138 : 0;
+        }
+
+        private void UpdateTitleBarMargins()
+        {
+            var pad = MasterDetail.MasterVisibility != Visibility.Visible || !_tabsLeftCollapsed;
+            var left = pad ? 14 : 48;
+            var right = pad ? -50 : 10;
+
+            if (TitleText.FlowDirection == FlowDirection.LeftToRight)
+            {
+                TitleBarrr.Margin = new Thickness(left, TitleBarrr.Margin.Top, right, TitleBarrr.Margin.Bottom);
+            }
+            else
+            {
+                TitleBarrr.Margin = new Thickness(right, TitleBarrr.Margin.Top, left, TitleBarrr.Margin.Bottom);
+            }
+        }
+
+        private void InitializeLock()
+        {
+            Lock.Visibility = ViewModel.Passcode.IsEnabled ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        #region Handle
+
+        public void UpdateChatLastMessage(Chat chat)
+        {
+            Handle(chat.Id, ChatCellUpdate.LastMessage);
+        }
+
+        public void Handle(UpdateChatActiveStories update)
+        {
+            if (update.ActiveStories.List is StoryListArchive)
+            {
+                this.BeginOnUIThread(() => ArchivedChats.UpdateStoryList(ViewModel.ClientService, new StoryListArchive()));
+            }
+            else
+            {
+                Handle(update.ActiveStories.ChatId, ChatCellUpdate.ActiveStories);
+            }
+        }
+
+        public void Handle(UpdateFileDownloads update)
+        {
+            this.BeginOnUIThread(() => UpdateFileDownloads(update));
+        }
+
+        private void UpdateFileDownloads(UpdateFileDownloads update)
+        {
+            if (update.TotalSize > 0)
+            {
+                FindName(nameof(Downloads));
+            }
+
+            Downloads?.UpdateFileDownloads(update);
+
+#if UNPACKAGED
+            TaskbarButton.SetProgress(update.DownloadedSize, update.TotalSize);
+#endif
+        }
+
+        public void Handle(UpdateChatIsMarkedAsUnread update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.ReadInbox);
+        }
+
+        public void Handle(UpdateChatReadInbox update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.ReadInbox);
+        }
+
+        public void Handle(UpdateChatUnreadTopicCount update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.ReadInbox);
+        }
+
+        public void Handle(UpdateChatReadOutbox update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.ReadOutbox);
+        }
+
+        public void Handle(UpdateChatUnreadMentionCount update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.UnreadMentionCount);
+        }
+
+        public void Handle(UpdateChatUnreadReactionCount update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.UnreadMentionCount);
+        }
+
+        public void Handle(UpdateChatUnreadPollVoteCount update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.UnreadMentionCount);
+        }
+
+        public void Handle(UpdateChatAddedToList update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.ChatLists);
+        }
+
+        public void Handle(UpdateChatRemovedFromList update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.ChatLists);
+        }
+
+        public void Handle(UpdateChatTitle update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.Title);
+
+            // TODO: threading is not great here
+            if (update.ChatId == _viewModel.Topics.Chat?.Id)
+            {
+                this.BeginOnUIThread(() => TopicListPresenter?.UpdateChatTitle(_viewModel.Topics.Chat));
+            }
+        }
+
+        public void Handle(UpdateChatPhoto update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.Photo);
+        }
+
+        public void Handle(UpdateChatEmojiStatus update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.EmojiStatus);
+
+            // TODO: threading is not great here
+            if (update.ChatId == _viewModel.Topics.Chat?.Id)
+            {
+                this.BeginOnUIThread(() => TopicListPresenter?.UpdateChatEmojiStatus(_viewModel.Topics.Chat));
+            }
+        }
+
+        public void Handle(UpdateChatVideoChat update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.VideoChat);
+        }
+
+        public void Handle(UpdateChatViewAsTopics update)
+        {
+            // TODO: threading is not great here
+            // TODO: ignore if chatId is saved messages
+            if (update.ChatId == _viewModel.Topics.Chat?.Id && !update.ViewAsTopics)
+            {
+                this.BeginOnUIThread(() => HideTopicList());
+            }
+            else if (update.ChatId == _viewModel.Chats.SelectedItem && update.ViewAsTopics && update.ChatId != _viewModel.ClientService.Options.MyId)
+            {
+                this.BeginOnUIThread(() => ShowTopicList(_viewModel.ClientService.GetChat(update.ChatId)));
+            }
+        }
+
+        public void Handle(UpdateUser update)
+        {
+            if (update.User.Id == _clientService.Options.MyId)
+            {
+                this.BeginOnUIThread(() => UpdateUser(update.User));
+            }
+        }
+
+        public void Handle(UpdateUserStatus update)
+        {
+            if (update.UserId != _clientService.Options.MyId && update.UserId != 777000 && _clientService.TryGetChatFromUser(update.UserId, out long chatId))
+            {
+                Handle(chatId, ChatCellUpdate.UserStatus);
+            }
+        }
+
+        public void Handle(UpdateChatMessageAutoDeleteTime update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.MessageAutoDeleteTime);
+        }
+
+        public void Handle(UpdateChatAction update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.Actions);
+        }
+
+        public void Handle(UpdateMessageMentionRead update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.UnreadMentionCount);
+        }
+
+        public void Handle(UpdateMessageUnreadReactions update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.UnreadMentionCount);
+        }
+
+        public async void Handle(UpdateSecretChat update)
+        {
+            var response = await _clientService.SendAsync(new CreateSecretChat(update.SecretChat.Id));
+            if (response is Chat result)
+            {
+                Handle(result.Id, ChatCellUpdate.LastMessage);
+            }
+        }
+
+        public void Handle(UpdateChatNotificationSettings update)
+        {
+            Handle(update.ChatId, ChatCellUpdate.NotificationSettings);
+        }
+
+        public void Handle(UpdateUnreadChatCount update)
+        {
+            if (update.ChatList is ChatListArchive)
+            {
+                this.BeginOnUIThread(() => ArchivedChats.UpdateChatList(ViewModel.ClientService, update.ChatList));
+            }
+        }
+
+        private readonly DispatcherDrain<UpdateChatCell> _drain;
+        private readonly Dictionary<long, ChatCellUpdate> _coalesced = new();
+
+        private readonly record struct UpdateChatCell(long ChatId, ChatCellUpdate Update);
+
+        private void Handle(long chatId, ChatCellUpdate update)
+        {
+            _drain.Enqueue(new UpdateChatCell(chatId, update));
+        }
+
+        private void Handle(List<UpdateChatCell> batch)
+        {
+            _coalesced.Clear();
+
+            for (int i = 0; i < batch.Count; i++)
+            {
+                var key = batch[i].ChatId;
+
+                _coalesced[key] = _coalesced.TryGetValue(key, out var previous)
+                    ? previous | batch[i].Update
+                    : batch[i].Update;
+            }
+
+            foreach (var item in _coalesced)
+            {
+                if (ChatsList.TryGetChatAndCell(item.Key, out Chat chat, out ChatCell chatView))
+                {
+                    if ((item.Value & ChatCellUpdate.ReadInbox) != 0 || (item.Value & ChatCellUpdate.LastMessage) != 0)
+                    {
+                        chatView.UpdateChatReadInbox(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.ReadOutbox) != 0)
+                    {
+                        chatView.UpdateChatReadOutbox(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.UnreadMentionCount) != 0)
+                    {
+                        chatView.UpdateChatUnreadMentionCount(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.ChatLists) != 0)
+                    {
+                        chatView.UpdateChatChatLists(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.Title) != 0)
+                    {
+                        chatView.UpdateChatTitle(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.Photo) != 0)
+                    {
+                        chatView.UpdateChatPhoto(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.EmojiStatus) != 0)
+                    {
+                        chatView.UpdateChatEmojiStatus(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.VideoChat) != 0)
+                    {
+                        chatView.UpdateChatVideoChat(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.UserStatus) != 0)
+                    {
+                        chatView.UpdateUserStatus(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.MessageAutoDeleteTime) != 0)
+                    {
+                        chatView.UpdateChatMessageAutoDeleteTime(chat, true);
+                    }
+                    if ((item.Value & ChatCellUpdate.Actions) != 0)
+                    {
+                        chatView.UpdateChatActions(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.LastMessage) != 0)
+                    {
+                        chatView.UpdateChatLastMessage(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.NotificationSettings) != 0)
+                    {
+                        chatView.UpdateChatNotificationSettings(chat);
+                    }
+                    if ((item.Value & ChatCellUpdate.ActiveStories) != 0)
+                    {
+                        chatView.UpdateChatActiveStories(chat);
+                    }
+                }
+            }
+        }
+
+        [Flags]
+        enum ChatCellUpdate
+        {
+            ReadInbox = 1 << 1,
+            ReadOutbox = 1 << 2,
+            UnreadMentionCount = 1 << 3,
+            ChatLists = 1 << 4,
+            Title = 1 << 5,
+            Photo = 1 << 6,
+            EmojiStatus = 1 << 7,
+            VideoChat = 1 << 8,
+            UserStatus = 1 << 9,
+            MessageAutoDeleteTime = 1 << 10,
+            Actions = 1 << 11,
+            LastMessage = 1 << 12,
+            NotificationSettings = 1 << 13,
+            ActiveStories = 1 << 14
+        }
+
+        public void Handle(UpdatePasscodeLock update)
+        {
+            this.BeginOnUIThread(() =>
+            {
+                Lock.Visibility = update.IsEnabled ? Visibility.Visible : Visibility.Collapsed;
+            });
+        }
+
+        public void Handle(UpdateConfetti update)
+        {
+            this.BeginOnUIThread(() =>
+            {
+                FindName(nameof(Confetti));
+                Confetti.Start();
+            });
+        }
+
+        public void Handle(UpdateUnconfirmedSession update)
+        {
+            this.BeginOnUIThread(() =>
+            {
+                if (update.Session == null)
+                {
+                    UnloadObject(UnconfirmedCard);
+
+                    SetBirthdateCard?.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    FindName(nameof(UnconfirmedCard));
+                    UnconfirmedCard.Update(update.Session);
+
+                    SetBirthdateCard?.Visibility = Visibility.Collapsed;
+                }
+            });
+        }
+
+        public void Handle(UpdateFreezeState update)
+        {
+            this.BeginOnUIThread(() =>
+            {
+                if (update.IsFrozen)
+                {
+                    FindName(nameof(FrozenCard));
+
+                    SetBirthdateCard?.Visibility = Visibility.Collapsed;
+
+                    UnconfirmedCard?.Visibility = Visibility.Collapsed;
+                }
+                else
+                {
+                    UnloadObject(FrozenCard);
+
+                    SetBirthdateCard?.Visibility = Visibility.Visible;
+
+                    UnconfirmedCard?.Visibility = Visibility.Visible;
+                }
+            });
+        }
+
+        public void Handle(UpdateConnectionState update)
+        {
+            this.BeginOnUIThread(() =>
+            {
+                SetProxyVisibility(_clientService.Options.ExpectBlocking, _clientService.Options.EnabledProxyId, update.State);
+
+                switch (update.State)
+                {
+                    case ConnectionStateWaitingForNetwork waitingForNetwork:
+                        ShowState(Strings.WaitingForNetwork);
+                        break;
+                    case ConnectionStateConnecting connecting:
+                        ShowState(_clientService.Options.EnabledProxyId == 0 ? Strings.Connecting : Strings.ConnectingToProxy);
+                        break;
+                    case ConnectionStateConnectingToProxy connectingToProxy:
+                        ShowState(Strings.ConnectingToProxy);
+                        break;
+                    case ConnectionStateUpdating updating:
+                        ShowState(Strings.Updating);
+                        break;
+                    case ConnectionStateReady ready:
+                        HideState();
+                        return;
+                }
+            });
+        }
+
+        public void Handle(UpdateSuggestedActions update)
+        {
+            this.BeginOnUIThread(() =>
+            {
+                if (_clientService.HasSuggestedAction(new SuggestedActionSetBirthdate()))
+                {
+                    FindName(nameof(SetBirthdateCard));
+                }
+                else
+                {
+                    UnloadObject(SetBirthdateCard);
+                }
+            });
+        }
+
+        public void Handle(UpdateOption update)
+        {
+            if (update.Name == OptionsService.R.ExpectBlocking || update.Name == OptionsService.R.EnabledProxyId)
+            {
+                this.BeginOnUIThread(() => SetProxyVisibility(_clientService.Options.ExpectBlocking, _clientService.Options.EnabledProxyId, _clientService.ConnectionState));
+            }
+        }
+
+        private void SetProxyVisibility(bool expectBlocking, long proxyId, ConnectionState connectionState)
+        {
+            if (expectBlocking || proxyId != 0)
+            {
+                Proxy.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                switch (connectionState)
+                {
+                    case ConnectionStateWaitingForNetwork:
+                    case ConnectionStateConnecting:
+                    case ConnectionStateConnectingToProxy:
+                        Proxy.Visibility = Visibility.Visible;
+                        break;
+                    default:
+                        Proxy.Visibility = Visibility.Collapsed;
+                        break;
+                }
+            }
+
+            Proxy.Glyph = connectionState is ConnectionStateReady && proxyId != 0 ? Icons.ShieldCheckmark : Icons.ShieldError;
+        }
+
+        private void ShowState(string text)
+        {
+            State.IsIndeterminate = true;
+            StateLabel.Text = text;
+
+            var peer = FrameworkElementAutomationPeer.FromElement(TitleText);
+            peer?.RaiseAutomationEvent(AutomationEvents.LiveRegionChanged);
+        }
+
+        private void HideState()
+        {
+            State.IsIndeterminate = false;
+            StateLabel.Text = Constants.RELEASE
+                ? Strings.AppDisplayName
+                : Strings.AppName;
+        }
+
+        public void Handle(UpdateActiveCall update)
+        {
+            void UpdatePlaybackHidden(bool hidden)
+            {
+                Playback?.IsHidden = hidden;
+            }
+
+            this.BeginOnUIThread(() =>
+            {
+                var oldVisible = _activeCallVisible || _playbackVisible;
+
+                var call = ViewModel.VoipService.ActiveCall;
+                if (call != null)
+                {
+                    UpdatePlaybackHidden(true);
+                    FindName(nameof(CallBanner));
+
+                    CallBanner.Update(ViewModel.NavigationService, call);
+
+                    _activeCallVisible = true;
+                    MasterDetail.ShowHideBanner(_activeCallVisible || _playbackVisible);
+                }
+                else
+                {
+                    UpdatePlaybackHidden(false);
+
+                    CallBanner?.Update(null, null);
+
+                    _activeCallVisible = false;
+                }
+
+                var newVisible = _activeCallVisible || _playbackVisible;
+                if (newVisible && oldVisible && !_activeCallVisible)
+                {
+                    OnBannerCollapsed(null, null);
+                }
+                else
+                {
+                    MasterDetail.ShowHideBanner(_activeCallVisible || _playbackVisible);
+                }
+            });
+        }
+
+        private void OnBannerCollapsed(object sender, EventArgs e)
+        {
+            if (CallBanner != null && !_activeCallVisible)
+            {
+                CallBanner.Update(null, null);
+                UnloadObject(CallBanner);
+            }
+        }
+
+        public void Handle(UpdateChatFoldersLayout update)
+        {
+            this.BeginOnUIThread(UpdateChatFoldersLayout);
+        }
+
+        public void Handle(UpdateNavigationBar update)
+        {
+            this.BeginOnUIThread(UpdateNavigationBar);
+        }
+
+        private void UpdateNavigationBar()
+        {
+            Navigation.Visibility = AppSettings.Appearance.DisableNavigationBar
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+
+            UpdatePaneToggleButtonVisibility();
+        }
+
+        #endregion
+
+        private bool _tabsTopCollapsed = true;
+        private bool _tabsLeftCollapsed = true;
+
+        private void ShowHideTopTabs(bool show)
+        {
+            if (_tabsTopCollapsed != show)
+            {
+                return;
+            }
+
+            _tabsTopCollapsed = !show;
+            FindName(nameof(ChatTabs));
+
+            if (TopicListPresenter != null)
+            {
+                var padding = ChatTabs != null
+                    ? _tabsTopCollapsed ? -74 : -78
+                    : -12;
+
+                TopicListPresenter.Margin = new Thickness(72, padding, 0, 0);
+            }
+
+            Stories.TabsTopCollapsed = !show;
+            Stories.ChatTabs = ChatTabs;
+            Stories.ControlledList = ChatsList;
+
+            void ShowHideTopTabsCompleted()
+            {
+                DialogsPanel.Margin = new Thickness();
+                ChatsList.Margin = new Thickness(0, Stories.TopPadding, 0, 0);
+                ChatTabs.Visibility = _tabsTopCollapsed
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
+            }
+
+            var element = VisualTreeHelper.GetChild(ChatsList, 0) as UIElement;
+            if (element == null)
+            {
+                ShowHideTopTabsCompleted();
+                return;
+            }
+
+            var topPadding = Stories.GetTopPadding(false);
+
+            ChatTabs.Visibility = Visibility.Visible;
+            ChatsList.Margin = new Thickness(0, topPadding, 0, 0);
+            DialogsPanel.Margin = new Thickness(0, 0, 0, -40);
+
+            var visual = ElementComposition.GetElementVisual(DialogsPanel);
+            var header = ElementComposition.GetElementVisual(ChatTabsView);
+            header.Clip = visual.Compositor.CreateInsetClip();
+
+            var batch = visual.Compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += (s, args) =>
+            {
+                header.Offset = new Vector3();
+                visual.Offset = new Vector3();
+
+                ShowHideTopTabsCompleted();
+            };
+
+            var opacity = visual.Compositor.CreateScalarKeyFrameAnimation();
+            opacity.InsertKeyFrame(show ? 0 : 1, 0);
+            opacity.InsertKeyFrame(show ? 1 : 0, 1);
+            //opacity.Duration = Constants.FastAnimation;
+
+            var offset1 = visual.Compositor.CreateScalarKeyFrameAnimation();
+            offset1.InsertKeyFrame(show ? 0 : 1, -36);
+            offset1.InsertKeyFrame(show ? 1 : 0, 0);
+            //offset.Duration = Constants.FastAnimation;
+
+            var offset2 = visual.Compositor.CreateScalarKeyFrameAnimation();
+            offset2.InsertKeyFrame(show ? 0 : 1, 36);
+            offset2.InsertKeyFrame(show ? 1 : 0, 0);
+            //offset.Duration = Constants.FastAnimation;
+
+            header.StartAnimation("Opacity", opacity);
+            header.Clip.StartAnimation("TopInset", offset2);
+            visual.StartAnimation("Offset.Y", offset1);
+
+            batch.End();
+        }
+
+        private void ShowHideLeftTabs(bool show)
+        {
+            if (_tabsLeftCollapsed != show)
+            {
+                return;
+            }
+
+            _tabsLeftCollapsed = !show;
+            FindName(nameof(ChatTabsLeft));
+
+            Stories.TabsLeftCollapsed = !show;
+
+            UpdateTitleBarMargins();
+
+            Photo.Width = show ? 72 : 48;
+            Photo.Visibility = show || MasterDetail.MasterVisibility == Visibility.Visible
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
+            if (ChatTabsLeft == null)
+            {
+                FindName(nameof(ChatTabsLeft));
+            }
+
+            void ShowHideLeftTabsCompleted()
+            {
+                ChatsList.Margin = new Thickness(0, Stories.TopPadding, 0, 0);
+                ChatTabsLeft.Visibility = _tabsLeftCollapsed
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
+            }
+
+            ShowHideLeftTabsCompleted();
+            return;
+
+            var element = VisualTreeHelper.GetChild(ChatsList, 0) as UIElement;
+            if (element == null)
+            {
+                ShowHideLeftTabsCompleted();
+                return;
+            }
+
+            ChatTabsLeft.Visibility = Visibility.Visible;
+            ChatsList.Margin = new Thickness(0, Stories.TopPadding, 0, -40);
+
+            var parent = ElementComposition.GetElementVisual(ChatsList);
+
+            var visual = ElementComposition.GetElementVisual(element);
+            var header = ElementComposition.GetElementVisual(ChatTabsView);
+
+            parent.Clip = null;
+
+            var batch = visual.Compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += (s, args) =>
+            {
+                header.Offset = new Vector3();
+                visual.Offset = new Vector3();
+
+                ShowHideLeftTabsCompleted();
+            };
+
+            var offset = visual.Compositor.CreateVector3KeyFrameAnimation();
+            offset.InsertKeyFrame(show ? 0 : 1, new Vector3(0, -40, 0));
+            offset.InsertKeyFrame(show ? 1 : 0, new Vector3());
+            //offset.Duration = Constants.FastAnimation;
+
+            var opacity1 = visual.Compositor.CreateScalarKeyFrameAnimation();
+            opacity1.InsertKeyFrame(show ? 0 : 1, 0);
+            opacity1.InsertKeyFrame(show ? 1 : 0, 1);
+            opacity1.Duration /= 2;
+
+            var opacity2 = visual.Compositor.CreateScalarKeyFrameAnimation();
+            opacity2.InsertKeyFrame(show ? 0 : 1, 1);
+            opacity2.InsertKeyFrame(show ? 1 : 0, 0);
+            opacity2.Duration /= 2;
+
+            header.StartAnimation("Offset", offset);
+            visual.StartAnimation("Offset", offset);
+
+            batch.End();
+        }
+
+        public void OnBackRequesting(BackRequestedRoutedEventArgs args)
+        {
+            if (!_searchCollapsed)
+            {
+                DialogsSearchPanel.OnBackRequested(args);
+
+                if (args.Handled)
+                {
+                    return;
+                }
+
+                Search_LostFocus(null, null);
+                args.Handled = true;
+            }
+            else if (ViewModel.Chats.SelectionMode == ListViewSelectionMode.Multiple)
+            {
+                Manage_Click(null, null);
+                args.Handled = true;
+            }
+        }
+
+        public void OnBackRequested(BackRequestedRoutedEventArgs args)
+        {
+            OnBackRequesting(args);
+
+            if (args.Handled)
+            {
+                return;
+            }
+
+            if (!_topicListCollapsed)
+            {
+                HideTopicList();
+                args.Handled = true;
+            }
+            else if (_prevIndex != INDEX_CHATS)
+            {
+                SetPivotSelectedIndex(INDEX_CHATS);
+                ViewModel.RaisePropertyChanged(nameof(ViewModel.SelectedFolder));
+                args.Handled = true;
+            }
+            else
+            {
+                var scrollViewer = ChatsList.GetScrollViewer();
+                if (scrollViewer != null && scrollViewer.VerticalOffset > 50)
+                {
+                    Logger.Info("ChangeView");
+
+                    scrollViewer.TryChangeView(null, 0, null);
+                    args.Handled = true;
+                }
+                else if (ViewModel.Chats.Items.ChatList is ChatListArchive
+                    || ViewModel.Folders.Count > 0 && !ViewModel.Chats.Items.ChatList.AreTheSame(ViewModel.Folders[0].ChatList))
+                {
+                    UpdateFolder(ViewModel.Folders.Count > 0 ? ViewModel.Folders[0] : ChatFolderViewModel.Main);
+                    args.Handled = true;
+                }
+            }
+        }
+
+        private int _prevIndex;
+
+        private void LoadAtIndex(int index)
+        {
+            if (index == _prevIndex)
+            {
+                return;
+            }
+
+            if (index == INDEX_CHATS)
+            {
+                SettingsRoot?.Visibility = Visibility.Collapsed;
+
+                Show(ChatsRoot, _prevIndex > index, index);
+            }
+            else if (index == INDEX_SETTINGS)
+            {
+                ChatsRoot.Visibility = Visibility.Collapsed;
+
+                if (SettingsRoot != null)
+                {
+                    SettingsView.UpdateAccounts();
+                    Show(SettingsRoot, _prevIndex > index, index);
+                }
+                else
+                {
+                    Pivot_SelectionChanged(index);
+                    return;
+                }
+            }
+
+            _prevIndex = index;
+            Pivot_SelectionChanged(index);
+        }
+
+        private void Show(UIElement element, bool leftToRight, int index)
+        {
+            if (_prevIndex == -1)
+            {
+                return;
+            }
+
+            element.Visibility = Visibility.Visible;
+
+            if (!PowerSavingPolicy.AreSmoothTransitionsEnabled)
+            {
+                return;
+            }
+
+            ElementCompositionPreview.SetIsTranslationEnabled(element, true);
+
+            var visualIn = ElementComposition.GetElementVisual(element);
+            var offsetIn = visualIn.Compositor.CreateScalarKeyFrameAnimation();
+            offsetIn.InsertKeyFrame(0, leftToRight ? -48 : 48);
+            offsetIn.InsertKeyFrame(1, 0);
+            offsetIn.Duration = Constants.SoftAnimation;
+
+            var opacityIn = visualIn.Compositor.CreateScalarKeyFrameAnimation();
+            opacityIn.InsertKeyFrame(0, 0);
+            opacityIn.InsertKeyFrame(1, 1);
+            opacityIn.Duration = Constants.SoftAnimation;
+
+            visualIn.StartAnimation("Translation.X", offsetIn);
+            visualIn.StartAnimation("Opacity", opacityIn);
+        }
+
+        private void SettingsRoot_Loaded(object sender, RoutedEventArgs e)
+        {
+            SettingsRoot.Loaded -= SettingsRoot_Loaded;
+            Show(SettingsRoot, _prevIndex > INDEX_SETTINGS, INDEX_SETTINGS);
+
+            _prevIndex = INDEX_SETTINGS;
+            UpdatePaneToggleButtonVisibility();
+        }
+
+        private void UpdateUser(User user)
+        {
+            TitleBarLogo.IsEnabled = _clientService.IsPremium;
+
+            if (user.EmojiStatus != null)
+            {
+                LogoBasic.Visibility = Visibility.Collapsed;
+                LogoEmoji.Visibility = Visibility.Visible;
+                LogoEmoji.Source = new CustomEmojiFileSource(_clientService, user.EmojiStatus.Type);
+
+                if (user.EmojiStatus.Type is EmojiStatusTypeUpgradedGift upgradedGift)
+                {
+                    LogoEmojiParticles.Source = new ParticlesImageSource(upgradedGift.BackdropColors);
+                }
+                else
+                {
+                    LogoEmojiParticles.Source = null;
+                }
+            }
+            else
+            {
+                LogoBasic.Visibility = Visibility.Visible;
+                LogoEmoji.Visibility = Visibility.Collapsed;
+                LogoEmoji.Source = null;
+                LogoEmojiParticles.Source = null;
+            }
+        }
+
+        private async void OnLoaded(object sender, RoutedEventArgs e)
+        {
+            if (_clientService.TryGetUser(_clientService.Options.MyId, out User user))
+            {
+                UpdateUser(user);
+            }
+
+            Subscribe();
+
+            var context = WindowContext.ForXamlRoot(XamlRoot);
+            if (context != null)
+            {
+                context.CharacterReceived += OnCharacterReceived;
+            }
+
+            OnStateChanged(null, null);
+
+            ShowHideBanner(LifetimeService.Current.Playback);
+
+            var update = new UpdateConnectionState(ViewModel.ClientService.ConnectionState);
+            if (update.State != null)
+            {
+                Handle(update);
+                ViewModel.Aggregator.Publish(update);
+            }
+
+            Handle(new UpdateUnconfirmedSession(ViewModel.ClientService.UnconfirmedSession, 1));
+            Handle(new UpdateActiveCall());
+            Handle(ViewModel.ClientService.FreezeState);
+            UpdateChatFolders();
+
+            if (_clientService.HasSuggestedAction(new SuggestedActionSetBirthdate()))
+            {
+                FindName(nameof(SetBirthdateCard));
+            }
+
+            if (_unloaded)
+            {
+                _unloaded = false;
+                ChatsList.ItemsSource = null;
+
+                Bindings.StopTracking();
+                Bindings.Update();
+            }
+
+            WatchDog.TrackEvent("MainPage");
+
+            if (AppSettings.Diagnostics.IsLastErrorDiskFull)
+            {
+                AppSettings.Diagnostics.IsLastErrorDiskFull = false;
+
+                // TODO: Missing translation
+                var confirm = await ViewModel.ShowPopupAsync("Unigram has previously failed to launch because the device storage was full.\r\n\r\nMake sure there's enough storage space available and press **OK** to continue.", "Disk storage is full", Strings.OK, Strings.StorageUsage);
+                if (confirm == ContentDialogResult.Secondary)
+                {
+                    MasterDetail.NavigationService.Navigate(typeof(SettingsStoragePage));
+                }
+            }
+        }
+
+        private void Subscribe()
+        {
+            ViewModel.Aggregator.Subscribe<UpdateFileDownloads>(this, Handle)
+                .Subscribe<UpdateChatActiveStories>(Handle)
+                .Subscribe<UpdateChatIsMarkedAsUnread>(Handle)
+                .Subscribe<UpdateChatReadInbox>(Handle)
+                .Subscribe<UpdateChatReadOutbox>(Handle)
+                .Subscribe<UpdateChatUnreadMentionCount>(Handle)
+                .Subscribe<UpdateChatUnreadReactionCount>(Handle)
+                .Subscribe<UpdateChatUnreadPollVoteCount>(Handle)
+                .Subscribe<UpdateChatAddedToList>(Handle)
+                .Subscribe<UpdateChatRemovedFromList>(Handle)
+                .Subscribe<UpdateChatTitle>(Handle)
+                .Subscribe<UpdateChatPhoto>(Handle)
+                .Subscribe<UpdateChatEmojiStatus>(Handle)
+                .Subscribe<UpdateChatVideoChat>(Handle)
+                .Subscribe<UpdateChatViewAsTopics>(Handle)
+                .Subscribe<UpdateUserStatus>(Handle)
+                .Subscribe<UpdateUser>(Handle)
+                .Subscribe<UpdateChatMessageAutoDeleteTime>(Handle)
+                .Subscribe<UpdateChatAction>(Handle)
+                .Subscribe<UpdateMessageMentionRead>(Handle)
+                .Subscribe<UpdateMessageUnreadReactions>(Handle)
+                .Subscribe<UpdateUnreadChatCount>(Handle)
+                .Subscribe<UpdateChatUnreadTopicCount>(Handle)
+                .Subscribe<UpdateSecretChat>(Handle)
+                .Subscribe<UpdateChatNotificationSettings>(Handle)
+                .Subscribe<UpdatePasscodeLock>(Handle)
+                .Subscribe<UpdateUnconfirmedSession>(Handle)
+                .Subscribe<UpdateFreezeState>(Handle)
+                .Subscribe<UpdateConnectionState>(Handle)
+                .Subscribe<UpdateOption>(Handle)
+                .Subscribe<UpdateSuggestedActions>(Handle)
+                .Subscribe<UpdateActiveCall>(Handle)
+                .Subscribe<UpdateChatFoldersLayout>(Handle)
+                .Subscribe<UpdateNavigationBar>(Handle)
+                .Subscribe<UpdateConfetti>(Handle);
+        }
+
+        private void OnPlaybackSourceChanged(IPlaybackService sender, object e)
+        {
+            this.BeginOnUIThread(() => ShowHideBanner(sender));
+        }
+
+        private bool _playbackVisible;
+        private bool _activeCallVisible;
+
+        private void ShowHideBanner(IPlaybackService sender)
+        {
+            if (sender.CurrentItem != null && Playback == null)
+            {
+                FindName(nameof(Playback));
+                Playback.Update(ViewModel.ClientService, ViewModel.NavigationService);
+            }
+
+            _playbackVisible = sender.CurrentItem != null;
+            MasterDetail.ShowHideBanner(_playbackVisible || _activeCallVisible);
+        }
+
+        private void OnUnloaded(object sender, RoutedEventArgs e)
+        {
+            var context = WindowContext.ForXamlRoot(this);
+            if (context != null)
+            {
+                context.CharacterReceived -= OnCharacterReceived;
+            }
+
+            Bindings.StopTracking();
+
+            _unloaded = true;
+
+            LeakTest(false);
+        }
+
+        private void OnCharacterReceived(WindowContext sender, CharacterReceivedRoutedEventArgs args)
+        {
+            if (MasterDetail.NavigationService?.Frame.Content is not BlankPage)
+            {
+                return;
+            }
+
+            var character = args.Character;
+            if (char.IsControl(character) || char.IsWhiteSpace(character))
+            {
+                return;
+            }
+
+            // Neither a focus check nor a popup check: the event is raised from the window
+            // root, so a focused TextBox or RichEditBox has already marked it handled, and a
+            // popup that took focus never bubbles here at all.
+            Search_Click(null, null);
+            SearchField.Focus(FocusState.Keyboard);
+            SearchField.Text = character.ToString();
+            SearchField.SelectionStart = 1;
+
+            args.Handled = true;
+        }
+
+        private static Task CollectAsync()
+        {
+            // Off the view thread, or this deadlocks. A finalizing RCW releases through
+            // IContextCallback back into the apartment that created it, and an ASTA will not
+            // dispatch an incoming call while it is blocked in a wait - so waiting for the
+            // finalizers here would block the one thread the finalizer needs.
+            return Task.Run(static () =>
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+            });
+        }
+
+        private async void CollectAndAnalyze()
+        {
+            await CollectAsync();
+
+            // After the collection, so the surfaces it finalized are released first. DComp keeps a
+            // released surface's atlas region, and with it the page it sits in, until its graphics
+            // device is trimmed, and Direct3D what it released until its context is flushed.
+            Direct2D.Current.Device.Trim();
+            Direct2D.Current.Trim();
+
+            Logger.Info(WindowContent.DebugCounters());
+
+#if INSTRUMENTATION
+            Logger.Info(await DebugAnalyzeOrphans());
+            Profiler.Report();
+#endif
+
+#if !NET9_0_OR_GREATER
+            GarbageCollectionMonitor.DisconnectUnusedReferenceSources();
+#endif
+        }
+
+        public void ProcessKeyboardAccelerators(ShortcutInvokedEventArgs args)
+        {
+            foreach (var command in args.Shortcut.Commands)
+            {
+                if (AppSettings.Diagnostics.ShowMemoryUsage && command == ShortcutCommand.Quit)
+                {
+                    if (!MasterDetail.NavigationService.CanGoBack)
+                    {
+                        MasterDetail.NavigationService.Navigate(typeof(BlankPage), Guid.NewGuid());
+                        MasterDetail.NavigationService.Frame.BackStack.Clear();
+                        MasterDetail.NavigationService.Frame.ForwardStack.Clear();
+                        MasterDetail.NavigationService.ClearCache(true);
+                    }
+
+                    //GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+                    //GCSettings.LatencyMode = GCSettings.LatencyMode == GCLatencyMode.Interactive
+                    //    ? GCLatencyMode.SustainedLowLatency
+                    //    : GCLatencyMode.Interactive;
+
+                    CollectAndAnalyze();
+                    args.Handled = true;
+                    return;
+                }
+
+                ProcessChatCommands(command, args);
+                ProcessFolderCommands(command, args);
+                ProcessAppCommands(command, args);
+            }
+        }
+
+#if INSTRUMENTATION
+        // Every registered control that no window can reach, as a report.
+        //
+        // The walk is generic - VisualTreeHelper over every window's tree and its open popups - so
+        // the only thing left to name here is what the app deliberately keeps OFF the tree.
+        private static async Task<string> DebugAnalyzeOrphans()
+        {
+            return await Telegram.Common.Instrumentation.AnalyzeAsync()
+                + AnimatedImageLoader.DebugReport();
+        }
+
+        // The controls held in a field or a pool rather than under a parent, which is the one thing
+        // a tree walk cannot find. Returns nothing for every other type.
+        private static IEnumerable<object> DebugDetachedOf(object node)
+        {
+            return node switch
+            {
+                ChatView x => x.DebugPooled(),
+                Telegram.Controls.Messages.MessageTextBlock x => x.DebugDetached(),
+                Telegram.Controls.Messages.ReactionsPanel x => x.DebugDetached(),
+                Telegram.Controls.Gallery.GalleryTransportControls x => x.DebugDetached(),
+                Telegram.Controls.Gallery.GalleryCompactOverlay x => x.DebugDetached(),
+                _ => Array.Empty<object>()
+            };
+        }
+#endif
+
+        private void ProcessAppCommands(ShortcutCommand command, ShortcutInvokedEventArgs args)
+        {
+            if (command is ShortcutCommand.SetStatus)
+            {
+                Status_Click(null, null);
+                args.Handled = true;
+            }
+            else if (command is ShortcutCommand.Search)
+            {
+                if (MasterDetail.NavigationService.Frame.Content is ISearchablePage child)
+                {
+                    child.Search();
+                }
+                else
+                {
+                    SearchField.Focus(FocusState.Keyboard);
+                    Search_Click(null, null);
+                }
+
+                args.Handled = true;
+            }
+            else if (command is ShortcutCommand.SearchChats)
+            {
+                SearchField.Focus(FocusState.Keyboard);
+                Search_Click(null, null);
+
+                args.Handled = true;
+            }
+            else if (command is ShortcutCommand.Downloads)
+            {
+                Downloads_Click(null, null);
+                args.Handled = true;
+            }
+
+            // Quit, Close, Lock, the media commands and the two call ones are answered by
+            // WindowContext once this declines them, so that a window without a page still has
+            // them.
+        }
+
+        private void ProcessFolderCommands(ShortcutCommand command, ShortcutInvokedEventArgs args)
+        {
+            var folders = ViewModel.Folders;
+            if (folders.Empty())
+            {
+                return;
+            }
+
+            if (command == ShortcutCommand.FolderPrevious)
+            {
+                args.Handled = true;
+                ScrollFolder(-1, true);
+            }
+            else if (command == ShortcutCommand.FolderNext)
+            {
+                args.Handled = false;
+                ScrollFolder(+1, true);
+            }
+            else if (command == ShortcutCommand.ShowAllChats)
+            {
+                args.Handled = true;
+                ScrollFolder(int.MinValue, true);
+            }
+            else if (command == ShortcutCommand.ShowFolderLast)
+            {
+                args.Handled = true;
+                ScrollFolder(int.MaxValue, true);
+            }
+            else if (command == ShortcutCommand.ShowArchive)
+            {
+                args.Handled = true;
+                ArchivedChats_Click(null, null);
+            }
+            else if (command is >= ShortcutCommand.ShowFolder1 and <= ShortcutCommand.ShowFolder6)
+            {
+                var index = command - ShortcutCommand.ShowAllChats;
+                if (folders.Count > index)
+                {
+                    UpdateFolder(folders[index], false);
+                }
+            }
+        }
+
+        private async void ProcessChatCommands(ShortcutCommand command, ShortcutInvokedEventArgs args)
+        {
+            if (command == ShortcutCommand.ChatRecentPrevious)
+            {
+                args.Handled = ShowChatSwitch(false);
+            }
+            else if (command == ShortcutCommand.ChatRecentNext)
+            {
+                args.Handled = ShowChatSwitch(true);
+            }
+            if (command == ShortcutCommand.ChatPrevious)
+            {
+                args.Handled = true;
+                Scroll(-1, true);
+            }
+            else if (command == ShortcutCommand.ChatNext)
+            {
+                args.Handled = true;
+                Scroll(+1, true);
+            }
+            else if (command == ShortcutCommand.ChatFirst)
+            {
+                args.Handled = true;
+                Scroll(int.MinValue, true);
+            }
+            else if (command == ShortcutCommand.ChatLast)
+            {
+                args.Handled = true;
+                Scroll(int.MaxValue, true);
+            }
+            else if (command == ShortcutCommand.ChatSelf)
+            {
+                args.Handled = true;
+
+                if (ViewModel.ClientService.TryGetChat(ViewModel.ClientService.Options.MyId, out Chat chat))
+                {
+                    MasterDetail.NavigationService.NavigateToChat(chat, force: false);
+                    MasterDetail.NavigationService.GoBackAt(0, false);
+                }
+            }
+            else if (command is >= ShortcutCommand.ChatPinned1 and <= ShortcutCommand.ChatPinned5)
+            {
+                var folders = ViewModel.Folders;
+                if (folders.Count > 0)
+                {
+                    return;
+                }
+
+                var index = command - ShortcutCommand.ChatPinned1;
+
+                var response = await ViewModel.ClientService.GetChatListAsync(new ChatListMain(), 0, (int)ViewModel.ClientService.Options.PinnedChatCountMax * 2 + 1);
+                if (response is Telegram.Td.Api.Chats chats && index >= 0 && index < chats.ChatIds.Count)
+                {
+                    for (int i = 0; i < chats.ChatIds.Count; i++)
+                    {
+                        var chat = ViewModel.ClientService.GetChat(chats.ChatIds[i]);
+                        if (chat == null)
+                        {
+                            return;
+                        }
+
+                        //if (chat.Source != null)
+                        //{
+                        //    index++;
+                        //}
+                        //else if (i == index)
+                        //{
+                        //    if (chat.IsPinned)
+                        //    {
+                        //        MasterDetail.NavigationService.NavigateToChat(chats.ChatIds[index]);
+                        //        MasterDetail.NavigationService.GoBackAt(0, false);
+                        //    }
+
+                        //    return;
+                        //}
+                    }
+                }
+            }
+        }
+
+        private bool ShowChatSwitch(bool start)
+        {
+            foreach (var open in VisualTreeHelper.GetOpenPopupsForXamlRoot(XamlRoot))
+            {
+                if (open.Child is RecentChatsView)
+                {
+                    return false;
+                }
+            }
+
+            if (ViewModel.ClientService.RecentlyOpenedChatsCount > 1)
+            {
+                var popup = new Popup
+                {
+                    XamlRoot = XamlRoot
+                };
+
+                popup.Child = new RecentChatsView(ViewModel.ClientService, MasterDetail.NavigationService, popup, start)
+                {
+                    Width = ActualWidth,
+                    Height = ActualHeight
+                };
+
+                popup.IsOpen = true;
+                return true;
+            }
+
+            return false;
+        }
+
+        public void Scroll(int offset, bool navigate)
+        {
+            if (!_topicListCollapsed)
+            {
+                TopicListPresenter.Scroll(offset, navigate);
+                return;
+            }
+
+            int index;
+            if (offset == int.MaxValue)
+            {
+                index = ViewModel.Chats.Items.Count - 1;
+            }
+            else if (offset == int.MinValue)
+            {
+                index = 0;
+            }
+            else
+            {
+                index = ChatsList.SelectedIndex + offset;
+            }
+
+            if (index >= 0 && index < ViewModel.Chats.Items.Count)
+            {
+                if (navigate)
+                {
+                    Navigate(ViewModel.Chats.Items[index], false);
+                }
+            }
+            else if (index < 0 && offset == -1 && !navigate)
+            {
+                Search_Click(null, null);
+            }
+        }
+
+        public void ScrollFolder(int offset, bool navigate)
+        {
+            var already = ViewModel.SelectedFolder;
+            if (already == null)
+            {
+                return;
+            }
+
+            var index = ViewModel.Folders.IndexOf(already);
+            if (offset == int.MaxValue)
+            {
+                index = ViewModel.Folders.Count - 1;
+            }
+            else if (offset == int.MinValue)
+            {
+                index = 0;
+            }
+            else
+            {
+                index += offset;
+            }
+
+            if (index >= 0 && index < ViewModel.Folders.Count)
+            {
+                UpdateFolder(ViewModel.Folders[index], true);
+            }
+        }
+
+        public void Initialize()
+        {
+            Frame.BackStack.Clear();
+
+            if (MasterDetail.NavigationService == null)
+            {
+                var service = BootStrapper.Current.NavigationServiceFactory(ViewModel.Session, ViewModel.NavigationService.Window, BootStrapper.BackButton.Ignore, $"Main{ViewModel.Session.Id}", false) as NavigationService;
+                service.Frame.DataContext = new object();
+                service.Frame.CacheSize = 5;
+                service.FrameFacade.Navigated += OnNavigated;
+
+                MasterDetail.Initialize(service, Frame, ViewModel, true);
+            }
+
+            ViewModel.NavigationService = MasterDetail.NavigationService;
+
+            _archive?.Changed -= OnArchiveChanged;
+
+            _archive = ViewModel.ClientService.GetChatList(new ChatListArchive());
+            _archive.Changed += OnArchiveChanged;
+
+            ArchivedChats.UpdateChatList(ViewModel.ClientService, new ChatListArchive());
+            ArchivedChats.UpdateStoryList(ViewModel.ClientService, new StoryListArchive());
+        }
+
+        public void Activate(string parameter)
+        {
+            Initialize();
+
+            if (parameter == null)
+            {
+                return;
+            }
+
+            if (parameter.StartsWith("tg:toast"))
+            {
+                parameter = parameter.Substring("tg:toast?".Length).TrimStart('?');
+            }
+            else if (parameter.StartsWith("tg://toast"))
+            {
+                parameter = parameter.Substring("tg://toast?".Length).TrimStart('?');
+            }
+
+            var data = Toast.SplitArguments(parameter);
+            if (data.TryGetValue("web_app", out string webApp))
+            {
+                parameter = Toast.FromBase64(webApp);
+            }
+
+            if (data.TryGetValue("oauth", out string oauth))
+            {
+                MessageHelper.OpenTelegramUrl(ViewModel.ClientService, MasterDetail.NavigationService, new InternalLinkTypeOauth(Toast.FromBase64(oauth)), new OpenUrlSourceExternal());
+            }
+            else if (Uri.TryCreate(parameter, UriKind.Absolute, out Uri scheme))
+            {
+                Activate(scheme);
+            }
+            else
+            {
+                data.TryGetValue("chat_id", out string chat_id);
+                data.TryGetValue("forum_topic_id", out string forum_topic_id);
+                data.TryGetValue("saved_messages_topic_id", out string saved_messages_topic_id);
+                data.TryGetValue("feedback_chat_topic_id", out string feedback_chat_topic_id);
+                data.TryGetValue("thread_id", out string thread_id);
+
+                long.TryParse(chat_id, out long chatId);
+
+                MessageTopic messageTopic = null;
+                if (int.TryParse(forum_topic_id, out int forumTopicId))
+                {
+                    messageTopic = new MessageTopicForum(forumTopicId);
+                }
+                else if (long.TryParse(saved_messages_topic_id, out long savedMessagesTopicId))
+                {
+                    messageTopic = new MessageTopicSavedMessages(savedMessagesTopicId);
+                }
+                else if (long.TryParse(feedback_chat_topic_id, out long directMessagesChatTopicId))
+                {
+                    messageTopic = new MessageTopicDirectMessages(directMessagesChatTopicId);
+                }
+                else if (long.TryParse(thread_id, out long threadId))
+                {
+                    messageTopic = new MessageTopicThread(threadId);
+                }
+
+                if (_clientService.TryGetChat(chatId, out Chat chat))
+                {
+                    if (chat.ViewAsTopics)
+                    {
+                        MasterDetail.NavigationService.NavigateToChat(chat.Id, topic: messageTopic, force: false);
+                    }
+                    else
+                    {
+                        MasterDetail.NavigationService.NavigateToChat(chat.Id, force: false);
+                    }
+                }
+            }
+
+            if (XamlRoot == null)
+            {
+                return;
+            }
+
+            var popups = VisualTreeHelper.GetOpenPopupsForXamlRoot(XamlRoot);
+            if (popups != null)
+            {
+                foreach (var popup in popups)
+                {
+                    if (popup.Child is GalleryWindow gallery)
+                    {
+                        gallery.OnBackRequested(new BackRequestedRoutedEventArgs());
+                        break;
+                    }
+                }
+            }
+        }
+
+        public async void Activate(Uri scheme)
+        {
+            if (MessageHelper.IsTelegramUrl(scheme))
+            {
+                MessageHelper.OpenTelegramUrl(ViewModel.ClientService, MasterDetail.NavigationService, scheme, new OpenUrlSourceExternal());
+            }
+            else if (scheme.Scheme.Equals("ms-contact-profile") || scheme.Scheme.Equals("ms-ipmessaging"))
+            {
+                var query = scheme.Query.ParseQueryString();
+                if (query.TryGetValue("ContactRemoteIds", out string remote) && int.TryParse(remote.Substring(1), out int from_id))
+                {
+                    var response = await ViewModel.ClientService.SendAsync(new CreatePrivateChat(from_id, false));
+                    if (response is Chat chat)
+                    {
+                        MasterDetail.NavigationService.NavigateToChat(chat, force: false);
+                    }
+                }
+            }
+        }
+
+        private void OnNavigated(object sender, NavigatedEventArgs e)
+        {
+            var allowed = e.SourcePageType == typeof(ChatPage) ||
+                e.SourcePageType == typeof(ChatPinnedPage) ||
+                e.SourcePageType == typeof(ChatScheduledPage) ||
+                e.SourcePageType == typeof(ChatEventLogPage) ||
+                e.SourcePageType == typeof(ChatBusinessRepliesPage) ||
+                e.SourcePageType == typeof(ChatWelcomeMessagesPage) ||
+                e.SourcePageType == typeof(BlankPage);
+
+            var animate = MasterDetail.CurrentState != MasterDetailState.Minimal ||
+                (e.SourcePageType != typeof(BlankPage) && e.Content is not BlankPage);
+
+            var type = allowed ? BackgroundKind.Background : BackgroundKind.Material;
+
+            if (MasterDetail.CurrentState == MasterDetailState.Minimal && e.SourcePageType == typeof(BlankPage))
+            {
+                type = BackgroundKind.None;
+            }
+
+            if (MasterDetail.CurrentState != MasterDetailState.Unknown)
+            {
+                MasterDetail.ShowHideBackground(type, animate);
+            }
+
+            if (MasterDetail.CurrentState == MasterDetailState.Minimal)
+            {
+                MasterDetail.AllowCompact = true;
+            }
+            else
+            {
+                MasterDetail.AllowCompact = e.SourcePageType != typeof(BlankPage) && _prevIndex == INDEX_CHATS;
+            }
+
+            _shouldGoBackWithDetail = true;
+
+            UpdatePaneToggleButtonVisibility();
+            UpdateListViewsSelectedItem(MasterDetail.NavigationService.GetChatFromBackStack());
+
+            SettingsView?.UpdateSelection(false);
+        }
+
+        private void OnStateChanged(object sender, EventArgs e)
+        {
+            if (MasterDetail.CurrentState == MasterDetailState.Minimal)
+            {
+                if (ViewModel.Chats.SelectionMode != ListViewSelectionMode.Multiple)
+                {
+                    ChatsList.SelectedItem = null;
+                    ChatsList.SelectionMode = ListViewSelectionMode.None;
+                }
+
+                Header.Visibility = Visibility.Visible;
+                TitleText.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                if (ViewModel.Chats.SelectionMode != ListViewSelectionMode.Multiple)
+                {
+                    ChatsList.SelectionMode = ListViewSelectionMode.Single;
+                    ChatsList.SelectedItem = ViewModel.Chats.Items.FirstOrDefault(x => x.Id == ViewModel.Chats.SelectedItem);
+                }
+
+                Header.Visibility = MasterDetail.CurrentState == MasterDetailState.Expanded ? Visibility.Visible : Visibility.Collapsed;
+                TitleText.Visibility = MasterDetail.CurrentState == MasterDetailState.Expanded ? Visibility.Visible : Visibility.Collapsed;
+            }
+
+            UpdatePaneToggleButtonVisibility();
+
+            ChatsList.UpdateViewState(MasterDetail.CurrentState);
+
+            var frame = MasterDetail.NavigationService.Frame;
+            var allowed = frame.CurrentSourcePageType == typeof(ChatPage) ||
+                frame.CurrentSourcePageType == typeof(ChatPinnedPage) ||
+                frame.CurrentSourcePageType == typeof(ChatScheduledPage) ||
+                frame.CurrentSourcePageType == typeof(ChatEventLogPage) ||
+                frame.CurrentSourcePageType == typeof(ChatBusinessRepliesPage) ||
+                frame.CurrentSourcePageType == typeof(ChatWelcomeMessagesPage) ||
+                frame.CurrentSourcePageType == typeof(BlankPage);
+
+            var type = allowed ? BackgroundKind.Background : BackgroundKind.Material;
+
+            if (MasterDetail.CurrentState == MasterDetailState.Minimal && frame.CurrentSourcePageType == typeof(BlankPage))
+            {
+                type = BackgroundKind.None;
+            }
+
+            if (MasterDetail.CurrentState != MasterDetailState.Unknown)
+            {
+                MasterDetail.ShowHideBackground(type, false);
+            }
+        }
+
+        private void OnMasterVisibilityChanged(object sender, EventArgs e)
+        {
+            UpdateTitleBarMargins();
+
+            Stories.IsVisible = MasterDetail.MasterVisibility == Visibility.Visible;
+            Photo.Visibility = MasterDetail.MasterVisibility == Visibility.Visible || !_tabsLeftCollapsed
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        private void UpdatePaneToggleButtonVisibility()
+        {
+            var visible = ViewModel.Chats.Items.ChatList is ChatListArchive
+                || !_searchCollapsed
+                || (_prevIndex != INDEX_CHATS && AppSettings.Appearance.DisableNavigationBar);
+
+            if (MasterDetail.CurrentState == MasterDetailState.Minimal)
+            {
+                visible &= MasterDetail.NavigationService.CurrentPageType == typeof(BlankPage);
+            }
+
+            ShowHideBackButton(visible);
+        }
+
+        private void BackButton_Click(object sender, RoutedEventArgs e)
+        {
+            OnBackRequested(new BackRequestedRoutedEventArgs());
+        }
+
+        private bool _backButtonCollapsed = true;
+        private CompositionScopedBatch _backButtonBatch;
+
+        private void ShowHideBackButton(bool show)
+        {
+            if (_backButtonCollapsed != show)
+            {
+                return;
+            }
+
+            _backButtonCollapsed = !show;
+
+            var width = (float)(BackButton.Width + BackButton.Margin.Left + BackButton.Margin.Right);
+            var fullWidth = SearchField.ActualSize.X + (float)SearchField.Margin.Left;
+            var newWidth = show ? fullWidth - width : fullWidth;
+
+            SearchField.Margin = new Thickness(show ? width : 0, 0, 0, 0);
+            BackButton.Visibility = Visibility.Visible;
+
+            var field = ElementComposition.GetElementVisual(SearchField);
+            var border = SearchField.GetChild<Border>(x => x.Name == "BorderElement");
+
+            if (border == null || SearchField.ActualSize.X == 0 || newWidth <= 0)
+            {
+                _backButtonBatch = null;
+
+                BackButton.Visibility = show
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+                return;
+            }
+
+            var compositor = field.Compositor;
+            var background = ElementComposition.GetElementVisual(border);
+            var button = ElementComposition.GetElementVisual(BackButton);
+
+            var batch = compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += ShowHideBackButton_Completed;
+
+            _backButtonBatch = batch;
+
+            // The field takes its new size at once and slides in from where it was. Its border, scaled
+            // from the left by 1 - translation / width, keeps the right edge fixed only while both
+            // animations share the same duration and easing.
+            var from = show ? -width : width;
+
+            var offset = compositor.CreateScalarKeyFrameAnimation();
+            offset.InsertKeyFrame(0, from);
+            offset.InsertKeyFrame(1, 0);
+            offset.Duration = Constants.FastAnimation;
+
+            var stretch = compositor.CreateScalarKeyFrameAnimation();
+            stretch.InsertKeyFrame(0, 1 - from / newWidth);
+            stretch.InsertKeyFrame(1, 1);
+            stretch.Duration = Constants.FastAnimation;
+
+            var scale = compositor.CreateVector3KeyFrameAnimation();
+            scale.InsertKeyFrame(show ? 0 : 1, Vector3.Zero);
+            scale.InsertKeyFrame(show ? 1 : 0, Vector3.One);
+            scale.Duration = Constants.FastAnimation;
+
+            var opacity = compositor.CreateScalarKeyFrameAnimation();
+            opacity.InsertKeyFrame(show ? 0 : 1, 0);
+            opacity.InsertKeyFrame(show ? 1 : 0, 1);
+            opacity.Duration = Constants.FastAnimation;
+
+            button.CenterPoint = new Vector3(BackButton.ActualSize / 2, 0);
+
+            background.CenterPoint = Vector3.Zero;
+
+            field.StartAnimation("Translation.X", offset);
+            background.StartAnimation("Scale.X", stretch);
+            button.StartAnimation("Scale", scale);
+            button.StartAnimation("Opacity", opacity);
+
+            batch.End();
+        }
+
+        private void ShowHideBackButton_Completed(object sender, CompositionBatchCompletedEventArgs args)
+        {
+            if (sender is CompositionScopedBatch batch)
+            {
+                batch.Completed -= ShowHideBackButton_Completed;
+            }
+
+            // An interrupted batch completes after its replacement has started, and must not reset it.
+            if (sender != _backButtonBatch || BackButton == null)
+            {
+                return;
+            }
+
+            _backButtonBatch = null;
+
+            BackButton.Visibility = _backButtonCollapsed
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+        }
+
+        private Visibility UpdateScrollingHostHeaderVisibility(MasterDetailState state, bool primaryFolderSelected)
+        {
+            return state == MasterDetailState.Compact
+                ? Visibility.Collapsed
+                : primaryFolderSelected
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        private void UpdateListViewsSelectedItem(ChatMessageTopic openChat, bool fromSelection = false)
+        {
+            if (openChat.ChatId == 0 && ViewModel.Topics.Chat != null)
+            {
+                openChat = new ChatMessageTopic(ViewModel.Topics.Chat.Id, null);
+            }
+
+            ViewModel.Chats.SelectedItem = openChat.ChatId;
+
+            if (ViewModel.Topics.ChatId == openChat.ChatId)
+            {
+                ViewModel.Topics.SelectedItem = openChat.MessageTopic;
+                ViewModel.Topics.Delegate?.SetSelectedItem(ViewModel.Topics.Items.GetItem(openChat.MessageTopic));
+            }
+            else
+            {
+                ViewModel.Topics.SelectedItem = null;
+                ViewModel.Topics.Delegate?.SetSelectedItem(null);
+            }
+
+            if (ViewModel.Chats.SelectionMode != ListViewSelectionMode.Multiple)
+            {
+                try
+                {
+                    if (ViewModel.ClientService.TryGetChat(openChat.ChatId, out Chat chat) && ViewModel.Chats.Items.Contains(chat))
+                    {
+                        if (fromSelection)
+                        {
+                            // If we come from selection we need to delay this as ItemClick comes before SelectionChanged,
+                            // hence, if we unselect here, the ListView internal code will re-select the item right away.
+                            VisualUtilities.QueueCallbackForCompositionRendered(this, () => ChatsList.SelectedItem = chat);
+                        }
+                        else if (ChatsList.SelectedItem != chat)
+                        {
+                            ChatsList.SelectedItem = chat;
+                        }
+                    }
+                    else if (fromSelection)
+                    {
+                        // If we come from selection we need to delay this as ItemClick comes before SelectionChanged,
+                        // hence, if we unselect here, the ListView internal code will re-select the item right away.
+                        VisualUtilities.QueueCallbackForCompositionRendered(this, () => ChatsList.ClearValue(Selector.SelectedItemProperty));
+                    }
+                    else
+                    {
+                        ChatsList.ClearValue(Selector.SelectedItemProperty);
+                    }
+                }
+                catch
+                {
+                    // In some cases setting SelectedItem can trigger
+                }
+            }
+        }
+
+        public bool EvaluatePaneToggleButtonVisibility()
+        {
+            if (MasterDetail.CurrentState == MasterDetailState.Minimal)
+            {
+                return MasterDetail.NavigationService.CurrentPageType == typeof(BlankPage);
+            }
+
+            return true;
+        }
+
+        private void ListView_ItemClick(object sender, ItemClickEventArgs e)
+        {
+            if (e == null)
+            {
+                SearchField.Text = string.Empty;
+                Search_LostFocus(null, null);
+                return;
+            }
+
+            if (ViewModel.Chats.SelectionMode == ListViewSelectionMode.Multiple && e.ClickedItem is Chat chat)
+            {
+                if (ViewModel.Chats.SelectedItems.Contains(chat))
+                {
+                    ViewModel.Chats.SelectedItems.Remove(chat);
+                }
+                else
+                {
+                    ViewModel.Chats.SelectedItems.Add(chat);
+                }
+
+                if (ViewModel.Chats.SelectedItems.Empty())
+                {
+                    ViewModel.Chats.SelectionMode = MasterDetail.CurrentState == MasterDetailState.Minimal
+                        ? ListViewSelectionMode.None
+                        : ListViewSelectionMode.Single;
+                }
+            }
+            else
+            {
+                Navigate(e.ClickedItem, true);
+            }
+        }
+
+        private void ListView_ItemClick(object sender, ForumViewItemClickEventArgs e)
+        {
+            Navigate(e.ClickedItem, e.FromSelection);
+        }
+
+        public async void Navigate(object item, bool selectionChanged)
+        {
+            var profile = false;
+
+            if (item is TLCallGroup callGroup)
+            {
+                item = callGroup.Message;
+            }
+
+            if (item is Message message)
+            {
+                ViewModel.Chats.SelectedItem = message.ChatId;
+
+                var modifiers = WindowContext.KeyModifiers();
+                var createNewWindow = modifiers == Windows.System.VirtualKeyModifiers.Control;
+
+                var messageChat = ViewModel.ClientService.GetChat(message.ChatId);
+                var hasTabs = ViewModel.ClientService.HasTabs(messageChat);
+
+                MasterDetail.NavigationService.NavigateToChat(
+                    messageChat,
+                    message: message.Id,
+                    topic: hasTabs ? message.TopicId : null,
+                    force: false,
+                    createNewWindow: createNewWindow);
+            }
+            else
+            {
+                SearchField.Text = string.Empty;
+                Search_LostFocus(null, null);
+            }
+
+            if (item is TLCallGroup group)
+            {
+                item = group.Message;
+            }
+            else if (item is SearchResult result)
+            {
+                if (result.Chat != null)
+                {
+                    item = result.Chat;
+                    ViewModel.ClientService.Send(new AddRecentlyFoundChat(result.Chat.Id));
+                }
+                else
+                {
+                    item = result.User;
+                }
+
+                profile = result.Type == SearchResultType.WebApps;
+            }
+
+            //if (item is TLMessageCommonBase message)
+            //{
+            //    if (message.Parent != null)
+            //    {
+            //        MasterDetail.NavigationService.NavigateToDialog(message.Parent, message.Id);
+            //    }
+            //}
+            //else
+            //{
+            //    SearchField.Text = string.Empty;
+            //}
+
+            if (item is User user)
+            {
+                var response = await ViewModel.ClientService.SendAsync(new CreatePrivateChat(user.Id, false));
+                if (response is Chat)
+                {
+                    item = response as Chat;
+                }
+            }
+
+            if (item is Chat chat)
+            {
+                ViewModel.Chats.SelectedItem = chat.Id;
+
+                if (chat.ViewAsTopics && chat.Type is ChatTypeSupergroup && !ViewModel.ClientService.HasTabs(chat))
+                {
+                    if (ViewModel.Chats.SelectedItem != ViewModel.Topics.Chat?.Id)
+                    {
+                        ShowTopicList(chat);
+                    }
+                    else
+                    {
+                        HideTopicList(true);
+                    }
+                }
+                else
+                {
+                    if (profile)
+                    {
+                        MasterDetail.NavigationService.Navigate(typeof(ProfilePage), chat.Id);
+                    }
+                    else
+                    {
+                        var modifiers = WindowContext.KeyModifiers();
+                        if (modifiers == VirtualKeyModifiers.Menu && selectionChanged)
+                        {
+                            if (ChatsList.TryGetCell(chat, out ChatCell chatView))
+                            {
+                                chatView.ShowPreview(null);
+                            }
+                        }
+                        else
+                        {
+                            var createNewWindow = selectionChanged && modifiers == VirtualKeyModifiers.Control;
+
+                            // TODO: new display mode
+                            var messageThreadId = chat.LastMessage != null && ViewModel.ClientService.IsForum(chat) ? chat.LastMessage.ForumTopicId() : 0;
+                            messageThreadId = 0;
+
+                            MasterDetail.NavigationService.NavigateToChat(chat, force: false, createNewWindow: createNewWindow, clearBackStack: true);
+                        }
+                    }
+
+                    HideTopicList();
+                }
+            }
+            else if (item is ForumTopic topic)
+            {
+                var modifiers = WindowContext.KeyModifiers();
+                if (modifiers == VirtualKeyModifiers.Menu && selectionChanged)
+                {
+                    TopicListPresenter.HandleForumTopic(topic, (cell, chat) => cell.ShowPreview(null));
+                }
+                else
+                {
+                    var createNewWindow = selectionChanged && modifiers == VirtualKeyModifiers.Control;
+
+                    ViewModel.Chats.SelectedItem = topic.Info.ChatId;
+                    ViewModel.Topics.SelectedItem = topic.ToId();
+                    MasterDetail.NavigationService.NavigateToChat(ViewModel.Topics.Chat, topic: topic.ToId(), force: false, createNewWindow: createNewWindow, clearBackStack: true);
+                }
+            }
+        }
+
+        private void ListView_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (ViewModel.Chats.SelectedItems.Count > 0)
+            {
+                var muted = ViewModel.Chats.SelectedItems.Any(x => ViewModel.ClientService.Notifications.IsMuted(x));
+                ManageMute.Glyph = muted ? Icons.Alert : Icons.AlertOff;
+                Automation.SetToolTip(ManageMute, muted ? Strings.UnmuteNotifications : Strings.MuteNotifications);
+
+                var unread = ViewModel.Chats.SelectedItems.Any(x => x.IsUnread());
+                ManageMark.Icon = MenuFlyoutHelper.CreateIcon(unread ? Icons.MarkAsRead : Icons.MarkAsUnread);
+                ManageMark.Text = unread ? Strings.MarkAsRead : Strings.MarkAsUnread;
+
+                ManageClear.IsEnabled = ViewModel.Chats.SelectedItems.All(x => DialogClear_Loaded(x));
+            }
+        }
+
+        private void Pivot_SelectionChanged(int index)
+        {
+            MasterDetail.AllowCompact = MasterDetail.NavigationService.CurrentPageType != typeof(BlankPage) && index == INDEX_CHATS;
+
+            switch (index)
+            {
+                case INDEX_CHATS:
+                    break;
+                case INDEX_SETTINGS:
+                    _shouldGoBackWithDetail = false;
+                    SearchField.ControlledList = null;
+
+                    if (SettingsView == null)
+                    {
+                        FindName(nameof(SettingsRoot));
+                        SettingsView.DataContext = ViewModel.Settings;
+                        SettingsView.UpdateAccounts();
+                        ViewModel.Settings.Delegate = SettingsView;
+
+                        _ = ViewModel.Settings.NavigatedToAsync(null, NavigationMode.Refresh, null);
+                    }
+                    break;
+            }
+
+            SearchField.Text = string.Empty;
+
+            UpdateHeader();
+            UpdatePaneToggleButtonVisibility();
+
+            SearchReset();
+
+            if (index != INDEX_CHATS)
+            {
+                Stories.Collapse();
+                ViewModel.IsSettingsSelected = true;
+            }
+            else
+            {
+                ViewModel.IsSettingsSelected = false;
+            }
+
+            _shouldGoBackWithDetail = false;
+
+            for (int i = 0; i < ViewModel.Children.Count; i++)
+            {
+                if (ViewModel.Children[i] is IChildViewModel child)
+                {
+                    if (i == _prevIndex)
+                    {
+                        child.Activate();
+                    }
+                    else
+                    {
+                        child.Deactivate();
+                    }
+                }
+            }
+        }
+
+        private void UpdateHeader()
+        {
+            if (_prevIndex == INDEX_CHATS)
+            {
+                ChatsOptions.Visibility = Visibility.Visible;
+                SearchField.Padding = new Thickness(10, 5, 40, 6);
+            }
+            else
+            {
+                ChatsOptions.Visibility = Visibility.Collapsed;
+                SearchField.Padding = new Thickness(10, 5, 6, 6);
+            }
+
+            SearchField.PlaceholderText = _prevIndex == INDEX_SETTINGS
+                ? Strings.SearchInSettings
+                : Strings.Search;
+        }
+
+        #region Search
+
+        private bool _searchCollapsed = true;
+
+        private void ShowHideSearch(bool show)
+        {
+            if (_searchCollapsed != show)
+            {
+                return;
+            }
+
+            _searchCollapsed = !show;
+
+            FindName(nameof(DialogsSearchPanel));
+            DialogsPanel.Visibility = Visibility.Visible;
+            DialogsSearchPanel.Visibility = Visibility.Visible;
+
+            if (show)
+            {
+                DialogsSearchPanel.Activate();
+                SearchField.ControlledList = DialogsSearchPanel.Root;
+                Stories.Collapse();
+            }
+
+            var chats = ElementComposition.GetElementVisual(DialogsPanel);
+            var panel = ElementComposition.GetElementVisual(DialogsSearchPanel);
+
+            chats.CenterPoint = panel.CenterPoint = new Vector3(DialogsPanel.ActualSize / 2, 0);
+
+            var batch = panel.Compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += (s, args) =>
+            {
+                DialogsPanel.Visibility = _searchCollapsed ? Visibility.Visible : Visibility.Collapsed;
+                DialogsSearchPanel.Visibility = _searchCollapsed ? Visibility.Collapsed : Visibility.Visible;
+
+                if (_searchCollapsed)
+                {
+                    DialogsSearchPanel.Deactivate();
+                }
+            };
+
+            var scale1 = panel.Compositor.CreateVector3KeyFrameAnimation();
+            scale1.InsertKeyFrame(show ? 0 : 1, new Vector3(1.05f, 1.05f, 1));
+            scale1.InsertKeyFrame(show ? 1 : 0, new Vector3(1));
+            scale1.Duration = TimeSpan.FromMilliseconds(200);
+
+            var scale2 = panel.Compositor.CreateVector3KeyFrameAnimation();
+            scale2.InsertKeyFrame(show ? 0 : 1, new Vector3(1));
+            scale2.InsertKeyFrame(show ? 1 : 0, new Vector3(0.95f, 0.95f, 1));
+            scale2.Duration = TimeSpan.FromMilliseconds(200);
+
+            var opacity1 = panel.Compositor.CreateScalarKeyFrameAnimation();
+            opacity1.InsertKeyFrame(show ? 0 : 1, 0);
+            opacity1.InsertKeyFrame(show ? 1 : 0, 1);
+            opacity1.Duration = TimeSpan.FromMilliseconds(200);
+
+            var opacity2 = panel.Compositor.CreateScalarKeyFrameAnimation();
+            opacity2.InsertKeyFrame(show ? 0 : 1, 1);
+            opacity2.InsertKeyFrame(show ? 1 : 0, 0);
+            opacity2.Duration = TimeSpan.FromMilliseconds(200);
+
+            panel.StartAnimation("Scale", scale1);
+            panel.StartAnimation("Opacity", opacity1);
+
+            chats.StartAnimation("Scale", scale2);
+            chats.StartAnimation("Opacity", opacity2);
+
+            if (!_topicListCollapsed)
+            {
+                var header = ElementComposition.GetElementVisual(Header);
+                header.StartAnimation("Opacity", opacity1);
+            }
+
+            batch.End();
+        }
+
+        public void Search()
+        {
+            SearchField.Focus(FocusState.Keyboard);
+            Search_Click(null, null);
+        }
+
+        private void Search_Click(object sender, RoutedEventArgs e)
+        {
+            if (SearchField.FocusState == FocusState.Keyboard && sender == SearchField)
+            {
+                return;
+            }
+
+            Search_TextChanged(null, null);
+        }
+
+        private void Search_LostFocus(object sender, RoutedEventArgs e)
+        {
+            MasterDetail.AllowCompact = MasterDetail.NavigationService?.CurrentPageType != typeof(BlankPage)
+                && _prevIndex == INDEX_CHATS;
+
+            SearchReset();
+
+            UpdatePaneToggleButtonVisibility();
+        }
+
+        private const int INDEX_CHATS = 0;
+        private const int INDEX_SETTINGS = 1;
+
+        private void Search_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (SearchField.FocusState == FocusState.Unfocused && string.IsNullOrWhiteSpace(SearchField.Text))
+            {
+                return;
+            }
+
+            _shouldGoBackWithDetail = false;
+
+            MasterDetail.AllowCompact = false;
+
+            if (_prevIndex == INDEX_CHATS)
+            {
+                ShowHideSearch(true);
+                ViewModel.SearchChats.Query = SearchField.Text;
+            }
+            else if (_prevIndex == INDEX_SETTINGS)
+            {
+                if (string.IsNullOrWhiteSpace(SearchField.Text))
+                {
+                    SearchReset();
+                }
+                else
+                {
+                    SettingsView?.Visibility = Visibility.Collapsed;
+
+                    ViewModel.Settings.Search(SearchField.Text);
+                }
+            }
+
+            UpdatePaneToggleButtonVisibility();
+        }
+
+        private void SearchReset()
+        {
+            //DialogsPanel.Visibility = Visibility.Visible;
+            ShowHideSearch(false);
+
+            if (_prevIndex == INDEX_CHATS && SearchField.FocusState != FocusState.Unfocused)
+            {
+                Photo.Focus(FocusState.Programmatic);
+            }
+
+            SearchField.Text = string.Empty;
+
+            SettingsView?.Visibility = Visibility.Visible;
+
+            ViewModel.Settings.Results.Clear();
+        }
+
+        #endregion
+
+        private void Lock_Click(object sender, RoutedEventArgs e)
+        {
+            ViewModel.Passcode.Lock(false);
+        }
+
+        private void Settings_ContainerContentChanging(ListViewBase sender, ContainerContentChangingEventArgs args)
+        {
+            if (args.InRecycleQueue)
+            {
+                return;
+            }
+
+            static string GetPath(SettingsSearchEntry item)
+            {
+                if (item.Parent != null)
+                {
+                    return GetPath(item.Parent) + " > " + item.Text;
+                }
+
+                return item.Text;
+            }
+
+            var entry = args.Item as SettingsSearchEntry;
+            var button = args.ItemContainer.ContentTemplateRoot as SettingsButton;
+            button.Command = ViewModel.Settings.NavigateCommand;
+            button.CommandParameter = entry;
+
+            button.Content = entry.Text;
+            button.IconSource = entry.Icon;
+
+            var icon = button.GetChild<AnimatedIcon>();
+            icon?.InvalidateMeasure();
+
+            if (entry.Parent == null)
+            {
+                button.Badge = null;
+                button.BadgeVisibility = Visibility.Collapsed;
+            }
+            else
+            {
+                button.Badge = GetPath(entry.Parent);
+                button.BadgeVisibility = Visibility.Visible;
+            }
+
+            args.Handled = true;
+        }
+
+        private void SetPivotSelectedIndex(int index, bool updateBackStack = false)
+        {
+            if (_prevIndex != index || updateBackStack)
+            {
+                LoadAtIndex(index);
+
+                if (MasterDetail.CurrentState == MasterDetailState.Minimal &&
+                    MasterDetail.NavigationService.CurrentPageType != typeof(BlankPage))
+                {
+                    MasterDetail.NavigationService.GoBackAt(0);
+                }
+
+                Navigation.SelectionChanged -= Navigation_SelectionChanged;
+                Navigation.SelectedIndex = index;
+                Navigation.SelectionChanged += Navigation_SelectionChanged;
+            }
+        }
+
+        private void Arrow_Click(object sender, RoutedEventArgs e)
+        {
+            var scrollViewer = ChatsList.GetScrollViewer();
+            scrollViewer?.TryChangeView(null, 0, null);
+        }
+
+        private void Proxy_Click(object sender, RoutedEventArgs e)
+        {
+            MasterDetail.NavigationService.Navigate(typeof(SettingsProxyPage));
+        }
+
+        // The archived chats cell shows a summary of the list, so which chat moved does not
+        // matter here, only that one did: a change arriving while a refresh is already posted
+        // has nothing to add to it.
+        private ChatListService _archive;
+        private int _archivePosted;
+
+        private void OnArchiveChanged(OrderedSourceService<Chat> sender, OrderChangedEventArgs<Chat> args)
+        {
+            if (Interlocked.CompareExchange(ref _archivePosted, 1, 0) == 0)
+            {
+                this.BeginOnUIThread(UpdateChatListArchive);
+            }
+        }
+
+        private void UpdateChatListArchive()
+        {
+            // Cleared first, so a change landing while the cell is being rebuilt posts the
+            // refresh that covers it rather than being folded into this one.
+            Volatile.Write(ref _archivePosted, 0);
+
+            ArchivedChats.UpdateChatList(ViewModel.ClientService, new ChatListArchive());
+        }
+
+        public void UpdateChatFoldersLayout()
+        {
+            void handler(object sender, object e)
+            {
+                ChatsList.LayoutUpdated -= handler;
+                ChatsList.ItemContainerTransitions.Clear();
+            }
+
+            ChatsList.ItemContainerTransitions.Clear();
+            ChatsList.ItemContainerTransitions.Add(new RepositionThemeTransition());
+
+            ChatsList.LayoutUpdated += handler;
+            ChatsList.UpdateVisibleChats();
+
+            ConvertFolder(ViewModel.SelectedFolder);
+        }
+
+        public void UpdateChatFolders()
+        {
+            ConvertFolder(ViewModel.SelectedFolder);
+        }
+
+        private ChatFolderViewModel ConvertFolder(ChatFolderViewModel folder, bool updateBackStack = true)
+        {
+            ShowHideArchive(folder?.ChatList is ChatListMain or null && ViewModel.Chats.Items.ChatList is not ChatListArchive, false);
+            ShowHideLeftTabs(AppSettings.UseLeftTabsForChats && ViewModel.Folders.Count > 0);
+            ShowHideTopTabs(!AppSettings.UseLeftTabsForChats && ViewModel.Folders.Count > 0 && folder.ChatList is not ChatListArchive);
+
+            UpdatePaneToggleButtonVisibility();
+
+            if (MasterDetail.CurrentState != MasterDetailState.Minimal && updateBackStack)
+            {
+                SetPivotSelectedIndex(INDEX_CHATS);
+            }
+
+            ChatsList.CanGoNext = ViewModel.Folders.Count > 0 && ViewModel.Folders[^1] != folder;
+            ChatsList.CanGoPrev = ViewModel.Folders.Count > 0 && ViewModel.Folders[0] != folder;
+
+            return folder;
+        }
+
+        private void ChatFolders_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (sender is ListViewBase listView && listView.SelectedItem is ChatFolderViewModel folder)
+            {
+                UpdateFolder(folder, updateBackStack: false);
+
+                SetPivotSelectedIndex(INDEX_CHATS, true);
+                HideTopicList();
+            }
+        }
+
+        public void ArchivedChats_Click(object sender, RoutedEventArgs e)
+        {
+            UpdateFolder(ChatFolderViewModel.Archive);
+        }
+
+        private void ChatFolder_ContextRequested(UIElement sender, ContextRequestedEventArgs args)
+        {
+            var viewModel = ViewModel;
+            if (viewModel == null)
+            {
+                return;
+            }
+
+            var element = sender as FrameworkElement;
+            var folder = ChatFolders?.ItemFromContainer(sender) as ChatFolderViewModel;
+
+            folder ??= ChatFoldersSide.ItemFromContainer(sender) as ChatFolderViewModel;
+
+            if (folder.IsNavigationItem)
+            {
+                return;
+            }
+
+            var flyout = new MenuFlyout();
+
+            if (folder.ChatFolderId == Constants.ChatListMain)
+            {
+                flyout.CreateFlyoutItem(ViewModel.EditFolder, folder, Strings.FilterEditAll, Icons.Edit);
+                flyout.CreateFlyoutItem(ViewModel.MarkFolderAsRead, folder, Strings.MarkAllAsRead, Icons.MarkAsRead);
+            }
+            else
+            {
+                flyout.CreateFlyoutItem(ViewModel.EditFolder, folder, Strings.FilterEdit, Icons.Edit);
+                flyout.CreateFlyoutItem(ViewModel.MarkFolderAsRead, folder, Strings.MarkAllAsRead, Icons.MarkAsRead);
+                flyout.CreateFlyoutItem(ViewModel.AddToFolder, folder, Strings.FilterAddChats, Icons.Add);
+                flyout.CreateFlyoutSeparator();
+                flyout.CreateFlyoutItem(ViewModel.DeleteFolder, folder, Strings.Remove, Icons.Delete, destructive: true);
+            }
+
+            flyout.ShowAt(element, FlyoutPlacementMode.BottomEdgeAlignedLeft);
+        }
+
+        private void ArchivedChats_ContextRequested(UIElement sender, ContextRequestedEventArgs args)
+        {
+            var viewModel = ViewModel;
+            if (viewModel == null)
+            {
+                return;
+            }
+
+            var flyout = new MenuFlyout();
+
+            //if (((TLViewModelBase)ViewModel).Settings.CollapseArchivedChats)
+            //{
+            //    flyout.CreateFlyoutItem(new RelayCommand(ToggleArchive), Strings.AccDescrExpandPanel, Icons.Expand);
+            //}
+            //else
+            //{
+            //    flyout.CreateFlyoutItem(new RelayCommand(ToggleArchive), Strings.AccDescrCollapsePanel, Icons.Collapse);
+            //}
+
+            flyout.CreateFlyoutItem(ToggleArchive, Strings.ArchiveMoveToMainMenu, Icons.SubtractCircle);
+            flyout.CreateFlyoutItem(ViewModel.MarkFolderAsRead, ChatFolderViewModel.Archive, Strings.MarkAllAsRead, Icons.MarkAsRead);
+
+            flyout.ShowAt(sender, args);
+        }
+
+        public async void ToggleArchive()
+        {
+            ViewModel.ToggleArchive();
+
+            ArchivedChatsPanel.Visibility = Visibility.Visible;
+            //ArchivedChatsCompactPanel.Visibility = Visibility.Visible;
+
+            await ArchivedChatsPanel.UpdateLayoutAsync();
+
+            void ToggleArchiveCompleted()
+            {
+                ArchivedChatsPanel.Visibility = ((ViewModelBase)ViewModel).Settings.HideArchivedChats
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
+                //ArchivedChatsCompactPanel.Visibility = show ? Visibility.Collapsed : Visibility.Visible;
+                ChatsList.Margin = new Thickness(0, Stories.TopPadding, 0, 0);
+
+                if (((ViewModelBase)ViewModel).Settings.HideArchivedChats)
+                {
+                    ToastPopup.Show(Photo, Strings.ArchiveMoveToMainMenuInfo, ToastPlacementMode.BottomRight);
+                }
+            }
+
+            var show = !((ViewModelBase)ViewModel).Settings.HideArchivedChats;
+
+            var element = VisualTreeHelper.GetChild(ChatsList, 0) as UIElement;
+            if (element == null)
+            {
+                ToggleArchiveCompleted();
+            }
+
+            var presenter = ElementComposition.GetElementVisual(ArchivedChatsPresenter);
+            var parent = ElementComposition.GetElementVisual(ChatsList);
+
+            var chats = ElementComposition.GetElementVisual(element);
+            var panel = ElementComposition.GetElementVisual(ArchivedChatsPanel);
+            //var compact = ElementComposition.GetElementVisual(ArchivedChatsCompactPanel);
+
+            presenter.Clip = chats.Compositor.CreateInsetClip();
+            parent.Clip = chats.Compositor.CreateInsetClip();
+
+            var batch = chats.Compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += (s, args) =>
+            {
+                chats.Offset = new Vector3();
+                panel.Offset = new Vector3();
+                //compact.Offset = new Vector3();
+
+                ToggleArchiveCompleted();
+            };
+
+            var panelY = ArchivedChatsPanel.ActualSize.Y;
+            var compactY = 0; //(float)ArchivedChatsCompactPanel.ActualHeight;
+
+            ChatsList.Margin = new Thickness(0, Stories.TopPadding, 0, -(panelY - compactY));
+
+            float y0, y1;
+
+            if (show)
+            {
+                y0 = -(panelY - compactY);
+                y1 = 0;
+            }
+            else
+            {
+                y0 = 0;
+                y1 = -(panelY - compactY);
+            }
+
+            var offset0 = chats.Compositor.CreateVector3KeyFrameAnimation();
+            offset0.InsertKeyFrame(0, new Vector3(0, y0, 0));
+            offset0.InsertKeyFrame(1, new Vector3(0, y1, 0));
+            chats.StartAnimation("Offset", offset0);
+
+            //var offset1 = chats.Compositor.CreateVector3KeyFrameAnimation();
+            //offset1.InsertKeyFrame(0, new Vector3(0, show ? 0 : compactY, 0));
+            //offset1.InsertKeyFrame(1, new Vector3(0, show ? compactY : 0, 0));
+            //compact.StartAnimation("Offset", offset1);
+
+            var offset2 = chats.Compositor.CreateVector3KeyFrameAnimation();
+            offset2.InsertKeyFrame(0, new Vector3(0, show ? -compactY : 0, 0));
+            offset2.InsertKeyFrame(1, new Vector3(0, show ? 0 : -compactY, 0));
+            panel.StartAnimation("Offset", offset2);
+
+            batch.End();
+        }
+
+        private bool _archiveCollapsed;
+
+        private async void ShowHideArchive(bool show, bool animate)
+        {
+            if (_archiveCollapsed != show)
+            {
+                return;
+            }
+
+            _archiveCollapsed = !show;
+            ArchivedChatsPresenter.Visibility = Visibility.Visible;
+
+            void ShowHideArchiveCompleted()
+            {
+                ChatsList.Margin = new Thickness(0, Stories.TopPadding, 0, 0);
+                ArchivedChatsPresenter.Visibility = _archiveCollapsed
+                    ? Visibility.Collapsed
+                    : Visibility.Visible;
+            }
+
+            var element = VisualTreeHelper.GetChild(ChatsList, 0) as UIElement;
+            if (element == null || !animate || ((ViewModelBase)ViewModel).Settings.HideArchivedChats)
+            {
+                ShowHideArchiveCompleted();
+                return;
+            }
+
+            if (ArchivedChatsPanel.ActualWidth == 0)
+            {
+                await ArchivedChatsPanel.UpdateLayoutAsync();
+            }
+
+            var parent = ElementComposition.GetElementVisual(ChatsList);
+            var chats = ElementComposition.GetElementVisual(element);
+
+            parent.Clip = chats.Compositor.CreateInsetClip();
+            chats.StopAnimation("Offset");
+
+            var batch = chats.Compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += (s, args) =>
+            {
+                chats.Offset = new Vector3();
+                ShowHideArchiveCompleted();
+            };
+
+            var y = ArchivedChatsPresenter.ActualSize.Y;
+
+            ChatsList.Margin = new Thickness(0, Stories.TopPadding, 0, -y);
+
+            var offset0 = chats.Compositor.CreateVector3KeyFrameAnimation();
+            offset0.InsertKeyFrame(0, new Vector3(0, show ? -y : 0, 0));
+            offset0.InsertKeyFrame(1, new Vector3(0, show ? 0 : -y, 0));
+            chats.StartAnimation("Offset", offset0);
+
+            batch.End();
+        }
+
+        private bool _shouldGoBackWithDetail = true;
+
+        public void BackRequested()
+        {
+            if (_shouldGoBackWithDetail && MasterDetail.NavigationService.CanGoBack)
+            {
+                ViewModel.Window.RaiseBackRequested();
+            }
+            else
+            {
+                _shouldGoBackWithDetail = true;
+                OnBackRequested(new BackRequestedRoutedEventArgs());
+            }
+        }
+
+        private void UpdateFolder(ChatFolderViewModel folder, bool update = true, bool updateBackStack = true)
+        {
+            CarouselDirection direction = CarouselDirection.None;
+            if (folder.ChatList is ChatListArchive)
+            {
+                direction = CarouselDirection.Next;
+            }
+            else if (ViewModel.Chats.Items.ChatList is ChatListArchive)
+            {
+                direction = CarouselDirection.Previous;
+            }
+            else if (_prevIndex == INDEX_CHATS)
+            {
+                var nextIndex = ViewModel.Folders.IndexOf(folder);
+                var prevIndex = ViewModel.Folders.IndexOf(ViewModel.SelectedFolder);
+
+                if (nextIndex == prevIndex)
+                {
+                    return;
+                }
+
+                direction = nextIndex <= prevIndex
+                    ? CarouselDirection.Previous
+                    : CarouselDirection.Next;
+            }
+
+            ChatsList.ChangeView(direction, () =>
+            {
+                ViewModel.SelectedFolder = folder;
+
+                if (update)
+                {
+                    ConvertFolder(folder, updateBackStack);
+
+                    Logger.Info("ChangeView");
+
+                    var scrollingHost = ChatsList.GetScrollViewer();
+                    scrollingHost?.TryChangeView(null, 0, null, true);
+                }
+            });
+
+            if (folder.ChatList is ChatListArchive)
+            {
+                _shouldGoBackWithDetail = false;
+            }
+
+            Search_LostFocus(null, null);
+        }
+
+        #region Selection
+
+        private void List_SelectionModeChanged(DependencyObject sender, DependencyProperty dp)
+        {
+            if (ViewModel.Chats.SelectionMode == ListViewSelectionMode.Multiple)
+            {
+                ShowHideManagePanel(true);
+            }
+            else
+            {
+                ShowHideManagePanel(false);
+            }
+
+            UpdatePaneToggleButtonVisibility();
+        }
+
+        private bool _manageCollapsed = true;
+
+        private void ShowHideManagePanel(bool show)
+        {
+            if (_manageCollapsed != show)
+            {
+                return;
+            }
+
+            if (show)
+            {
+                HideTopicList();
+            }
+
+            _manageCollapsed = !show;
+            ManagePanel.Visibility = Visibility.Visible;
+
+            var manage = ElementComposition.GetElementVisual(ManagePanel);
+            //manage.Offset = new Vector3(show ? -20 : 12, 8, 0);
+            manage.Opacity = show ? 0 : 1;
+
+            var batch = manage.Compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += (s, args) =>
+            {
+                //manage.Offset = new Vector3(show ? 12 : -20, 8, 0);
+                manage.Opacity = show ? 1 : 0;
+
+                if (show)
+                {
+                    ManagePanel.Visibility = Visibility.Visible;
+                }
+                else
+                {
+                    ManagePanel.Visibility = Visibility.Collapsed;
+                    ViewModel.Chats.SelectedItems.Clear();
+                }
+            };
+
+            var offset1 = manage.Compositor.CreateVector3KeyFrameAnimation();
+            offset1.InsertKeyFrame(show ? 0 : 1, new Vector3(0, 48, 0));
+            offset1.InsertKeyFrame(show ? 1 : 0, new Vector3(0, 0, 0));
+
+            var opacity1 = manage.Compositor.CreateScalarKeyFrameAnimation();
+            opacity1.InsertKeyFrame(show ? 0 : 1, 0);
+            opacity1.InsertKeyFrame(show ? 1 : 0, 1);
+
+            manage.StartAnimation("Translation", offset1);
+            manage.StartAnimation("Opacity", opacity1);
+
+            batch.End();
+
+            if (show)
+            {
+                ManagePanel.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                MainHeader.Visibility = Visibility.Visible;
+            }
+        }
+
+        private void Manage_Click(object sender, RoutedEventArgs e)
+        {
+            if (ViewModel.Chats.SelectionMode != ListViewSelectionMode.Multiple)
+            {
+                ViewModel.Chats.SelectionMode = ListViewSelectionMode.Multiple;
+            }
+            else
+            {
+                ViewModel.Chats.SelectionMode = MasterDetail.CurrentState == MasterDetailState.Minimal
+                    ? ListViewSelectionMode.None
+                    : ListViewSelectionMode.Single;
+            }
+        }
+
+        public void SetSelectionMode(bool enabled)
+        {
+            if (enabled)
+            {
+                ViewModel.Chats.SelectionMode = ListViewSelectionMode.Multiple;
+            }
+            else
+            {
+                ViewModel.Chats.SelectionMode = MasterDetail.CurrentState == MasterDetailState.Minimal
+                    ? ListViewSelectionMode.None
+                    : ListViewSelectionMode.Single;
+            }
+        }
+
+        public async void SetSelectedItem(Chat chat)
+        {
+            await System.Threading.Tasks.Task.Delay(100);
+
+            if (ViewModel.Chats.SelectionMode != ListViewSelectionMode.Multiple)
+            {
+                try
+                {
+                    ChatsList.SelectedItem = chat;
+
+                    // TODO: would be great, but doesn't seem to work well enough :(
+                    //VisualUtilities.QueueCallbackForCompositionRendered(() => ChatsList.SelectedItem = chat);
+                }
+                catch
+                {
+                    // All the remote procedure calls must be wrapped in a try-catch block
+                }
+            }
+        }
+
+        public void SetSelectedItems(IList<Chat> chats)
+        {
+            if (ViewModel.Chats.SelectionMode == ListViewSelectionMode.Multiple)
+            {
+                try
+                {
+                    foreach (var item in chats)
+                    {
+                        if (!ChatsList.SelectedItems.Contains(item))
+                        {
+                            ChatsList.SelectedItems.Add(item);
+                        }
+                    }
+
+                    foreach (Chat item in ChatsList.SelectedItems)
+                    {
+                        if (!chats.Contains(item))
+                        {
+                            ChatsList.SelectedItems.Remove(item);
+                        }
+                    }
+                }
+                catch
+                {
+                    // SelectedItems likes to throw
+                }
+            }
+        }
+
+        #endregion
+
+        private void Confetti_Completed(object sender, EventArgs e)
+        {
+            this.BeginOnUIThread(() =>
+            {
+                UnloadObject(Confetti);
+            });
+        }
+
+        public static string GetFolderIcon(ChatListFolderFlags folder)
+        {
+            if (folder == ChatListFolderFlags.ExcludeMuted)
+            {
+                return Icons.AlertFilled;
+            }
+            else if (folder == ChatListFolderFlags.ExcludeRead)
+            {
+                return Icons.ChatUnreadFilled;
+            }
+            else if (folder == ChatListFolderFlags.ExcludeArchived)
+            {
+                return Icons.ArchiveFilled;
+            }
+            else if (folder == ChatListFolderFlags.IncludeContacts)
+            {
+                return Icons.PersonFilled;
+            }
+            else if (folder == ChatListFolderFlags.IncludeNonContacts)
+            {
+                return Icons.PersonQuestionMarkFilled;
+            }
+            else if (folder == ChatListFolderFlags.IncludeGroups)
+            {
+                return Icons.PeopleFilled;
+            }
+            else if (folder == ChatListFolderFlags.IncludeChannels)
+            {
+                return Icons.MegaphoneFilled;
+            }
+            else if (folder == ChatListFolderFlags.IncludeBots)
+            {
+                return Icons.BotFilled;
+            }
+            else if (folder == ChatListFolderFlags.ExistingChats)
+            {
+                return Icons.ChatMultipleFilled;
+            }
+            else if (folder == ChatListFolderFlags.NewChats)
+            {
+                return Icons.ChatUnreadFilled;
+            }
+
+            return null;
+        }
+
+        private void ChatFolders_DragItemsStarting(object sender, DragItemsStartingEventArgs e)
+        {
+            var list = sender as TopNavView;
+            if (list == null)
+            {
+                return;
+            }
+
+            if (e.Items.Count > 1)
+            {
+                list.CanReorderItems = false;
+                e.Cancel = true;
+            }
+            else
+            {
+                var items = ViewModel?.Folders;
+                if (items == null || items.Count < 2)
+                {
+                    list.CanReorderItems = false;
+                    e.Cancel = true;
+                }
+                else
+                {
+                    list.CanReorderItems = true;
+                }
+            }
+        }
+
+        private void ChatFolders_DragItemsCompleted(ListViewBase sender, DragItemsCompletedEventArgs args)
+        {
+            sender.CanReorderItems = false;
+
+            if (args.DropResult == DataPackageOperation.Move && args.Items.Count == 1 && args.Items[0] is ChatFolderViewModel folder)
+            {
+                var items = ViewModel?.Folders;
+                var index = items.IndexOf(folder);
+
+                var compare = items[index > 0 ? index - 1 : index + 1];
+                if (compare.ChatList is ChatListMain && index > 0 && index < items.Count - 1 && !_clientService.IsPremium)
+                {
+                    compare = items[index + 1];
+                }
+
+                if ((compare.ChatList is ChatListMain || folder.ChatList is ChatListMain) && !_clientService.IsPremium)
+                {
+                    ViewModel.Handle(new UpdateChatFolders(ViewModel.ClientService.ChatFolders, 0, false));
+
+                    ToastPopup.ShowPromo(ViewModel.NavigationService, string.Format(Strings.LimitReachedReorderFolder, Strings.FilterAllChats), Strings.PremiumMore, new PremiumSourceLimitExceeded(new PremiumLimitTypeChatFolderCount()));
+                }
+                else
+                {
+                    var folders = items.Where(x => x.ChatList is ChatListFolder).Select(x => x.ChatFolderId).ToArray();
+                    var main = _clientService.IsPremium ? items.IndexOf(items.FirstOrDefault(x => x.ChatList is ChatListMain)) : 0;
+
+                    ViewModel.ClientService.Send(new ReorderChatFolders(folders, main));
+                }
+            }
+        }
+
+        private void ArchivedChats_ActualThemeChanged(FrameworkElement sender, object args)
+        {
+            ArchivedChats.UpdateChatList(ViewModel.ClientService, new ChatListArchive());
+            ArchivedChats.UpdateStoryList(ViewModel.ClientService, new StoryListArchive());
+        }
+
+        private async void Downloads_Click(object sender, RoutedEventArgs e)
+        {
+            await ViewModel.NavigationService.ShowPopupAsync(new DownloadsPopup());
+        }
+
+        private void Photo_Click(object sender, RoutedEventArgs e)
+        {
+            var theme = ActualTheme;
+            var flyout = new MenuFlyout();
+
+            flyout.CreateFlyoutItem(MenuItemSwitchTheme, theme == ElementTheme.Dark ? Strings.SwitchThemeToDay : Strings.SwitchThemeToNight, theme == ElementTheme.Dark ? Icons.Sun : Icons.Moon);
+            flyout.CreateFlyoutSeparator();
+
+            if (AppSettings.Appearance.DisableNavigationBar)
+            {
+                var items = LifetimeService.Current.GetItemsForMenu(true, out _);
+
+                foreach (var session in items)
+                {
+                    var template = Resources["SessionItemTemplate"] as DataTemplate;
+                    var content = template.LoadContent() as Grid;
+                    content.DataContext = session;
+
+                    var user = session.ClientService.GetUser(session.UserId);
+                    if (user == null)
+                    {
+                        session.ClientService.Send(new GetUser(session.UserId));
+                        continue;
+                    }
+
+                    var title = content.FindName("TitleLabel") as TextBlock;
+                    title.Text = user.FullName();
+
+                    var photo = content.Children[0] as ProfilePicture;
+                    photo.Source = ProfilePictureSource.User(session.ClientService, user);
+
+                    var identity = content.FindName("Identity") as IdentityIcon;
+                    var botVerified = content.FindName("BotVerified") as CustomEmojiIcon;
+
+                    identity.SetStatus(session.ClientService, user, botVerified);
+
+                    var item = new MenuFlyoutButton
+                    {
+                        Content = content,
+                        CommandParameter = session,
+                        Command = new RelayCommand<ISession>(Root.Switch)
+                    };
+
+                    AutomationProperties.SetName(item, user.FullName());
+
+                    flyout.Items.Add(item);
+                }
+
+                if (items.Count < Constants.MaxAccountCount)
+                {
+                    flyout.CreateFlyoutItem(MenuItemAddAccount, Strings.AddAccount, Icons.AddCircle);
+                }
+
+                flyout.CreateFlyoutSeparator();
+            }
+
+            flyout.CreateFlyoutItem(MenuItemContacts, Strings.Contacts, Icons.Person);
+            flyout.CreateFlyoutItem(MenuItemCalls, Strings.Calls, Icons.Call);
+
+            if (AppSettings.Appearance.DisableNavigationBar)
+            {
+                flyout.CreateFlyoutItem(MenuItemSettings, Strings.Settings, Icons.Settings);
+            }
+
+            flyout.CreateFlyoutSeparator();
+            flyout.CreateFlyoutItem(MenuItemCreateGroup, Strings.NewGroup, Icons.People);
+
+            if (ViewModel.Session.Settings.HideArchivedChats)
+            {
+                var archiveChats = flyout.CreateFlyoutItem(MenuItemArchivedChats, Strings.ArchivedChats, Icons.Archive);
+                archiveChats.ContextRequested += ArchiveChats_ContextRequested;
+            }
+
+            flyout.CreateFlyoutItem(MenuItemSavedMessages, Strings.SavedMessages, Icons.Bookmark);
+
+            if (ViewModel.ClientService.Options.CanUseTonWallet)
+            {
+                flyout.CreateFlyoutItem(MenuItemWallet, Strings.WalletAttachMoney, Icons.Gram);
+            }
+
+            flyout.ShowAt(Photo, FlyoutPlacementMode.BottomEdgeAlignedLeft, animation: MenuFlyoutAnimation.Overlap);
+        }
+
+        private void MenuItemSettings()
+        {
+            SetPivotSelectedIndex(INDEX_SETTINGS);
+        }
+
+        private async void MenuItemSwitchTheme()
+        {
+            if (PowerSavingPolicy.AreSmoothTransitionsEnabled)
+            {
+                Transition.Visibility = Visibility.Collapsed;
+
+                var visual = BootStrapper.Current.Compositor.CreateRedirectVisual(this, Vector2.Zero, ActualSize, true);
+                await VisualUtilities.WaitForCompositionRenderedAsync();
+
+                ElementCompositionPreview.SetElementChildVisual(Transition, visual);
+
+                Transition.Visibility = Visibility.Visible;
+                Transition.Background = new SolidColorBrush(ActualTheme == ElementTheme.Dark ? Windows.UI.Color.FromArgb(0xFF, 0x20, 0x20, 0x20) : Windows.UI.Color.FromArgb(0xFF, 0xF3, 0xF3, 0xF3));
+
+                var actualWidth = (float)ActualWidth;
+                var actualHeight = (float)ActualHeight;
+
+                var transform = Photo.TransformToVisual(this);
+                var point = transform.TransformVector2();
+                var diagonal = MathFEx.DistanceToFarthestCorner(point + Photo.ActualSize / 2, LayoutRoot.ActualSize);
+
+                var expand = false; // ActualTheme == ElementTheme.Dark;
+
+                var rect1 = CanvasGeometry.CreateRectangle(null, 0, 0, expand ? 0 : actualWidth, expand ? 0 : actualHeight);
+
+                var elli1 = CanvasGeometry.CreateCircle(null, point.X + 24, point.Y + 24, expand ? 0 : diagonal);
+                var group1 = CanvasGeometry.CreateGroup(null, new[] { elli1, rect1 }, CanvasFilledRegionDetermination.Alternate);
+
+                var elli2 = CanvasGeometry.CreateCircle(null, point.X + 24, point.Y + 24, expand ? diagonal : 0);
+                var group2 = CanvasGeometry.CreateGroup(null, new[] { elli2, rect1 }, CanvasFilledRegionDetermination.Alternate);
+
+                var ellipse = visual.Compositor.CreatePathGeometry(new CompositionPath(group2));
+                var clip = visual.Compositor.CreateGeometricClip(ellipse);
+
+                var container = ElementComposition.GetElementVisual(Transition);
+                container.Clip = clip;
+
+                var batch = visual.Compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+                batch.Completed += (s, args) =>
+                {
+                    visual.Clip = null;
+                    visual.Brush = visual.Compositor.CreateColorBrush(Colors.Transparent);
+
+                    ElementCompositionPreview.SetElementChildVisual(Transition, visual.Compositor.CreateSpriteVisual());
+
+                    Transition.Visibility = Visibility.Collapsed;
+                };
+
+                CompositionEasingFunction ease;
+                if (expand)
+                {
+                    ease = visual.Compositor.CreateCubicBezierEasingFunction(new Vector2(.42f, 0), new Vector2(1, 1));
+                }
+                else
+                {
+                    ease = visual.Compositor.CreateCubicBezierEasingFunction(new Vector2(0, 0), new Vector2(.58f, 1));
+                }
+
+                var anim = visual.Compositor.CreatePathKeyFrameAnimation();
+                anim.InsertKeyFrame(0, new CompositionPath(group2), ease);
+                anim.InsertKeyFrame(1, new CompositionPath(group1), ease);
+                anim.Duration = TimeSpan.FromMilliseconds(500);
+
+                ellipse.StartAnimation("Path", anim);
+                batch.End();
+            }
+
+            NightModeService.Current.Switch(ActualTheme != ElementTheme.Dark ? TelegramTheme.Dark : TelegramTheme.Light, XamlRoot);
+        }
+
+        private void MenuItemContacts()
+        {
+            ViewModel.NavigationService.ShowPopup(new ContactsPopup());
+        }
+
+        private void MenuItemCalls()
+        {
+            ViewModel.NavigationService.ShowPopup(new CallsPopup());
+        }
+
+        private void MenuItemCreateGroup()
+        {
+            ViewModel.NavigationService.ShowPopup(new NewGroupPopup());
+        }
+
+        private void MenuItemArchivedChats()
+        {
+            ArchivedChats_Click(null, null);
+        }
+
+        private void ArchiveChats_ContextRequested(UIElement sender, ContextRequestedEventArgs args)
+        {
+            var flyout = new MenuFlyout();
+            flyout.CreateFlyoutItem(ToggleArchive, Strings.ArchiveMoveToChatList, Icons.AddCircle);
+            flyout.CreateFlyoutItem(ViewModel.MarkFolderAsRead, ChatFolderViewModel.Archive, Strings.MarkAllAsRead, Icons.MarkAsRead);
+            flyout.ShowAt(sender, args);
+        }
+
+        private void MenuItemSavedMessages()
+        {
+            ViewModel.NavigateToMyProfile(true);
+        }
+
+        private void MenuItemWallet()
+        {
+            ViewModel.NavigationService.NavigateToWallet();
+        }
+
+        private void ChatsList_GettingFocus(UIElement sender, GettingFocusEventArgs args)
+        {
+            if (!AutomationPeer.ListenerExists(AutomationEvents.LiveRegionChanged))
+            {
+                if (Photo == sender)
+                {
+                    Photo.UseSystemFocusVisuals = args.Direction != FocusNavigationDirection.None;
+                }
+
+                return;
+            }
+
+            try
+            {
+                // ListViewBase ignores GettingFocus events with Direction equals to None
+                // What we do here is to simulate the default behavior, so that closing the active chat
+                // will move the focus to the last selected item in the chat list if possible.
+                if (args.Direction == FocusNavigationDirection.None && args.OldFocusedElement is not ChatListListViewItem)
+                {
+                    if (!_topicListCollapsed && ViewModel?.Topics.LastSelectedItem is MessageTopicForum forum && TopicListPresenter.TryGetContainer(forum.ForumTopicId, out SelectorItem container))
+                    {
+                        Logger.Info("Set topic item as focused element");
+
+                        if (args.TrySetNewFocusedElement(container))
+                        {
+                            args.Handled = true;
+                        }
+                    }
+                    else if (ChatsList.TryGetContainer(ViewModel?.Chats.LastSelectedItem ?? 0, out container))
+                    {
+                        Logger.Info("Set chat item as focused element");
+
+                        if (args.TrySetNewFocusedElement(container))
+                        {
+                            args.Handled = true;
+                        }
+                    }
+                    else if (sender != ChatsList)
+                    {
+                        Logger.Info("Set chat list as focused element");
+
+                        if (args.TrySetNewFocusedElement(ChatsList))
+                        {
+                            args.Handled = true;
+                        }
+                    }
+
+                    if (args.NewFocusedElement is ChatListListViewItem item)
+                    {
+                        // Let's disable the awkward focus rect that would appear on activation.
+                        // ChatListListViewItem.OnLostFocus takes care of reenabling it.
+                        item.UseSystemFocusVisuals = false;
+                    }
+                }
+            }
+            catch
+            {
+                // All the remote procedure calls must be wrapped in a try-catch block
+            }
+        }
+
+        private void ChatFolders_ChoosingGroupHeaderContainer(ListViewBase sender, ChoosingGroupHeaderContainerEventArgs args)
+        {
+            args.GroupHeaderContainer = new ListViewHeaderItem
+            {
+                Visibility = args.GroupIndex == 0
+                    ? Visibility.Collapsed
+                    : Visibility.Visible
+            };
+        }
+
+        private void ChatsList_ChoosingItemContainer(ListViewBase sender, ChoosingItemContainerEventArgs args)
+        {
+            if (args.ItemContainer == null)
+            {
+                args.ItemContainer = new ChatListListViewItem(ChatsList);
+                args.ItemContainer.ContentTemplate = ChatsList.ItemTemplate;
+                args.ItemContainer.ContextRequested += Chat_ContextRequested;
+            }
+
+            args.IsContainerPrepared = true;
+        }
+
+        public void PopupOpened()
+        {
+            NavigationService.Window.SetTitleBar(null);
+
+            if (NavigationService.Frame.Content is IActivablePage page)
+            {
+                page.PopupOpened();
+            }
+        }
+
+        public void PopupClosed()
+        {
+            NavigationService.Window.SetTitleBar(TitleBarHandle);
+
+            if (NavigationService.Frame.Content is IActivablePage page)
+            {
+                page.PopupClosed();
+            }
+        }
+
+        #region Context menu
+
+        private void DialogsSearchPanel_ItemContextRequested(UIElement sender, ItemContextRequestedEventArgs args)
+        {
+            if (args.Item is SearchResult result && result.Chat != null)
+            {
+                var element = sender as FrameworkElement;
+                var chat = result.Chat;
+
+                Chat_ContextRequested(chat, element, args.EventArgs, false);
+            }
+        }
+
+        private void Chat_ContextRequested(UIElement sender, ContextRequestedEventArgs args)
+        {
+            var element = sender as FrameworkElement;
+            var chat = ChatsList.ItemFromContainer(element) as Chat;
+
+            Chat_ContextRequested(chat, sender, args, true);
+        }
+
+        private async void Chat_ContextRequested(Chat chat, UIElement sender, ContextRequestedEventArgs args, bool allowSelection)
+        {
+            var viewModel = ViewModel.Chats;
+            if (viewModel == null)
+            {
+                return;
+            }
+
+            var flyout = new MenuFlyout();
+            var element = sender as FrameworkElement;
+
+            var position = chat?.GetPosition(viewModel.Items.ChatList);
+            if (position == null)
+            {
+                return;
+            }
+
+            var muted = ViewModel.ClientService.Notifications.IsMuted(chat);
+            var archived = chat.Positions.Any(x => x.List is ChatListArchive);
+
+            if (DialogArchive_Loaded(chat))
+            {
+                // Suggest to unarchive only when archive is open
+                if (viewModel.Items.ChatList is ChatListArchive && archived)
+                {
+                    flyout.CreateFlyoutItem(DialogArchive_Loaded, viewModel.ArchiveChat, chat, Strings.Unarchive, Icons.Unarchive);
+                }
+                else if (viewModel.Items.ChatList is not ChatListArchive && !archived)
+                {
+                    flyout.CreateFlyoutItem(DialogArchive_Loaded, viewModel.ArchiveChat, chat, Strings.Archive, Icons.Archive);
+                }
+            }
+
+            flyout.CreateFlyoutItem(DialogPin_Loaded, viewModel.PinChat, chat, position.IsPinned ? Strings.UnpinFromTop : Strings.PinToTop, position.IsPinned ? Icons.PinOff : Icons.Pin);
+
+            var chatLists = await ViewModel.ClientService.SendAsync(new GetChatListsToAddChat(chat.Id)) as ChatLists;
+            if (chatLists != null && chatLists.ChatListsValue.Count > 0)
+            {
+                var folders = ViewModel.ClientService.ChatFolders.ToDictionary(x => x.Id);
+
+                var item = new MenuFlyoutSubItem();
+                item.Text = Strings.FilterAddTo;
+                item.Icon = MenuFlyoutHelper.CreateIcon(Icons.FolderAdd);
+
+                foreach (var chatList in chatLists.ChatListsValue.OfType<ChatListFolder>())
+                {
+                    // Skip current folder from "Add to folder" list to avoid confusion
+                    if (chatList.AreTheSame(viewModel.Items.ChatList))
+                    {
+                        continue;
+                    }
+
+                    if (folders.TryGetValue(chatList.ChatFolderId, out ChatFolderInfo folder))
+                    {
+                        var icon = Icons.ParseFolder(folder.Icon);
+                        var glyph = Icons.FolderToGlyph(icon);
+
+                        var textBlock = new RichTextBlock
+                        {
+                            IsTextSelectionEnabled = false
+                        };
+
+                        var paragraph = new Paragraph();
+                        textBlock.Blocks.Add(paragraph);
+
+                        CustomEmojiIcon.Add(textBlock, paragraph.Inlines, ViewModel.ClientService, folder.Name);
+
+                        var folderItem = new MenuFlyoutChatFolder
+                        {
+                            Icon = MenuFlyoutHelper.CreateIcon(glyph.Item1),
+                            Content = textBlock,
+                            CommandParameter = (folder.Id, chat),
+                            Command = new RelayCommand<(int, Chat)>(viewModel.AddToFolder)
+                        };
+                        item.Items.Add(folderItem);
+                    }
+                }
+
+                if (folders.Count < 10 && item.Items.Count > 0)
+                {
+                    item.CreateFlyoutSeparator();
+                    item.CreateFlyoutItem(viewModel.CreateFolder, chat, Strings.CreateNewFilter, Icons.Add);
+                }
+
+                if (item.Items.Count > 0)
+                {
+                    flyout.Items.Add(item);
+                }
+            }
+
+            if (viewModel.Items.ChatList is ChatListFolder chatListFolder)
+            {
+                var response = await ViewModel.ClientService.SendAsync(new GetChatFolder(chatListFolder.ChatFolderId)) as ChatFolder;
+                if (response != null)
+                {
+                    if (response.Any(chat.Id))
+                    {
+                        flyout.CreateFlyoutItem(viewModel.RemoveFromFolder, (chatListFolder.ChatFolderId, chat), Strings.FilterRemoveFrom, Icons.FolderMove);
+                    }
+                }
+            }
+
+            if (DialogNotify_Loaded(chat))
+            {
+                var silent = ViewModel.ClientService.Notifications.IsSilent(chat);
+
+                var mute = new MenuFlyoutSubItem();
+                mute.Text = Strings.Mute;
+                mute.Icon = MenuFlyoutHelper.CreateIcon(muted ? Icons.Alert : Icons.AlertOff);
+
+                if (muted is false)
+                {
+                    mute.CreateFlyoutItem(ViewModel.Chats.SetChatSound, Tuple.Create<Chat, bool>(chat, !silent),
+                        silent ? Strings.SoundOn : Strings.SoundOff,
+                        silent ? Icons.MusicNote2 : Icons.MusicNoteOff2);
+                }
+
+                mute.CreateFlyoutItem(ViewModel.Chats.MuteChatFor, Tuple.Create<Chat, int?>(chat, 60 * 60), Strings.MuteFor1h, Icons.ClockAlarmHour);
+                mute.CreateFlyoutItem(ViewModel.Chats.MuteChatFor, Tuple.Create<Chat, int?>(chat, null), Strings.MuteForPopup, Icons.AlertSnooze);
+
+                var toggle = mute.CreateFlyoutItem(
+                    ViewModel.Chats.NotifyChat,
+                    chat,
+                    muted ? Strings.UnmuteNotifications : Strings.MuteNotifications,
+                    muted ? Icons.Speaker3 : Icons.SpeakerOff, destructive: !muted);
+
+                flyout.Items.Add(mute);
+            }
+
+            flyout.CreateFlyoutItem(DialogMark_Loaded, viewModel.MarkChatAsRead, chat, chat.IsUnread() ? Strings.MarkAsRead : Strings.MarkAsUnread, chat.IsUnread() ? Icons.MarkAsRead : Icons.MarkAsUnread);
+            flyout.CreateFlyoutItem(DialogClear_Loaded, viewModel.ClearChat, chat, Strings.ClearHistory, Icons.Broom);
+            flyout.CreateFlyoutItem(DialogDelete_Loaded, viewModel.DeleteChat, chat, DialogDelete_Text(chat), Icons.Delete, destructive: true);
+
+            if (viewModel.SelectionMode != ListViewSelectionMode.Multiple)
+            {
+                if (ApiInfo.HasMultipleViews)
+                {
+                    flyout.CreateFlyoutSeparator();
+                    flyout.CreateFlyoutItem(viewModel.OpenChat, chat, Strings.OpenInNewWindow, Icons.WindowNew);
+                }
+
+                if (allowSelection)
+                {
+                    flyout.CreateFlyoutSeparator();
+                    flyout.CreateFlyoutItem(viewModel.SelectChat, chat, Strings.Select, Icons.CheckmarkCircle);
+                }
+            }
+
+            flyout.ShowAt(sender, args);
+        }
+
+        private bool DialogMark_Loaded(Chat chat)
+        {
+            return true;
+        }
+
+        private bool DialogPin_Loaded(Chat chat)
+        {
+            //if (!chat.IsPinned)
+            //{
+            //    var count = ViewModel.Dialogs.LegacyItems.Where(x => x.IsPinned).Count();
+            //    var max = ViewModel.ClientService.Config.PinnedDialogsCountMax;
+
+            //    return count < max ? Visibility.Visible : Visibility.Collapsed;
+            //}
+
+            var position = chat.GetPosition(ViewModel.Chats.Items.ChatList);
+            if (position?.Source != null)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool DialogArchive_Loaded(Chat chat)
+        {
+            var position = chat.GetPosition(ViewModel.Chats.Items.ChatList);
+            if (ViewModel.ClientService.IsSavedMessages(chat) || position?.Source != null || chat.Id == 777000)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool DialogNotify_Loaded(Chat chat)
+        {
+            var position = chat.GetPosition(ViewModel.Chats.Items.ChatList);
+            if (ViewModel.ClientService.IsSavedMessages(chat) || position?.Source is ChatSourcePublicServiceAnnouncement)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        public bool DialogClear_Loaded(Chat chat)
+        {
+            var position = chat.GetPosition(ViewModel.Chats.Items.ChatList);
+            if (position?.Source != null)
+            {
+                return false;
+            }
+
+            if (chat.Type is ChatTypeSupergroup super)
+            {
+                var supergroup = ViewModel.ClientService.GetSupergroup(super.SupergroupId);
+                if (supergroup != null)
+                {
+                    return !supergroup.HasActiveUsername() && !super.IsChannel;
+                }
+            }
+
+            return true;
+        }
+
+        private bool DialogDelete_Loaded(Chat chat)
+        {
+            var position = chat.GetPosition(ViewModel.Chats.Items.ChatList);
+            if (position?.Source is ChatSourceMtprotoProxy)
+            {
+                return false;
+            }
+
+            //if (dialog.With is TLChannel channel)
+            //{
+            //    return Visibility.Visible;
+            //}
+            //else if (dialog.Peer is TLPeerUser userPeer)
+            //{
+            //    return Visibility.Visible;
+            //}
+            //else if (dialog.Peer is TLPeerChat chatPeer)
+            //{
+            //    return dialog.With is TLChatForbidden || dialog.With is TLChatEmpty ? Visibility.Visible : Visibility.Collapsed;
+            //}
+
+            //return Visibility.Collapsed;
+
+            return true;
+        }
+
+        private string DialogDelete_Text(Chat chat)
+        {
+            var position = chat.GetPosition(ViewModel.Chats.Items.ChatList);
+            if (position?.Source is ChatSourcePublicServiceAnnouncement)
+            {
+                return Strings.PsaHide;
+            }
+            else if (chat.Type is ChatTypeSupergroup super)
+            {
+                return super.IsChannel ? Strings.LeaveChannelMenu : Strings.LeaveMegaMenu;
+            }
+            else if (chat.Type is ChatTypeBasicGroup)
+            {
+                return Strings.DeleteAndExit;
+            }
+
+            return Strings.Delete;
+        }
+
+        #endregion
+
+        private void Status_Click(object sender, RoutedEventArgs e)
+        {
+            if (ViewModel.IsPremium)
+            {
+                EmojiMenuFlyout.ShowAt(ViewModel.ClientService, EmojiDrawerMode.EmojiStatus, LogoEmoji, EmojiFlyoutAlignment.TopLeft);
+            }
+        }
+
+        public void ShowTopicList(Chat chat)
+        {
+            ViewModel.Topics.SetChat(chat);
+            ShowHideTopicList(true);
+            TopicListPresenter?.UpdateChat(chat);
+
+            var currentChat = MasterDetail.NavigationService.GetChatFromBackStack();
+            if (currentChat.ChatId == chat.Id)
+            {
+                UpdateListViewsSelectedItem(currentChat);
+            }
+            else
+            {
+                UpdateListViewsSelectedItem(new ChatMessageTopic(chat.Id, null));
+            }
+        }
+
+        public void HideTopicList(bool fromSelection = false)
+        {
+            var chatId = ViewModel.Topics.Chat?.Id;
+
+            ShowHideTopicList(false);
+
+            if (ViewModel.Chats.SelectedItem == chatId)
+            {
+                UpdateListViewsSelectedItem(MasterDetail.NavigationService.GetChatFromBackStack(), fromSelection);
+            }
+        }
+
+        private bool _topicListCollapsed = true;
+
+        private void ShowHideTopicList(bool show)
+        {
+            if (_topicListCollapsed != show)
+            {
+                return;
+            }
+
+            FindName(nameof(TopicListPresenter));
+            TopicListPresenter.DataContext = ViewModel.Topics;
+
+            ViewModel.Topics.Delegate = TopicListPresenter;
+
+            _topicListCollapsed = !show;
+            TopicListPresenter.Visibility = Visibility.Visible;
+
+            // Hiding clears the model below while the presenter stays visible for the
+            // animation, so input has to stop now: a click landing in between finds a null Chat.
+            TopicListPresenter.IsHitTestVisible = show;
+
+            MasterDetail.CornerRadius = new CornerRadius(show ? 0 : 8, 0, 0, 0);
+            Canvas.SetZIndex(ChatsRoot, show ? 1 : 0);
+
+            if (show)
+            {
+                Stories.Collapse();
+                TopicListPresenter.Focus(FocusState.Programmatic);
+            }
+            else
+            {
+                ViewModel.Topics.SetChat(null);
+            }
+
+            var padding = ChatTabs != null
+                ? _tabsTopCollapsed ? -74 : -78
+                : -14;
+
+            var margin = _tabsTopCollapsed ? 38 : 74;
+
+            DialogsPanel.Margin = new Thickness(0, -margin, 0, 0);
+            TopicListPresenter.Margin = new Thickness(72, padding, 0, 0);
+
+            void ShowHideTopicListCompleted()
+            {
+                if (_topicListCollapsed)
+                {
+                    TopicListPresenter.Visibility = Visibility.Collapsed;
+                }
+            }
+
+            var element = VisualTreeHelper.GetChild(ChatsList, 0) as UIElement;
+            if (element == null)
+            {
+                ShowHideTopicListCompleted();
+                return;
+            }
+
+            var scrollingHost = VisualTreeHelper.GetChild(element, 1) as UIElement;
+
+            var chats = ElementComposition.GetElementVisual(element);
+            var panel = ElementComposition.GetElementVisual(TopicListPresenter);
+
+            var dialogs = ElementComposition.GetElementVisual(DialogsPanel);
+            var header = ElementComposition.GetElementVisual(Header);
+
+            var compositor = chats.Compositor;
+
+            var inset = 72;
+            var width = ChatsList.ActualSize.X - inset;
+
+            var sourceOffset = new Vector2(inset, 0);
+            var sourceSize = new Vector2(width, ChatsList.ActualSize.Y);
+
+            var redirect = compositor.CreateRedirectVisual(scrollingHost, sourceOffset, sourceSize);
+            redirect.Offset = new Vector3(sourceOffset, 0);
+            redirect.Clip = compositor.CreateInsetClip();
+
+            ElementCompositionPreview.SetElementChildVisual(ChatsList, redirect);
+            ElementCompositionPreview.SetIsTranslationEnabled(TopicListPresenter, true);
+
+            chats.Clip = compositor.CreateInsetClip(0, 0, width, 0);
+            dialogs.Clip = null;
+
+            var batch = compositor.CreateScopedBatch(CompositionBatchTypes.Animation);
+            batch.Completed += (s, args) =>
+            {
+                redirect.Size = Vector2.Zero;
+                ElementCompositionPreview.SetElementChildVisual(ChatsList, null);
+
+                if (_topicListCollapsed)
+                {
+                    chats.Clip = null;
+                    TopicListPresenter.Visibility = Visibility.Collapsed;
+
+                    dialogs.Properties.InsertVector3("Translation", Vector3.Zero);
+                    DialogsPanel.Margin = new Thickness(0);
+                }
+                else
+                {
+                    dialogs.Clip = compositor.CreateInsetClip(0, (float)ChatsList.Margin.Top, 0, 0);
+                }
+            };
+
+            var offset0 = compositor.CreateScalarKeyFrameAnimation();
+            offset0.InsertKeyFrame(0, show ? width : 0);
+            offset0.InsertKeyFrame(1, show ? 0 : width);
+            offset0.Duration = Constants.FastAnimation;
+
+            var offset1 = compositor.CreateScalarKeyFrameAnimation();
+            offset1.InsertKeyFrame(0, show ? inset : -width + inset);
+            offset1.InsertKeyFrame(1, show ? -width + inset : inset);
+            offset1.Duration = Constants.FastAnimation;
+
+            var clip0 = compositor.CreateScalarKeyFrameAnimation();
+            clip0.InsertKeyFrame(0, show ? 0 : width);
+            clip0.InsertKeyFrame(1, show ? width : 0);
+            clip0.Duration = Constants.FastAnimation;
+
+            panel.StartAnimation("Translation.X", offset0);
+            redirect.StartAnimation("Offset.X", offset1);
+            redirect.Clip.StartAnimation("LeftInset", clip0);
+
+            ChatsList.UpdateViewState(show ? MasterDetailState.Compact : MasterDetail.CurrentState);
+
+            var offset2 = compositor.CreateScalarKeyFrameAnimation();
+            offset2.InsertKeyFrame(0, show ? margin : 0);
+            offset2.InsertKeyFrame(1, show ? 0 : margin);
+            offset2.Duration = Constants.FastAnimation;
+
+            var clip1 = compositor.CreateScalarKeyFrameAnimation();
+            clip1.InsertKeyFrame(0, show ? 0 : 40);
+            clip1.InsertKeyFrame(1, show ? 40 : 0);
+            clip1.Duration = Constants.FastAnimation;
+
+            var opacity = compositor.CreateScalarKeyFrameAnimation();
+            opacity.InsertKeyFrame(0, show ? 1 : 0);
+            opacity.InsertKeyFrame(1, show ? 0 : 1);
+            opacity.Duration = Constants.FastAnimation;
+
+            dialogs.StartAnimation("Translation.Y", offset2);
+            header.StartAnimation("Opacity", opacity);
+
+            if (ChatTabs != null)
+            {
+                var tabs = ElementComposition.GetElementVisual(ChatTabs);
+                tabs.StartAnimation("Opacity", opacity);
+            }
+
+            batch.End();
+        }
+
+        private void ChatList_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            var element = VisualTreeHelper.GetChild(ChatsList, 0) as UIElement;
+            if (element == null)
+            {
+                return;
+            }
+
+            var chats = ElementComposition.GetElementVisual(element);
+            if (chats.Clip is InsetClip inset && inset.RightInset != 0 && TopicListPresenter != null)
+            {
+                inset.RightInset = TopicListPresenter.ActualSize.X;
+            }
+        }
+
+        private void Banner_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            MasterDetail.BackgroundMargin = new Thickness(0, -e.NewSize.Height, 0, 0);
+        }
+
+        private void Stories_Expanding(object sender, EventArgs e)
+        {
+            if (_prevIndex != INDEX_CHATS)
+            {
+                SetPivotSelectedIndex(INDEX_CHATS);
+                ViewModel.RaisePropertyChanged(nameof(ViewModel.SelectedFolder));
+            }
+            else if (!_searchCollapsed)
+            {
+                Search_LostFocus(null, null);
+            }
+
+            HideTopicList();
+        }
+
+        private void ComposeButton_Click(object sender, RoutedEventArgs e)
+        {
+            if (ViewModel.ClientService.FreezeState.IsFrozen)
+            {
+                ViewModel.NavigationService.ShowPopup(new FrozenPopup(ViewModel.ClientService.FreezeState));
+            }
+            else
+            {
+                ViewModel.NavigationService.ShowPopup(new ContactsPopup
+                {
+                    Title = Strings.NewMessageTitle
+                });
+            }
+        }
+
+        private void ChatCell_StoryClick(object sender, Chat chat)
+        {
+            if (sender is ActiveStoriesSegments segments)
+            {
+                segments.Open(ViewModel.NavigationService, ViewModel.ClientService, chat, 48, story =>
+                {
+                    var container = ChatsList.ContainerFromItem(story.Chat) as SelectorItem;
+                    if (container != null)
+                    {
+                        var transform = container.TransformToVisual(null);
+                        var point = transform.TransformPoint(new Point());
+
+                        return new Rect(point.X + 4 + 8, point.Y + 4 + 8, 40, 40);
+                    }
+
+                    return Rect.Empty;
+                });
+            }
+        }
+
+        public Task UpdateLayoutAsync()
+        {
+            if (ChatsList.IsConnected)
+            {
+                if (ChatsList.ItemsPanelRoot != null)
+                {
+                    return ChatsList.ItemsPanelRoot.UpdateLayoutAsync();
+                }
+
+                return ChatsList.UpdateLayoutAsync();
+            }
+
+            return Task.CompletedTask;
+        }
+
+        #region Chat List
+
+        private void Chats_DragItemsStarting(object sender, DragItemsStartingEventArgs e)
+        {
+            try
+            {
+                if (e.Items[0] is Chat chat)
+                {
+                    var position = chat.GetPosition(ViewModel.Chats.Items.ChatList);
+                    if (position == null || !position.IsPinned || e.Items.Count > 1 || ChatsList.SelectionMode == ListViewSelectionMode.Multiple)
+                    {
+                        ChatsList.CanReorderItems = false;
+                        e.Cancel = true;
+                    }
+                    else
+                    {
+                        ChatsList.CanReorderItems = true;
+                    }
+                }
+            }
+            catch
+            {
+                ChatsList.CanReorderItems = false;
+                e.Cancel = true;
+            }
+        }
+
+        private void Chats_DragItemsCompleted(ListViewBase sender, DragItemsCompletedEventArgs args)
+        {
+            ChatsList.CanReorderItems = false;
+
+            var chatList = ViewModel.Chats.Items.ChatList;
+            if (chatList == null)
+            {
+                return;
+            }
+
+            if (args.DropResult == DataPackageOperation.Move && args.Items.Count == 1 && args.Items[0] is Chat chat)
+            {
+                var items = ViewModel.Chats.Items;
+                if (items.Count == 1)
+                {
+                    return;
+                }
+
+                var index = items.IndexOf(chat);
+                var compare = items[index > 0 ? index - 1 : index + 1];
+
+                var position = compare.GetPosition(items.ChatList);
+                if (position == null)
+                {
+                    return;
+                }
+
+                if (position.Source != null && index > 0)
+                {
+                    position = items[index + 1].GetPosition(items.ChatList);
+                }
+
+                if (position.IsPinned)
+                {
+                    var pinned = items.Where(x =>
+                    {
+                        var position = x.GetPosition(items.ChatList);
+                        if (position == null)
+                        {
+                            return false;
+                        }
+
+                        return position.IsPinned;
+                    }).Select(x => x.Id).ToArray();
+
+                    ViewModel.ClientService.Send(new SetPinnedChats(chatList, pinned));
+                }
+                else
+                {
+                    var real = chat.GetPosition(items.ChatList);
+                    if (real != null)
+                    {
+                        items.ApplyOrder(chat.Id, real.Order);
+                    }
+                }
+            }
+        }
+
+        private void ChatsList_Swiped(object sender, ChatListSwipedEventArgs e)
+        {
+            ScrollFolder(e.Direction == CarouselDirection.Next ? 1 : -1, true);
+        }
+
+        #endregion
+
+        private bool _testLeak;
+
+        [Conditional("DEBUG")]
+        public void LeakTest(bool enable)
+        {
+            if (!_testLeak)
+            {
+                if (enable)
+                {
+                    _testLeak = true;
+                }
+
+                return;
+            }
+
+            return;
+
+            _viewModel = null;
+            LayoutRoot.Children.Clear();
+
+            LayoutRoot = null;
+            State = null;
+            TitleBarrr = null;
+            ChatTabsLeft = null;
+            Photo = null;
+            MasterDetail = null;
+            Confetti = null;
+            Playback = null;
+            CallBanner = null;
+            Header = null;
+            Stories = null;
+            SettingsRoot = null;
+            SettingsView = null;
+            DialogsSearchPanel = null;
+            DialogsPanel = null;
+            ChatsPanel = null;
+            Downloads = null;
+            ManagePanel = null;
+            ButtonManage = null;
+            ManageCount = null;
+            ManageMute = null;
+            ManageMark = null;
+            ManageClear = null;
+            UpdateShadow = null;
+            UpdateCloud = null;
+            ChatListHeader = null;
+            ChatsList = null;
+            TopicListPresenter = null;
+            EmptyState = null;
+            ArchivedChatsPresenter = null;
+            ArchivedChatsPanel = null;
+            ArchivedChats = null;
+            SetBirthdateCard = null;
+            UnconfirmedCard = null;
+            ChatTabs = null;
+            ChatTabsView = null;
+            ChatFolders = null;
+            MainHeader = null;
+            SearchField = null;
+            BackButton = null;
+            ChatsOptions = null;
+            Proxy = null;
+            Lock = null;
+            ChatFoldersSide = null;
+            TitleBarHandle = null;
+            TitleBarLogo = null;
+            TitleText = null;
+            StateLabel = null;
+            MemoryLabel = null;
+            LogoBasic = null;
+            LogoEmoji = null;
+        }
+
+        private void Navigation_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            var index = Navigation.SelectedIndex;
+            if (index != -1)
+            {
+                SetPivotSelectedIndex(index);
+            }
+            else if (e.RemovedItems?.Count > 0)
+            {
+                Navigation.SelectedItem = e.RemovedItems[0];
+            }
+        }
+
+        private int _advanced;
+
+        private void Navigation_ItemClick(object sender, ItemClickEventArgs e)
+        {
+            if (Navigation.SelectedIndex == INDEX_CHATS && e.ClickedItem is MainNavigationItemChats)
+            {
+                var scrollViewer = ChatsList.GetScrollViewer();
+                if (scrollViewer != null && scrollViewer.VerticalOffset > 50)
+                {
+                    scrollViewer.TryChangeView(null, 0, null);
+                }
+                else if (ViewModel.Chats.Items.ChatList is ChatListArchive
+                    || ViewModel.Folders.Count > 0 && !ViewModel.Chats.Items.ChatList.AreTheSame(ViewModel.Folders[0].ChatList))
+                {
+                    UpdateFolder(ViewModel.Folders.Count > 0 ? ViewModel.Folders[0] : ChatFolderViewModel.Main);
+                }
+            }
+            else if (Navigation.SelectedIndex == INDEX_SETTINGS && e.ClickedItem is MainNavigationItemSettings)
+            {
+                _advanced++;
+
+                if (_advanced >= 10)
+                {
+                    _advanced = 0;
+                    MasterDetail.NavigationService.Navigate(typeof(DiagnosticsPage));
+                }
+            }
+        }
+
+        private void Settings_ContextRequested(UIElement sender, ContextRequestedEventArgs args)
+        {
+            var items = LifetimeService.Current.GetItems(out _);
+            var flyout = new MenuFlyout();
+
+            foreach (var session in items)
+            {
+                var template = Resources["SessionItemTemplate"] as DataTemplate;
+                var content = template.LoadContent() as Grid;
+                content.DataContext = session;
+
+                var user = session.ClientService.GetUser(session.UserId);
+                if (user == null)
+                {
+                    session.ClientService.Send(new GetUser(session.UserId));
+                    continue;
+                }
+
+                var title = content.FindName("TitleLabel") as TextBlock;
+                title.Text = user.FullName();
+
+                var photo = content.Children[0] as ProfilePicture;
+                photo.Source = ProfilePictureSource.User(session.ClientService, user);
+
+                var identity = content.FindName("Identity") as IdentityIcon;
+                var botVerified = content.FindName("BotVerified") as CustomEmojiIcon;
+
+                identity.SetStatus(session.ClientService, user, botVerified);
+
+                var item = new MenuFlyoutButton
+                {
+                    Content = content,
+                    CommandParameter = session,
+                    Command = new RelayCommand<ISession>(Root.Switch)
+                };
+
+                AutomationProperties.SetName(item, user.FullName());
+
+                if (session == ViewModel.Session)
+                {
+                    if (items.Count < Constants.MaxAccountCount)
+                    {
+                        flyout.CreateFlyoutItem(MenuItemAddAccount, Strings.AddAccount, Icons.AddCircle);
+                    }
+
+                    flyout.Items.Add(item);
+
+                    if (items.Count > 1)
+                    {
+                        flyout.CreateFlyoutSeparator();
+                    }
+                }
+                else
+                {
+                    flyout.Items.Add(item);
+                }
+            }
+
+            if (flyout.Items.Count > 1)
+            {
+                flyout.ShowAt(sender, FlyoutPlacementMode.Top);
+            }
+        }
+
+        private void MenuItemAddAccount()
+        {
+            var premium = 0;
+            var count = 0;
+
+            foreach (var session in LifetimeService.Current.Items)
+            {
+                if (session.Settings.UseTestDC)
+                {
+                    continue;
+                }
+
+                if (session.ClientService.Options.IsPremium)
+                {
+                    premium++;
+                }
+
+                count++;
+            }
+
+            var limit = 3;
+
+            if (count >= limit + premium)
+            {
+                ViewModel.NavigationService.ShowLimitReached(new PremiumLimitTypeConnectedAccounts());
+                return;
+            }
+
+            Root.Switch(LifetimeService.Current.Create());
+        }
+
+        private void ChatFolders_ItemClick(object sender, ItemClickEventArgs e)
+        {
+            if (e.ClickedItem == ViewModel.SelectedFolder)
+            {
+                var scrollViewer = ChatsList.GetScrollViewer();
+                scrollViewer?.TryChangeView(null, 0, null);
+            }
+        }
+    }
+
+    public class MainNavigationItem
+    {
+        public string Text { get; set; }
+
+        public override string ToString()
+        {
+            return Text;
+        }
+    }
+
+    public class MainNavigationItemChats : MainNavigationItem
+    {
+        public MainNavigationItemChats()
+        {
+            Text = Strings.FilterChats;
+        }
+    }
+
+    public class MainNavigationItemSettings : MainNavigationItem
+    {
+        public MainNavigationItemSettings()
+        {
+            Text = Strings.Settings;
+        }
+    }
+}

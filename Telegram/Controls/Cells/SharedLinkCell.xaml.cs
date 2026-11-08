@@ -1,0 +1,336 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using System;
+using System.Collections.Generic;
+using System.Text;
+using Telegram.Common;
+using Telegram.Navigation.Services;
+using Telegram.Td.Api;
+using Telegram.ViewModels;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Input;
+
+namespace Telegram.Controls.Cells
+{
+    public sealed partial class SharedLinkCell : Control
+    {
+        private MessageWithOwner _message;
+        private INavigationService _navigationService;
+
+        private string _instantViewLink;
+
+        public SharedLinkCell()
+        {
+            DefaultStyleKey = typeof(SharedLinkCell);
+        }
+
+        #region InitializeComponent
+
+        private HyperlinkButton Button;
+        private ProfilePicture Photo;
+        private TextBlock TitleLabel;
+        private TextBlock DescriptionLabel;
+        private TextBlock Description2Label;
+        private FormattedTextBlock LinksLabel;
+        private bool _templateApplied;
+
+        protected override void OnApplyTemplate()
+        {
+            Button = GetTemplateChild(nameof(Button)) as HyperlinkButton;
+            Photo = GetTemplateChild(nameof(Photo)) as ProfilePicture;
+            TitleLabel = GetTemplateChild(nameof(TitleLabel)) as TextBlock;
+            DescriptionLabel = GetTemplateChild(nameof(DescriptionLabel)) as TextBlock;
+            Description2Label = GetTemplateChild(nameof(Description2Label)) as TextBlock;
+            LinksLabel = GetTemplateChild(nameof(LinksLabel)) as FormattedTextBlock;
+
+            Button.Click += Thumbnail_Click;
+            LinksLabel.ContextRequested += OnContextRequested;
+            LinksLabel.TextEntityClick += OnTextEntityClick;
+
+            _templateApplied = true;
+
+            if (_message != null)
+            {
+                UpdateMessage(_navigationService, _message);
+            }
+        }
+
+        #endregion
+
+        public void UpdateMessage(INavigationService navigationService, MessageWithOwner message)
+        {
+            _navigationService = navigationService;
+            _message = message;
+
+            if (!_templateApplied)
+            {
+                return;
+            }
+
+            var links = new List<string>();
+
+            string title = null;
+            string description = null;
+            string description2 = null;
+            string webPageLink = null;
+            bool webPageCached = false;
+            Thumbnail webPageThumbnail = null;
+            Minithumbnail webPageMinithumbnail = null;
+
+            if (message.Content is MessageText { LinkPreview: LinkPreview linkPreview })
+            {
+
+                title = linkPreview.Title;
+                if (string.IsNullOrEmpty(title))
+                {
+                    title = linkPreview.SiteName;
+                }
+
+                description = string.IsNullOrEmpty(linkPreview.Description?.Text) ? null : linkPreview.Description?.Text;
+                webPageLink = linkPreview.Url;
+                webPageCached = linkPreview.InstantViewVersion != 0;
+                webPageThumbnail = linkPreview.GetThumbnail();
+                webPageMinithumbnail = linkPreview.GetMinithumbnail();
+            }
+            else if (message.Content is MessageRichMessage richMessage)
+            {
+                foreach (var link in PageBlockHelper.GetLinks(richMessage.Message.Blocks))
+                {
+                    links.Add(link.Url);
+                }
+
+                description = PageBlockHelper.GetPlainText(richMessage.Message.Blocks);
+            }
+
+            var caption = message.GetCaption();
+            if (caption?.Entities.Count > 0)
+            {
+                for (int a = 0; a < caption.Entities.Count; a++)
+                {
+                    var entity = caption.Entities[a];
+                    if (entity.Length <= 0 || entity.Offset < 0 || entity.Offset >= caption.Text.Length)
+                    {
+                        continue;
+                    }
+                    else if (entity.Offset + entity.Length > caption.Text.Length)
+                    {
+                        entity.Length = caption.Text.Length - entity.Offset;
+                    }
+
+                    if (a == 0 && webPageLink != null && !(entity.Offset == 0 && entity.Length == caption.Text.Length))
+                    {
+                        if (caption.Entities.Count == 1)
+                        {
+                            if (description == null)
+                            {
+                                description2 = caption.Text;
+                            }
+                        }
+                        else
+                        {
+                            description2 = caption.Text;
+                        }
+                    }
+
+                    try
+                    {
+                        string link = null;
+                        if (entity.Type is TextEntityTypeTextUrl or TextEntityTypeUrl)
+                        {
+                            if (entity.Type is TextEntityTypeUrl)
+                            {
+                                link = caption.Text.Substring(entity.Offset, entity.Length);
+                            }
+                            else if (entity.Type is TextEntityTypeTextUrl textUrl)
+                            {
+                                link = textUrl.Url;
+                            }
+                            if (title == null || title.Length == 0)
+                            {
+                                title = link;
+                                var url = link;
+                                if (url.StartsWith("http") == false)
+                                {
+                                    url = "http://" + url;
+                                }
+
+                                var uri = new Uri(url);
+                                title = uri.Host;
+                                title ??= link;
+                                int index;
+                                if (title != null && (index = title.LastIndexOf('.')) >= 0)
+                                {
+                                    title = title.Substring(0, index);
+                                    if ((index = title.LastIndexOf('.')) >= 0)
+                                    {
+                                        title = title.Substring(index + 1);
+                                    }
+                                    title = title.Substring(0, 1).ToUpper() + title.Substring(1);
+                                }
+                                if (entity.Offset != 0 || entity.Length != caption.Text.Length)
+                                {
+                                    description = caption.Text;
+                                }
+                            }
+                        }
+                        else if (entity.Type is TextEntityTypeEmailAddress)
+                        {
+                            if (title == null || title.Length == 0)
+                            {
+                                link = "mailto:" + caption.Text.Substring(entity.Offset, entity.Length);
+                                title = caption.Text.Substring(entity.Offset, entity.Length);
+                                if (entity.Offset != 0 || entity.Length != caption.Text.Length)
+                                {
+                                    description = caption.Text;
+                                }
+                            }
+                        }
+                        if (link != null)
+                        {
+                            if (link.ToLower().IndexOf("http") != 0 && link.ToLower().IndexOf("mailto") != 0)
+                            {
+                                links.Add("http://" + link);
+                            }
+                            else
+                            {
+                                links.Add(link);
+                            }
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        //FileLog.e(e);
+                    }
+                }
+            }
+
+            if (webPageLink != null && links.Count == 0)
+            {
+                links.Add(webPageLink);
+            }
+
+            //if (hasThumb)
+            //{
+            //    Thumbnail.Visibility = Visibility.Visible;
+            //}
+            //else
+            //{
+            //    Thumbnail.Visibility = Visibility.Collapsed;
+            //}
+
+            if (title != null)
+            {
+                TitleLabel.Text = title.Replace('\n', ' ');
+                TitleLabel.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                TitleLabel.Visibility = Visibility.Collapsed;
+            }
+
+            if (description != null)
+            {
+                DescriptionLabel.Text = description;
+                DescriptionLabel.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                DescriptionLabel.Visibility = Visibility.Collapsed;
+            }
+
+            if (description2 != null)
+            {
+                Description2Label.Text = description2;
+                Description2Label.Visibility = Visibility.Visible;
+
+                if (description != null)
+                {
+                    Description2Label.Margin = new Thickness(0, 8, 0, 0);
+                }
+                else
+                {
+                    Description2Label.Margin = new Thickness(0);
+                }
+            }
+            else
+            {
+                Description2Label.Visibility = Visibility.Collapsed;
+            }
+
+            Photo.Source = null;
+
+            if (webPageThumbnail != null)
+            {
+                Photo.Source = new ProfilePictureSourcePhoto(message.ClientService, message.Id, webPageThumbnail.File, webPageMinithumbnail);
+            }
+
+            if (webPageLink != null && webPageCached)
+            {
+                _instantViewLink = webPageLink;
+            }
+
+            var builder = new StringBuilder();
+            var entities = new List<TextEntity>();
+
+            for (int i = 0; i < links.Count; i++)
+            {
+                var link = links[i];
+                if (MessageHelper.TryCreateUri(link, out Uri uri))
+                {
+                    Photo.Source ??= ProfilePictureSourceText.GetNameForChat(uri.Host, uri.GetHashCode());
+
+                    if (builder.Length > 0)
+                    {
+                        builder.Append('\n');
+                    }
+
+                    if (link == webPageLink && webPageCached)
+                    {
+                        entities.Add(new TextEntity(builder.Length, link.Length, new TextEntityTypeCached()));
+                    }
+
+                    entities.Add(new TextEntity(builder.Length, link.Length, new TextEntityTypeTextUrl(link)));
+                    builder.Append(link);
+                }
+            }
+
+            LinksLabel.SetText(message.ClientService, builder.ToString(), entities.ToVector());
+        }
+
+        private void OnContextRequested(UIElement sender, ContextRequestedEventArgs args)
+        {
+            MessageHelper.Hyperlink_ContextRequested(_navigationService, null, sender, args, null);
+        }
+
+        private void OnTextEntityClick(object sender, TextEntityClickEventArgs e)
+        {
+            if (e.Type is not TextEntityTypeTextUrl textUrl)
+            {
+                return;
+            }
+
+            if (textUrl.Url == _instantViewLink)
+            {
+                _navigationService.NavigateToInstant(textUrl.Url);
+            }
+            else
+            {
+                MessageHelper.OpenUrl(_message.ClientService, _navigationService, textUrl.Url);
+            }
+        }
+
+        private void Thumbnail_Click(object sender, RoutedEventArgs e)
+        {
+            if (_message?.Content is MessageText text && text.LinkPreview != null)
+            {
+                MessageHelper.OpenUrl(_message.ClientService, _navigationService, text.LinkPreview.Url);
+            }
+        }
+    }
+}

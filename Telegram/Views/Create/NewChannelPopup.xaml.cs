@@ -1,0 +1,94 @@
+//
+// Copyright (c) Fela Ameghino 2015-2026
+//
+// Distributed under the GNU General Public License v3.0. (See accompanying
+// file LICENSE or copy at https://www.gnu.org/licenses/gpl-3.0.txt)
+//
+
+using Telegram.Common;
+using Telegram.Controls;
+using Telegram.Controls.Drawers;
+using Telegram.Controls.Media;
+using Telegram.ViewModels.Create;
+using Telegram.ViewModels.Drawers;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls.Primitives;
+using Windows.UI.Xaml.Media.Imaging;
+
+namespace Telegram.Views.Create
+{
+    public sealed partial class NewChannelPopup : ModalPopup
+    {
+        public NewChannelViewModel ViewModel => DataContext as NewChannelViewModel;
+
+        public NewChannelPopup()
+        {
+            InitializeComponent();
+
+            PrimaryButtonText = Strings.OK;
+            SecondaryButtonText = Strings.Cancel;
+        }
+
+        public override void OnNavigatedTo(object parameter)
+        {
+            EmojiPanel.DataContext = EmojiDrawerViewModel.Create(ViewModel.Session, EmojiDrawerMode.Text);
+        }
+
+        private void Title_Loaded(object sender, RoutedEventArgs e)
+        {
+            TitleLabel.Focus(FocusState.Keyboard);
+        }
+
+        #region Binding
+
+        private ProfilePictureSource ConvertPhoto(string title, BitmapImage preview)
+        {
+            if (preview != null)
+            {
+                return new ProfilePictureSourceBitmap(preview);
+            }
+            else if (string.IsNullOrWhiteSpace(title))
+            {
+                return ProfilePictureSourceText.GetGlyph(Icons.CameraAddFilled);
+            }
+
+            return ProfilePictureSourceText.GetNameForChat(title);
+        }
+
+        #endregion
+
+        private void Emoji_Click(object sender, RoutedEventArgs e)
+        {
+            // We don't want to unfocus the text are when the context menu gets opened
+            EmojiPanel.ViewModel.Update();
+            EmojiFlyout.ShowAt(TitleLabel, FlyoutPlacementMode.Top, FlyoutShowMode.Transient, source: EmojiButton);
+        }
+
+        private void Emoji_ItemClick(object sender, EmojiDrawerItemClickEventArgs e)
+        {
+            if (e.ClickedItem is EmojiData emoji)
+            {
+                EmojiFlyout.Hide();
+
+                var text = TitleLabel.Text;
+                var index = TitleLabel.SelectionStart;
+
+                if (TitleLabel.SelectionLength > 0)
+                {
+                    text = text.Remove(TitleLabel.SelectionStart, TitleLabel.SelectionLength);
+                }
+
+                text = text.Insert(index, emoji.Value);
+
+                TitleLabel.Text = text;
+                TitleLabel.Focus(FocusState.Programmatic);
+                TitleLabel.SelectionStart = index;
+            }
+        }
+
+        private void OnPrimaryButtonClick(ModalPopup sender, ModalPopupButtonClickEventArgs args)
+        {
+            ViewModel.Create();
+        }
+    }
+}

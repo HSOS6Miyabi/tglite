@@ -1,0 +1,76 @@
+﻿<controls:UserControlEx x:Class="Telegram.Controls.Stories.StoriesStrip"
+                        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+                        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+                        xmlns:cells="using:Telegram.Controls.Cells"
+                        xmlns:controls="using:Telegram.Controls"
+                        xmlns:stories="using:Telegram.Controls.Stories"
+                        xmlns:viewModels="using:Telegram.ViewModels.Stories"
+                        mc:Ignorable="d"
+                        d:DesignHeight="300"
+                        d:DesignWidth="400">
+
+    <Grid>
+        <ListView x:Name="ScrollingHost"
+                  AutomationProperties.Name="{CustomResource LocalStoriesCache}"
+                  ItemsSource="{x:Bind ViewModel.Items}"
+                  ChoosingItemContainer="OnChoosingItemContainer"
+                  ContainerContentChanging="OnContainerContentChanging"
+                  ScrollViewer.VerticalScrollBarVisibility="Disabled"
+                  ScrollViewer.VerticalScrollMode="Disabled"
+                  ScrollViewer.HorizontalScrollBarVisibility="Hidden"
+                  ScrollViewer.HorizontalScrollMode="Auto"
+                  SizeChanged="OnSizeChanged"
+                  SelectionMode="None"
+                  IsItemClickEnabled="True"
+                  ItemClick="ScrollingHost_ItemClick"
+                  Padding="12,0,0,4">
+            <ListView.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <ItemsStackPanel Orientation="Horizontal" />
+                </ItemsPanelTemplate>
+            </ListView.ItemsPanel>
+            <ListView.ItemTemplate>
+                <DataTemplate x:DataType="viewModels:ActiveStoriesViewModel">
+                    <cells:ActiveStoriesCell Trigger="{x:Bind Item, Mode=OneWay}" />
+                </DataTemplate>
+            </ListView.ItemTemplate>
+            <ListView.ItemContainerStyle>
+                <Style TargetType="ListViewItem"
+                       BasedOn="{StaticResource DefaultListViewItemStyle}">
+                    <Setter Property="MinWidth"
+                            Value="0" />
+                </Style>
+            </ListView.ItemContainerStyle>
+            <ListView.ItemContainerTransitions>
+                <TransitionCollection />
+            </ListView.ItemContainerTransitions>
+        </ListView>
+
+        <stories:StoriesStack x:Name="Stack" />
+
+        <HyperlinkButton x:Name="Show"
+                         AutomationProperties.Name="{CustomResource LocalStoriesCache}"
+                         AutomationProperties.HelpText="{CustomResource AccDescrExpandPanel}"
+                         ToolTipService.ToolTip="{CustomResource LocalStoriesCache}"
+                         Click="Show_Click"
+                         IsTabStop="False"
+                         Height="32"
+                         Margin="10,20,0,0"
+                         CornerRadius="16"
+                         VerticalAlignment="Top"
+                         HorizontalAlignment="Left" />
+
+        <HyperlinkButton x:Name="Icon"
+                         AutomationProperties.Name="{CustomResource SetEmojiStatus}"
+                         ToolTipService.ToolTip="{CustomResource SetEmojiStatus}"
+                         Click="Icon_Click"
+                         Width="32"
+                         Height="32"
+                         Margin="10,20,0,0"
+                         VerticalAlignment="Top"
+                         HorizontalAlignment="Left"
+                         Style="{StaticResource EmptyHyperlinkButtonStyle}" />
+    </Grid>
+</controls:UserControlEx>
