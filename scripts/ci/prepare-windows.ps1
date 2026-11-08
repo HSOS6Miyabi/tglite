@@ -57,7 +57,7 @@ if ($certificate.NotBefore -gt (Get-Date) -or $certificate.NotAfter -le (Get-Dat
     throw 'Signing certificate is not currently valid.'
 }
 
-$ekuOids = @($certificate.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId.Value })
+$ekuOids = @($certificate.EnhancedKeyUsageList | ForEach-Object { $_.Value })
 if ($ekuOids.Count -gt 0 -and $ekuOids -notcontains '1.3.6.1.5.5.7.3.3' -and $ekuOids -notcontains '2.5.29.37.0') {
     throw 'Signing certificate is not permitted for code signing.'
 }
