@@ -83,12 +83,12 @@ jobs:
             $pub = Join-Path $env:RUNNER_TEMP 'tglite-root.cer'
             Export-Certificate -Cert $root -FilePath $pub -Type CERT -Force | Out-Null
             Write-Host 'Installing the private root CA through certutil without user interaction.'
-            & certutil.exe -user -f -addstore Root $pub
+            & certutil.exe -f -addstore Root $pub
             if ($LASTEXITCODE -ne 0) { throw 'Could not install the supplied private CA certificate.' }
             Write-Host "Trusted root CA: $($root.Subject)"
             $leafPublic = Join-Path $env:RUNNER_TEMP 'tglite-leaf.cer'
             Export-Certificate -Cert $cert -FilePath $leafPublic -Type CERT -Force | Out-Null
-            & certutil.exe -user -f -addstore TrustedPeople $leafPublic
+            & certutil.exe -f -addstore TrustedPeople $leafPublic
             if ($LASTEXITCODE -ne 0) { throw 'Could not install the public signing certificate.' }
             Write-Host 'Added signing certificate to Trusted People.'
             $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
