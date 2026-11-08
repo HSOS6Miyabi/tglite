@@ -55,3 +55,9 @@ Windows 工作流程使用官方 Telegram 测试服务器创建临时测试账�
 编译成功后，工作流程还检查签名、安装包版本、安装注册以及进程启动。只有这些检查全部通过才发布 Release。Release 中的 `TEST-RESULTS.json` 区分自动化测试和仍需人工操作的功能。
 
 首次正式使用时，应另行检查用户界面、个人账号登录、两步验证、群组与频道的真实消息收发、图片和视频、语音和视频通话，以及广告和 Premium 相关界面。
+
+## Windows 原生依赖
+
+`scripts/ci/configure-vcpkg-sources.ps1` 为 GitHub 公开源码归档增加 `codeload.github.com` 下载地址。文件仍由 vcpkg 按项目指定的 SHA-512 校验值进行完整性检查。改动只应用于 GitHub Actions 的临时运行环境，不会修改仓库使用的 vcpkg 版本。
+
+GitHub Actions 缓存已下载的源码归档，以及成功构建的 TDLib 与 vcpkg 依赖。引入上游变更时，应同时检查 `vcpkg.json`、`Libraries/tdjson/build.ps1` 和归档下载脚本。Windows 构建脚本的语法检查见 `.github/workflows/windows-script-check.yml`。
