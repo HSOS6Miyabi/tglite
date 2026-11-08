@@ -50,6 +50,20 @@ const cases = [
     assert.ok(s.includes("if (gift.Gift.IsPremium)"));
     assert.ok(s.includes("new GetAvailableGifts("));
   }],
+  ["Message editor date selector is available", () => {
+    const s=get("Telegram/Controls/FormattedTextBox.cs");
+    const popup=get("Telegram/Views/Popups/ChooseDateTimePopup.xaml.cs");
+    assert.ok(s.includes("ChooseDateTimePopup.ChooseDateUrlAsync(XamlRoot)"));
+    assert.ok(popup.includes("public static async Task<string> ChooseDateUrlAsync(XamlRoot xamlRoot)"));
+  }],
+  ["Chat previews use defined icon glyphs", () => {
+    const s=get("Telegram/Controls/Cells/ChatCell.xaml.cs");
+    const icons=get("Telegram/Controls/Media/Icons.cs");
+    for(const name of ["ArrowForward24","ArrowReply24"]) {
+      assert.ok(s.includes("Icons." + name + " + Icons.Space"));
+      assert.ok(icons.includes("const string " + name + " ="));
+    }
+  }],
   ["Standard sign-in remains configured", () => {
     const s=get("Telegram/Services/ClientService.cs");
     assert.match(s,/apiId:\s*Constants.ApiId/);

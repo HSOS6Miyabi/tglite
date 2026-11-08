@@ -23,6 +23,8 @@ string[] csFiles =
     "Telegram/Common/MessageHelper.cs",
     "Telegram/ViewModels/DialogViewModel.Messages.cs",
     "Telegram/Views/Premium/Popups/GiftPopup.xaml.cs",
+    "Telegram/Controls/FormattedTextBox.cs",
+    "Telegram/Controls/Cells/ChatCell.xaml.cs",
 ];
 string[] xamlFiles =
 [

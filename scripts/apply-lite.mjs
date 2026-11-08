@@ -122,6 +122,13 @@ function patchFile(file,source) {
  case "Telegram/Views/Premium/Popups/GiftPopup.xaml.cs":
    result=extraPatch(file,result);
    break;
+ case "Telegram/Controls/FormattedTextBox.cs":
+   result=replaceOnce(result,"ChooseDateTimeToast.ChooseDateUrlAsync(XamlRoot)","ChooseDateTimePopup.ChooseDateUrlAsync(XamlRoot)","date link editor");
+   break;
+ case "Telegram/Controls/Cells/ChatCell.xaml.cs":
+   result=replaceOnce(result,"Icons.ArrowForwardFilled14 + Icons.Space","Icons.ArrowForward24 + Icons.Space","forward preview");
+   result=replaceOnce(result,"Icons.ArrowStoryFilled14 + Icons.Space","Icons.ArrowReply24 + Icons.Space","story reply preview");
+   break;
  default:throw Error("Unexpected source file "+file);
  }
  if(result===source)throw Error("No changes for "+file);
@@ -203,7 +210,9 @@ const files = [
   "Telegram/Controls/Chats/ChatAccountInfoHeader.xaml.cs",
   "Telegram/Common/MessageHelper.cs",
   "Telegram/ViewModels/DialogViewModel.Messages.cs",
-  "Telegram/Views/Premium/Popups/GiftPopup.xaml.cs"
+  "Telegram/Views/Premium/Popups/GiftPopup.xaml.cs",
+  "Telegram/Controls/FormattedTextBox.cs",
+  "Telegram/Controls/Cells/ChatCell.xaml.cs"
 ];
 const root = path.resolve(process.argv[2] ?? ".");
 for (const file of files) {

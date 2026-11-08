@@ -22,6 +22,7 @@
 | Premium 展示 | 移除推广入口、赠送会员界面及相关提示 | `Telegram/Common/TLNavigationService.cs`、`Telegram/Controls/ToastPopup.cs`、`Telegram/Views/SettingsPage.xaml` |
 | 个人资料 | 保留常规资料功能并关闭会员购买推广 | `Telegram/ViewModels/ProfileViewModel.cs`、`Telegram/Controls/Chats/ChatAccountInfoHeader.xaml.cs` |
 | 礼物 | 保留 Stars 礼物，去除 Premium 购买入口 | `Telegram/Views/Premium/Popups/GiftPopup.xaml.cs` |
+| 消息编辑与聊天摘要 | 使用已有的日期选择窗口，并显示消息转发与回复标识 | `Telegram/Controls/FormattedTextBox.cs`、`Telegram/Controls/Cells/ChatCell.xaml.cs` |
 | 安装包 | 使用专属安装包名称以及用户提供的 PFX 证书 | `Telegram/Telegram.WinUI.csproj`、`Build.WinUI.ps1` |
 | 自动检查 | 检查修改结果、编译语法、签名证书与安装包身份、Windows 安装包签名 | `scripts/verify-lite.mjs`、`scripts/SyntaxCheck/`、`scripts/ci/preflight-windows.ps1`、`.github/workflows/windows-release.yml` |
 

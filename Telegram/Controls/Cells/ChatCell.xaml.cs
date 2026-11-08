@@ -1668,11 +1668,11 @@ namespace Telegram.Controls.Cells
                 // TODO: this is better than nothing, although it's not the best 
                 if (topMessage.ForwardInfo != null && !topMessage.IsSaved(_clientService.Options.MyId))
                 {
-                    return FormattedText.Concat(Icons.ArrowForwardFilled14 + Icons.Space, text);
+                    return FormattedText.Concat(Icons.ArrowForward24 + Icons.Space, text);
                 }
                 else if (topMessage.ReplyTo is MessageReplyToStory)
                 {
-                    return FormattedText.Concat(Icons.ArrowStoryFilled14 + Icons.Space, text);
+                    return FormattedText.Concat(Icons.ArrowReply24 + Icons.Space, text);
                 }
 
                 return text;
