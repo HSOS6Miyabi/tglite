@@ -40,16 +40,19 @@ $started = @(Get-Process -Name 'Telegram' -ErrorAction SilentlyContinue |
 if ($started.Count -eq 0) { throw 'TGLite process did not remain running after launch.' }
 Write-Host 'PASS Windows packaged application launch'
 
+$testDcResult = if ($env:TGLITE_TEST_DC_STATUS -eq 'success') { 'passed' } else { 'failed' }
 $result = [ordered]@{
     automated = [ordered]@{
         source_validation = 'passed'
         csharp_and_xaml_syntax = 'passed'
-        tdlib_test_dc_authorization = 'passed'
-        tdlib_test_dc_saved_messages = 'passed'
+        tdlib_native_interface = 'passed'
+        tdlib_test_dc_authorization = $testDcResult
+        tdlib_test_dc_saved_messages = $testDcResult
         signed_msixbundle = 'passed'
         windows_installation = 'passed'
         windows_launch = 'passed'
     }
+    test_dc_note = if ($testDcResult -eq 'passed') { 'Login and Saved Messages confirmed on test DC' } else { 'Test DC login and message checks did not pass; refer to the workflow log' }
     requires_manual_testing = @(
         'Windows interface navigation and appearance',
         'Production Telegram account login and two-factor authentication',
@@ -62,7 +65,10 @@ $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $release
 
 $metadataPath = Join-Path $release 'BUILD-INFO.json'
 $metadata = Get-Content $metadataPath -Raw | ConvertFrom-Json
-$metadata.checks = @($metadata.checks) + @('TDLib test DC authorization and Saved Messages', 'Windows package installation and launch')
+$metadata.checks = @($metadata.checks) + @('TDLib native JSON interface', 'Windows package installation and launch')
+if ($testDcResult -eq 'passed') {
+    $metadata.checks = @($metadata.checks) + @('Telegram test DC authorization and Saved Messages')
+}
 $metadata | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath $metadataPath -Encoding utf8
 
 $hashes = @(Get-ChildItem -LiteralPath $release -File |

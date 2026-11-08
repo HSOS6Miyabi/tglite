@@ -27,10 +27,15 @@ internal static class Program
     private static object Request(string type, string extra)
         => new Dictionary<string, object> { ["@type"] = type, ["@extra"] = extra };
 
-    public static int Main()
+    public static int Main(string[] args)
     {
         try
         {
+            if (args.Contains("--native-only", StringComparer.Ordinal))
+            {
+                VerifyNativeLibrary();
+                return 0;
+            }
             Run();
             return 0;
         }
@@ -39,6 +44,21 @@ internal static class Program
             Console.Error.WriteLine("FAIL TDLib integration: " + ex.GetType().Name + ": " + ex.Message);
             return 1;
         }
+    }
+
+    private static void VerifyNativeLibrary()
+    {
+        var ptr = Native.td_execute("{\"@type\":\"setLogVerbosityLevel\",\"new_verbosity_level\":0}");
+        if (ptr == 0)
+            throw new InvalidOperationException("TDLib synchronous call returned no response");
+        var json = Marshal.PtrToStringUTF8(ptr)
+            ?? throw new InvalidOperationException("TDLib synchronous call returned an empty response");
+        using var result = JsonDocument.Parse(json);
+        if (TypeOf(result.RootElement) != "ok")
+            throw new InvalidOperationException("TDLib synchronous JSON response is invalid");
+        if (Native.td_create_client_id() <= 0)
+            throw new InvalidOperationException("TDLib client creation failed");
+        Console.WriteLine("PASS Windows TDLib library load, synchronous JSON API and client creation");
     }
 
     private static void Run()

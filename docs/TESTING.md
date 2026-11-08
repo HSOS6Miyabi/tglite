@@ -2,7 +2,7 @@
 
 ## GitHub Actions 自动测试
 
-工作流程文件为 `.github/workflows/windows-release.yml`。使用 Windows Server 2025、Visual Studio 2026、.NET 10 和项目指定的依赖版本。只有测试成功才创建预发布版本。
+工作流程文件为 `.github/workflows/windows-release.yml`。使用 Windows Server 2025、Visual Studio 2026、.NET 10 和项目指定的依赖版本。只有 Windows 构建、签名、安装和启动等必需检查通过，才创建预发布版本。测试服务器登录的实际结果单独记录。
 
 自动测试覆盖以下内容：
 
@@ -10,12 +10,13 @@
 2. 检查 JavaScript 构建脚本、修改过的 C# 文件和 XAML 文件，并编译 TDLib 集成测试程序。
 3. 从 GitHub Actions Secrets 读取 `API_ID`、`API_HASH` 和 `PFX`，检查证书有效期、代码签名用途、安装包 Publisher 以及私钥是否可用。
 4. 构建 Windows x64 的 TDLib，调用其 JSON 接口检查本机动态库是否可以加载、版本信息是否可读取。
-5. 在 Telegram 官方测试服务器创建临时测试账号，完成验证码验证，调用 `getMe`，向测试账号的 Saved Messages 发送一条测试消息并从历史记录中读取。测试账号采用 Telegram 保留的 `99966XYYYY` 号码，使用测试数据中心提供的固定验证码。
-6. 编译 Windows x64 MSIXBundle，检查数字签名、签名证书指纹、安装包版本和安装包身份。
-7. 在 GitHub Actions Windows 运行环境中安装 MSIXBundle、注册应用并尝试启动 `Telegram.exe`，检查进程是否保持运行。
-8. 计算发布文件的 SHA-256，保存 `BUILD-INFO.json`、`TEST-RESULTS.json` 和 `SHA256SUMS.txt`，然后发布 GitHub Release。
+5. 验证 TDLib 本机动态库、同步 JSON 接口和客户端创建。
+6. 尝试使用 Telegram 测试服务器上的保留号码登录，并检查 `getMe`、Saved Messages 消息发送与历史记录读取。测试服务器可能拒绝临时号码；此项独立记录真实结果，失败时仍继续验证 Windows 安装包。
+7. 编译 Windows x64 MSIXBundle，检查数字签名、签名证书指纹、安装包版本和安装包身份。
+8. 在 GitHub Actions Windows 运行环境中安装 MSIXBundle、注册应用并尝试启动 `Telegram.exe`，检查进程是否保持运行。
+9. 计算发布文件的 SHA-256，保存 `BUILD-INFO.json`、`TEST-RESULTS.json` 和 `SHA256SUMS.txt`，然后发布 GitHub Release。
 
-测试服务器上的账号及消息仅用于开发测试，不保存个人账号的登录验证码、聊天记录或会话信息。编译使用的 PFX 私钥和 Telegram API 凭据只存在于 Actions 的运行环境中。
+测试服务器上的账号及消息仅用于开发测试，不保存个人账号的登录验证码、聊天记录或会话信息。若自动测试账户被服务器拒绝，`TEST-RESULTS.json` 将记录测试未通过，实际登录能力仍需验证。编译使用的 PFX 私钥和 Telegram API 凭据只存在于 Actions 的运行环境中。
 
 ## Windows 人工功能测试
 

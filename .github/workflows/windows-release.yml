@@ -151,7 +151,15 @@ jobs:
             vcpkg_installed/x64-windows
           key: tglite-native-windows-x64-${{ hashFiles('vcpkg.json', 'Libraries/tdjson/build.ps1', 'scripts/upstream-ref.txt') }}
 
+      - name: Verify TDLib native library and JSON API
+        shell: pwsh
+        run: |
+          $env:PATH = "$(Resolve-Path Libraries/tdjson/x64-windows);$env:PATH"
+          dotnet run --no-build --project scripts/TdlibSmoke/TdlibSmoke.csproj --configuration Release -- --native-only
+
       - name: Exercise Telegram test DC authorization and Saved Messages
+        id: testdc
+        continue-on-error: true
         shell: pwsh
         run: |
           $env:PATH = "$(Resolve-Path Libraries/tdjson/x64-windows);$env:PATH"
@@ -167,6 +175,8 @@ jobs:
 
       - name: Install and launch packaged application on Windows
         shell: pwsh
+        env:
+          TGLITE_TEST_DC_STATUS: ${{ steps.testdc.outcome }}
         run: .\scripts\ci\test-install.ps1
 
       - uses: actions/upload-artifact@v4
