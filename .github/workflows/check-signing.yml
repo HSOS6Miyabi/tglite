@@ -82,11 +82,19 @@ jobs:
             }
             $pub = Join-Path $env:RUNNER_TEMP 'tglite-root.cer'
             Export-Certificate -Cert $root -FilePath $pub -Type CERT -Force | Out-Null
-            Import-Certificate -FilePath $pub -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+            Write-Host 'Adding the private root CA to the current-user trust store.'
+            $trustedRoot = [Security.Cryptography.X509Certificates.X509Store]::new(
+              [Security.Cryptography.X509Certificates.StoreName]::Root,
+              [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+            $trustedRoot.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            try { $trustedRoot.Add($root) } finally { $trustedRoot.Close() }
             Write-Host "Trusted root CA: $($root.Subject)"
-            $leafPublic = Join-Path $env:RUNNER_TEMP 'tglite-leaf.cer'
-            Export-Certificate -Cert $cert -FilePath $leafPublic -Type CERT -Force | Out-Null
-            Import-Certificate -FilePath $leafPublic -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
+            $trustedPeople = [Security.Cryptography.X509Certificates.X509Store]::new(
+              [Security.Cryptography.X509Certificates.StoreName]::TrustedPeople,
+              [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser)
+            $trustedPeople.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+            try { $trustedPeople.Add($cert) } finally { $trustedPeople.Close() }
+            Write-Host 'Added signing certificate to Trusted People.'
             $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
             $tool = @(Get-ChildItem -LiteralPath $sdkBin -Filter signtool.exe -Recurse -File |
               Where-Object { $_.DirectoryName -match '[\\/]x64$' } | Sort-Object FullName -Descending)[0].FullName
