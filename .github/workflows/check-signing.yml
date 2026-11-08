@@ -68,15 +68,14 @@ jobs:
               }
             }
             if ((Get-Date) -lt $cert.NotBefore -or (Get-Date) -gt $cert.NotAfter) { throw 'Certificate expired or not yet valid.' }
-            $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
-            $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
-            $chain.ChainPolicy.DisableCertificateDownloads = $true
-            $null = $chain.Build($cert)
-            $root = @($chain.ChainElements | ForEach-Object { $_.Certificate } |
-              Where-Object { $_.Subject -ceq $_.Issuer }) | Select-Object -First 1
+            $collection = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+            $collection.Import($bytes, $env:TG_PFX_PASSWORD, [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet)
+            Write-Host "Certificate objects embedded in PFX: $($collection.Count)"
+            $root = @($collection | Where-Object { $_.Subject -ceq $_.Issuer }) | Select-Object -First 1
             if ($null -eq $root) {
-              throw 'The certificate chain does not contain the self-signed root CA certificate.'
+              throw 'The PFX does not contain its root CA public certificate. Export the issuing CA certificate and add it to the signing configuration.'
             }
+            Write-Host "Root CA found in the supplied PFX: $($root.Subject)"
             $rootUsage = $root.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.19' } | Select-Object -First 1
             if ($null -eq $rootUsage -or -not ([Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($rootUsage, $rootUsage.Critical)).CertificateAuthority) {
               throw 'The root certificate is not a certificate authority.'
