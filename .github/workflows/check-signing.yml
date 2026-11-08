@@ -1,0 +1,84 @@
+name: Verify TGLite signing certificate
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/check-signing.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signing:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      TG_PFX_B64: ${{ secrets.PFX }}
+      TG_PFX_PASSWORD: ${{ secrets.PFX_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build Windows test executable
+        shell: pwsh
+        run: dotnet build scripts/TdlibSmoke/TdlibSmoke.csproj --configuration Release --nologo
+      - name: Verify the PFX can actually sign Windows code
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          if ([string]::IsNullOrWhiteSpace($env:TG_PFX_B64)) { throw 'GitHub Actions PFX secret is missing.' }
+          $path = Join-Path $env:RUNNER_TEMP 'tglite-check.pfx'
+          try {
+            $bytes = [Convert]::FromBase64String(($env:TG_PFX_B64 -replace '\s', ''))
+            [IO.File]::WriteAllBytes($path, $bytes)
+            $password = New-Object System.Security.SecureString
+            if (-not [string]::IsNullOrEmpty($env:TG_PFX_PASSWORD)) {
+              $password = ConvertTo-SecureString -String $env:TG_PFX_PASSWORD -AsPlainText -Force
+            }
+            $installed = @(Import-PfxCertificate -FilePath $path -CertStoreLocation 'Cert:\CurrentUser\My' -Password $password -ErrorAction Stop)
+            $cert = $installed | Where-Object HasPrivateKey | Select-Object -First 1
+            if ($null -eq $cert) { throw 'PFX does not contain a usable private key.' }
+            Write-Host "Subject: $($cert.Subject)"
+            Write-Host "Issuer: $($cert.Issuer)"
+            Write-Host "Key algorithm: $($cert.PublicKey.Oid.FriendlyName)"
+            Write-Host "Certificate valid until: $($cert.NotAfter.ToString('yyyy-MM-dd'))"
+            $keyUsage = $cert.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.15' } | Select-Object -First 1
+            if ($null -ne $keyUsage) {
+              $usage = [Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new($keyUsage, $keyUsage.Critical)
+              Write-Host "Key usage: $($usage.KeyUsages)"
+              if (($usage.KeyUsages -band [Security.Cryptography.X509Certificates.X509KeyUsageFlags]::DigitalSignature) -eq 0) {
+                throw 'Certificate Key Usage does not allow Digital Signature.'
+              }
+            }
+            $eku = $cert.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.37' } | Select-Object -First 1
+            if ($null -ne $eku) {
+              $usageValues = @([Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($eku, $eku.Critical).EnhancedKeyUsages | ForEach-Object { $_.Value })
+              Write-Host "Extended key usages: $($usageValues -join ', ')"
+              if ($usageValues -notcontains '1.3.6.1.5.5.7.3.3' -and $usageValues -notcontains '2.5.29.37.0') {
+                throw 'Certificate Extended Key Usage excludes Code Signing.'
+              }
+            }
+            if ((Get-Date) -lt $cert.NotBefore -or (Get-Date) -gt $cert.NotAfter) { throw 'Certificate expired or not yet valid.' }
+            if ($cert.Subject -ceq $cert.Issuer) {
+              $pub = Join-Path $env:RUNNER_TEMP 'tglite-root.cer'
+              Export-Certificate -Cert $cert -FilePath $pub -Type CERT -Force | Out-Null
+              Import-Certificate -FilePath $pub -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+              Import-Certificate -FilePath $pub -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
+            }
+            $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+            $tool = @(Get-ChildItem -LiteralPath $sdkBin -Filter signtool.exe -Recurse -File |
+              Where-Object { $_.DirectoryName -match '[\\/]x64$' } | Sort-Object FullName -Descending)[0].FullName
+            $exe = @(Get-ChildItem 'scripts/TdlibSmoke/bin/Release' -Filter TdlibSmoke.exe -File -Recurse)[0].FullName
+            & $tool sign /v /debug /fd SHA256 /sha1 $cert.Thumbprint /s My $exe
+            if ($LASTEXITCODE -ne 0) { throw 'Windows SignTool failed to sign a test executable with PFX.' }
+            & $tool verify /pa /v $exe
+            if ($LASTEXITCODE -ne 0) { throw 'Windows SignTool could not verify the signed executable.' }
+            Write-Host 'PASS self-signed PFX can sign and verify a Windows executable.'
+          }
+          finally {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+          }
