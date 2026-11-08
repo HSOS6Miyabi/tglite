@@ -38,17 +38,17 @@ const cases = [
     assert.doesNotMatch(s,/ShowActionAsync\(navigationService.XamlRoot, markdown, action, ToastPopupIcon.Premium\)/);
   }],
   ["Direct Premium purchase presentations are inactive", () => {
-    assert.doesNotMatch(get("Telegram/ViewModels/ProfileViewModel.cs"), /NavigationService.ShowPopup\\(new PromoPopup/);
-    assert.doesNotMatch(get("Telegram/Controls/Chats/ChatAccountInfoHeader.xaml.cs"), /ViewModel.NavigationService.ShowPopup\\(new PromoPopup/);
-    assert.doesNotMatch(get("Telegram/Common/MessageHelper.cs"), /navigation.ShowPopup\\(new PromoPopup/);
-    assert.doesNotMatch(get("Telegram/ViewModels/DialogViewModel.Messages.cs"), /ShowPopup\\(new Views.Premium.Popups.PromoPopup/);
+    assert.ok(!get("Telegram/ViewModels/ProfileViewModel.cs").includes("NavigationService.ShowPopup(new PromoPopup"));
+    assert.ok(!get("Telegram/Controls/Chats/ChatAccountInfoHeader.xaml.cs").includes("ViewModel.NavigationService.ShowPopup(new PromoPopup"));
+    assert.ok(!get("Telegram/Common/MessageHelper.cs").includes("navigation.ShowPopup(new PromoPopup"));
+    assert.ok(!get("Telegram/ViewModels/DialogViewModel.Messages.cs").includes("ShowPopup(new Views.Premium.Popups.PromoPopup"));
   }],
   ["Gift browser keeps Stars items and omits Premium purchases", () => {
     const s=get("Telegram/Views/Premium/Popups/GiftPopup.xaml.cs");
-    assert.doesNotMatch(s,/GetPremiumGiftPaymentOptions\\s*\\(/);
-    assert.doesNotMatch(s,/ShowPopupAsync\\(new Views.Premium.Popups.PromoPopup/);
-    assert.match(s,/if \\(gift.Gift.IsPremium\\)/);
-    assert.match(s,/GetAvailableGifts\\s*\\(/);
+    assert.ok(!s.includes("new GetPremiumGiftPaymentOptions("));
+    assert.ok(!s.includes("ShowPopupAsync(new Views.Premium.Popups.PromoPopup"));
+    assert.ok(s.includes("if (gift.Gift.IsPremium)"));
+    assert.ok(s.includes("new GetAvailableGifts("));
   }],
   ["Standard sign-in remains configured", () => {
     const s=get("Telegram/Services/ClientService.cs");

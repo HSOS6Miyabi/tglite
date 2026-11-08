@@ -210,6 +210,6 @@ for (const file of files) {
   const filename = path.join(root, file);
   const original = fs.readFileSync(filename, "utf8");
   const changed = patchFile(file, original);
-  fs.writeFileSync(filename, changed.replace(/^[ \\t]+$/gm, ""), "utf8");
+  fs.writeFileSync(filename, changed.replace(/^[ \t]+$/gm, ""), "utf8");
   process.stdout.write("Updated " + file + "\n");
 }
