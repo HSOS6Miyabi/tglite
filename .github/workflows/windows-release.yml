@@ -76,6 +76,13 @@ jobs:
         shell: pwsh
         run: .\scripts\ci\preflight-windows.ps1
 
+      - name: Restore vcpkg downloaded archives
+        uses: actions/cache/restore@v4
+        id: downloads-cache
+        with:
+          path: C:\vcpkg\downloads
+          key: tglite-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
       - name: Restore native dependencies
         id: native-cache
         uses: actions/cache/restore@v4
@@ -98,8 +105,30 @@ jobs:
         if: steps.native-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           Push-Location Libraries/tdjson
-          try { .\build.ps1 -arch x64 -target windows } finally { Pop-Location }
+          try {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                .\build.ps1 -arch x64 -target windows
+                break
+              }
+              catch {
+                if ($attempt -eq 3) { throw }
+                Write-Warning "TDLib dependency preparation was interrupted. Retrying attempt $($attempt + 1) of 3."
+                Start-Sleep -Seconds (15 * $attempt)
+              }
+            }
+          }
+          finally { Pop-Location }
+
+      - name: Store downloaded archives
+        if: always() && steps.downloads-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:\vcpkg\downloads
+          key: tglite-vcpkg-downloads-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
 
       - name: Store native dependencies
         if: steps.native-cache.outputs.cache-hit != 'true'
@@ -111,6 +140,16 @@ jobs:
             vcpkg_installed/x64-windows
           key: tglite-native-windows-x64-${{ hashFiles('vcpkg.json', 'Libraries/tdjson/build.ps1', 'scripts/upstream-ref.txt') }}
 
+      - name: Compile TDLib integration tester
+        shell: pwsh
+        run: dotnet build scripts/TdlibSmoke/TdlibSmoke.csproj --configuration Release --nologo
+
+      - name: Exercise Telegram test DC authorization and Saved Messages
+        shell: pwsh
+        run: |
+          $env:PATH = "$(Resolve-Path Libraries/tdjson/x64-windows);$env:PATH"
+          dotnet run --no-build --project scripts/TdlibSmoke/TdlibSmoke.csproj --configuration Release
+
       - name: Build signed MSIXBundle
         shell: pwsh
         run: .\Build.WinUI.ps1 -Platform x64 -Configuration Release -Identity Bundle
@@ -118,6 +157,10 @@ jobs:
       - name: Verify and prepare Release assets
         shell: pwsh
         run: .\scripts\ci\verify-windows-package.ps1
+
+      - name: Install and launch packaged application on Windows
+        shell: pwsh
+        run: .\scripts\ci\test-install.ps1
 
       - uses: actions/upload-artifact@v4
         with:
