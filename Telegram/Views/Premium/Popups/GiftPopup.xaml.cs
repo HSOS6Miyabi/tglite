@@ -77,15 +77,15 @@ namespace Telegram.Views.Premium.Popups
             clientService.TryGetChatFromUser(user.Id, out _chat);
 
             Photo.Source = ProfilePictureSource.User(clientService, user);
+            PremiumOptions.Visibility = Visibility.Collapsed;
+            PremiumTitle.Visibility = Visibility.Collapsed;
+            PremiumInfo.Visibility = Visibility.Collapsed;
 
             if (user.Id != clientService.Options.MyId)
             {
-                TextBlockHelper.SetMarkdown(PremiumInfo, string.Format(Strings.Gift2PremiumInfo, user.FirstName));
-
                 StarsTitle.Text = Strings.Gift2Stars;
                 TextBlockHelper.SetMarkdown(StarsInfo, string.Format(Strings.Gift2StarsInfo, user.FirstName));
 
-                AddLink(PremiumInfo, Strings.Gift2PremiumInfoLink, PremiumInfoLink_Click);
                 AddLink(StarsInfo, Strings.Gift2StarsInfoLink, StarsInfoLink_Click);
 
                 InitializeOptions(clientService);
@@ -116,6 +116,7 @@ namespace Telegram.Views.Premium.Popups
             _chat = chat;
 
             Photo.Source = ProfilePictureSource.Chat(clientService, chat);
+            PremiumOptions.Visibility = Visibility.Collapsed;
 
             PremiumTitle.Visibility = Visibility.Collapsed;
             PremiumInfo.Visibility = Visibility.Collapsed;
@@ -152,22 +153,9 @@ namespace Telegram.Views.Premium.Popups
             // TODO: stars promo
         }
 
-        private async void InitializeOptions(IClientService clientService)
+        private void InitializeOptions(IClientService clientService)
         {
-            PremiumOptions.ItemsSource = new[]
-            {
-                new PremiumGiftPaymentOption(string.Empty, 0, 0, 0, 0, string.Empty, null),
-                new PremiumGiftPaymentOption(string.Empty, 0, 0, 0, 0, string.Empty, null),
-                new PremiumGiftPaymentOption(string.Empty, 0, 0, 0, 0, string.Empty, null),
-            };
-
-            var response = await clientService.SendAsync(new GetPremiumGiftPaymentOptions());
-            if (response is PremiumGiftPaymentOptions options)
-            {
-                PremiumOptions.ItemsSource = options.Options
-                    .OrderBy(x => x.MonthCount)
-                    .ToList();
-            }
+            PremiumOptions.Visibility = Visibility.Collapsed;
         }
 
         private async void InitializeGifts(IClientService clientService, bool birthday, bool self)
@@ -182,6 +170,10 @@ namespace Telegram.Views.Premium.Popups
 
                 foreach (var gift in gifts.Gifts)
                 {
+                    if (gift.Gift.IsPremium)
+                    {
+                        continue;
+                    }
                     if (gift.Gift.IsForBirthday && birthday)
                     {
                         all.Add(gift);
@@ -325,7 +317,7 @@ namespace Telegram.Views.Premium.Popups
                 }
                 else if (availableGift.Gift.IsPremium && !_clientService.IsPremium)
                 {
-                    await _navigationService.ShowPopupAsync(new Views.Premium.Popups.PromoPopup(_clientService, availableGift));
+                    confirm = ContentDialogResult.None;
                     confirm = ContentDialogResult.None;
                 }
                 else if (availableGift.Gift.OverallLimits == null || availableGift.Gift.OverallLimits.RemainingCount > 0)

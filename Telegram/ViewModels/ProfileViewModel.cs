@@ -1250,45 +1250,8 @@ namespace Telegram.ViewModels
             }
         }
 
-        public async void ShowPromo()
+        public void ShowPromo()
         {
-            bool CanShowPromo()
-            {
-                if (ClientService.TryGetUser(Chat, out User user) && user.IsPremium && user.VerificationStatus?.IsScam is not true && user.VerificationStatus?.IsFake is not true)
-                {
-                    return user.IsPremium || Chat.EmojiStatus != null;
-                }
-                else if (ClientService.TryGetSupergroup(Chat, out Supergroup supergroup) && supergroup.VerificationStatus?.IsScam is not true && supergroup.VerificationStatus?.IsFake is not true)
-                {
-                    return Chat.EmojiStatus != null;
-                }
-
-                return false;
-            }
-
-            if (CanShowPromo())
-            {
-                if (Chat?.EmojiStatus?.Type is EmojiStatusTypeCustomEmoji emojiStatusTypeCustomEmoji)
-                {
-                    var response = await ClientService.SendAsync(new GetCustomEmojiStickers(new[] { emojiStatusTypeCustomEmoji.CustomEmojiId }));
-                    if (response is Stickers stickers)
-                    {
-                        var second = await ClientService.SendAsync(new GetStickerSet(stickers.StickersValue[0].SetId));
-                        if (second is StickerSet stickerSet)
-                        {
-                            NavigationService.ShowPopup(new PromoPopup(ClientService, Chat, stickerSet), new PremiumSourceFeature(new PremiumFeatureEmojiStatus()));
-                        }
-                    }
-                }
-                else if (Chat?.EmojiStatus?.Type is EmojiStatusTypeUpgradedGift emojiStatusTypeUpgradedGift)
-                {
-                    MessageHelper.NavigateToUpgradedGift(ClientService, NavigationService, emojiStatusTypeUpgradedGift.GiftName);
-                }
-                else
-                {
-                    NavigationService.ShowPopup(new PromoPopup(ClientService, Chat, null), new PremiumSourceFeature(new PremiumFeatureEmojiStatus()));
-                }
-            }
         }
 
         public void OpenChat()

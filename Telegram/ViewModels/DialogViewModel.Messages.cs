@@ -2587,10 +2587,6 @@ namespace Telegram.ViewModels
 
                 ShowPopup(new Views.Stars.Popups.ReceiptPopup(ClientService, NavigationService, transaction));
             }
-            else if (message.Content is MessageGiftedPremium giftedPremium)
-            {
-                ShowPopup(new Views.Premium.Popups.PromoPopup(ClientService, giftedPremium));
-            }
             else if (message.Content is MessageTonConnectRequest tonConnectRequest)
             {
                 // Only while it is still answerable. A request another device has answered, or one

@@ -110,14 +110,78 @@ function patchFile(file,source) {
    break;
  case "Telegram/ViewModels/ProfileViewModel.cs":
    result=replaceMethod(result,"public void GiftPremium()",`public void GiftPremium()\n        {\n        }`);
+   result=replaceMethod(result,"public async void ShowPromo()",`public void ShowPromo()\n        {\n        }`);
    break;
  case "Telegram/Controls/IdentityIcon.cs":
    result=replaceOnce(result,"var premium = user.IsPremium && clientService.IsPremiumAvailable && (!chatList || user.Id != clientService.Options.MyId);","var premium = false;","identity premium status");
+   break;
+
+ case "Telegram/Controls/Chats/ChatAccountInfoHeader.xaml.cs":
+ case "Telegram/Common/MessageHelper.cs":
+ case "Telegram/ViewModels/DialogViewModel.Messages.cs":
+ case "Telegram/Views/Premium/Popups/GiftPopup.xaml.cs":
+   result=extraPatch(file,result);
    break;
  default:throw Error("Unexpected source file "+file);
  }
  if(result===source)throw Error("No changes for "+file);
  return result;
+}
+
+
+function extraPatch(file, source) {
+function once(s,oldText,newText,label="span") {
+ const at=s.indexOf(oldText);
+ if(at<0||s.indexOf(oldText,at+oldText.length)>=0)throw Error("Expected one "+label);
+ return s.slice(0,at)+newText+s.slice(at+oldText.length);
+}
+function method(s,sig,replacement) {
+ const at=s.indexOf(sig);
+ if(at<0||s.indexOf(sig,at+sig.length)>=0)throw Error("Unique method not found "+sig);
+ const open=s.indexOf("{",at+sig.length);
+ const rx=/\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|@?"(?:""|\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{}]/g;
+ rx.lastIndex=open;
+ let n=0,m,end=-1;
+ while((m=rx.exec(s))!==null){if(m[0]==="{")n++;if(m[0]==="}"){if(--n===0){end=rx.lastIndex;break}}}
+ if(end<0)throw Error("Unbalanced braces in "+sig);
+ return s.slice(0,at)+replacement+s.slice(end);
+}
+function extra(p,s) {
+ let r=s;
+ switch(p){
+ case "Telegram/Controls/Chats/ChatAccountInfoHeader.xaml.cs":{
+   r=once(r,"if ((chat?.ActionBar == null && user?.EmojiStatus == null) || (fullInfo == null || fullInfo.IncomingPaidMessageStarCount == 0))","if (fullInfo == null || fullInfo.IncomingPaidMessageStarCount == 0)","chat info visibility");
+   const a=r.indexOf("            if (chat.ActionBar != null && user.EmojiStatus != null)\n");
+   const b=r.indexOf("            if (fullInfo.IncomingPaidMessageStarCount > 0)",a);
+   if(a<0||b<a)throw Error("Chat info premium panel missing");
+   r=r.slice(0,a)+"            PremiumUserRoot.Visibility = Visibility.Collapsed;\n\n"+r.slice(b);
+   r=method(r,"private async void Premium_Click(Hyperlink sender, HyperlinkClickEventArgs args)",`private void Premium_Click(Hyperlink sender, HyperlinkClickEventArgs args)\n        {\n        }`);
+   break;
+ }
+ case "Telegram/ViewModels/ProfileViewModel.cs":
+   r=method(r,"public async void ShowPromo()",`public void ShowPromo()\n        {\n        }`);
+   break;
+ case "Telegram/Common/MessageHelper.cs":
+   r=method(r,"private static async void NavigateToPremiumGiftCode(IClientService clientService, INavigationService navigation, string code, OpenUrlSource source)",`private static void NavigateToPremiumGiftCode(IClientService clientService, INavigationService navigation, string code, OpenUrlSource source)\n        {\n        }`);
+   break;
+ case "Telegram/ViewModels/DialogViewModel.Messages.cs":
+   r=once(r,`            else if (message.Content is MessageGiftedPremium giftedPremium)\n            {\n                ShowPopup(new Views.Premium.Popups.PromoPopup(ClientService, giftedPremium));\n            }\n`,"","gift message presentation");
+   break;
+ case "Telegram/Views/Premium/Popups/GiftPopup.xaml.cs":
+   r=once(r,`            Photo.Source = ProfilePictureSource.User(clientService, user);`,`            Photo.Source = ProfilePictureSource.User(clientService, user);\n            PremiumOptions.Visibility = Visibility.Collapsed;\n            PremiumTitle.Visibility = Visibility.Collapsed;\n            PremiumInfo.Visibility = Visibility.Collapsed;`,"gift options visibility for user");
+   r=once(r,`            Photo.Source = ProfilePictureSource.Chat(clientService, chat);`,`            Photo.Source = ProfilePictureSource.Chat(clientService, chat);\n            PremiumOptions.Visibility = Visibility.Collapsed;`,"gift options visibility for chat");
+   r=once(r,`                TextBlockHelper.SetMarkdown(PremiumInfo, string.Format(Strings.Gift2PremiumInfo, user.FirstName));\n\n`,"","gift intro");
+   r=once(r,`                AddLink(PremiumInfo, Strings.Gift2PremiumInfoLink, PremiumInfoLink_Click);\n`,"","gift info link");
+   r=method(r,"private async void InitializeOptions(IClientService clientService)",`private void InitializeOptions(IClientService clientService)\n        {\n            PremiumOptions.Visibility = Visibility.Collapsed;\n        }`);
+   r=once(r,`                foreach (var gift in gifts.Gifts)\n                {\n`,`                foreach (var gift in gifts.Gifts)\n                {\n                    if (gift.Gift.IsPremium)\n                    {\n                        continue;\n                    }\n`,"gift filtering");
+   r=once(r,`                    await _navigationService.ShowPopupAsync(new Views.Premium.Popups.PromoPopup(_clientService, availableGift));`,`                    confirm = ContentDialogResult.None;`,"gift advertisement");
+   break;
+ default: throw Error("Unexpected file "+p);
+ }
+ if(r===s)throw Error("No changes for "+p);
+ return r.replace(/^[ \t]+$/gm,"");
+}
+ return extra(file, source);
 }
 
 const files = [
@@ -135,13 +199,17 @@ const files = [
   "Telegram/Controls/ProfileHeader.xaml.cs",
   "Telegram/Views/ChatView.xaml.cs",
   "Telegram/ViewModels/ProfileViewModel.cs",
-  "Telegram/Controls/IdentityIcon.cs"
+  "Telegram/Controls/IdentityIcon.cs",
+  "Telegram/Controls/Chats/ChatAccountInfoHeader.xaml.cs",
+  "Telegram/Common/MessageHelper.cs",
+  "Telegram/ViewModels/DialogViewModel.Messages.cs",
+  "Telegram/Views/Premium/Popups/GiftPopup.xaml.cs"
 ];
 const root = path.resolve(process.argv[2] ?? ".");
 for (const file of files) {
   const filename = path.join(root, file);
   const original = fs.readFileSync(filename, "utf8");
   const changed = patchFile(file, original);
-  fs.writeFileSync(filename, changed, "utf8");
+  fs.writeFileSync(filename, changed.replace(/^[ \\t]+$/gm, ""), "utf8");
   process.stdout.write("Updated " + file + "\n");
 }

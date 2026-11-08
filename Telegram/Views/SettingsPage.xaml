@@ -348,8 +348,6 @@
                                Margin="12,2"
                                Height="1" />
 
-                    
-
                     <controls:SettingsButton Click="Stars_Click"
                                              Badge="{x:Bind ViewModel.OwnedStarCount, Mode=OneWay}"
                                              Content="{CustomResource MenuTelegramStars}"
@@ -369,9 +367,6 @@
                         </controls:SettingsButton.IconSource>
                     </controls:SettingsButton>
 
-                    
-
-                    
                 </StackPanel>
                 <Rectangle Fill="{ThemeResource NavigationViewItemSeparatorForeground}"
                            Margin="12,2"

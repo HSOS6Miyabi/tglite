@@ -1457,24 +1457,8 @@ namespace Telegram.Common
             }
         }
 
-        private static async void NavigateToPremiumGiftCode(IClientService clientService, INavigationService navigation, string code, OpenUrlSource source)
+        private static void NavigateToPremiumGiftCode(IClientService clientService, INavigationService navigation, string code, OpenUrlSource source)
         {
-            var response = await clientService.SendAsync(new CheckPremiumGiftCode(code));
-            if (response is PremiumGiftCodeInfo info)
-            {
-                if (source is OpenUrlSourceChat sourceChat)
-                {
-                    navigation.ShowPopup(new PromoPopup(clientService, sourceChat.SenderId ?? new MessageSenderChat(sourceChat.ChatId), info, code));
-                }
-                else
-                {
-                    navigation.ShowPopup(new PromoPopup(clientService, null, info, code));
-                }
-            }
-            else
-            {
-                // TODO: error
-            }
         }
 
         private static async void NavigateToAttachmentMenuBot(IClientService clientService, INavigationService navigation, InternalLinkTypeAttachmentMenuBot attachmentMenuBot, OpenUrlSource source)

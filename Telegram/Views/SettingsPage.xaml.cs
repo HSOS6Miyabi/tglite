@@ -205,8 +205,6 @@ namespace Telegram.Views
             }
         }
 
-        
-
         private void Stars_Click(object sender, RoutedEventArgs e)
         {
             ViewModel.NavigationService.Navigate(typeof(StarsPage));

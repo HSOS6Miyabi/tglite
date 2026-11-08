@@ -50,7 +50,7 @@ namespace Telegram.Controls.Chats
         {
             _clientService = clientService;
 
-            if ((chat?.ActionBar == null && user?.EmojiStatus == null) || (fullInfo == null || fullInfo.IncomingPaidMessageStarCount == 0))
+            if (fullInfo == null || fullInfo.IncomingPaidMessageStarCount == 0)
             {
                 ShowHide(false);
                 return;
@@ -58,77 +58,7 @@ namespace Telegram.Controls.Chats
 
             ShowHide(true);
 
-            if (chat.ActionBar != null && user.EmojiStatus != null)
-            {
-                PremiumUserRoot.Visibility = Visibility.Visible;
-                PremiumUserText.Inlines.Clear();
-
-                var markdown = ClientEx.ParseMarkdown(string.Format(Strings.ReportSpamUserEmojiStatusHint2, "__1__"));
-                if (markdown.Entities.Count == 2)
-                {
-                    var e1 = markdown.Entities[0];
-                    var e2 = markdown.Entities[1];
-
-                    if (e1.Offset > 0)
-                    {
-                        PremiumUserText.Inlines.Add(markdown.Text.Substring(0, e1.Offset));
-                    }
-
-                    if (e1.Type is TextEntityTypeItalic)
-                    {
-                        var player = new CustomEmojiIcon();
-                        player.Width = 20;
-                        player.Height = 20;
-                        player.FrameSize = new Size(20, 20);
-                        player.Source = new CustomEmojiFileSource(clientService, user.EmojiStatus.Type);
-                        player.HorizontalAlignment = HorizontalAlignment.Left;
-                        player.FlowDirection = FlowDirection.LeftToRight;
-                        player.IsHitTestVisible = false;
-                        player.Margin = new Thickness(0, -2, 0, -6);
-
-                        //if (style != null)
-                        //{
-                        //    // "InfoCustomEmojiStyle"
-                        //    player.Style = BootStrapper.Current.Resources[style] as Style;
-                        //}
-
-                        //var baseline = parent.FontSize == 11 ? -3 : 0;
-
-                        var inline = new InlineUIContainer();
-                        inline.Child = player;
-
-                        // If the Span starts with a InlineUIContainer the RichTextBlock bugs and shows ellipsis
-                        if (PremiumUserText.Inlines.Empty())
-                        {
-                            PremiumUserText.Inlines.Add(Icons.ZWNJ);
-                        }
-
-                        PremiumUserText.Inlines.Add(inline);
-                        PremiumUserText.Inlines.Add(Icons.ZWNJ);
-                    }
-
-                    PremiumUserText.Inlines.Add(markdown.Text.Substring(e1.Offset + e1.Length, e2.Offset - (e1.Offset + e1.Length)));
-
-                    if (e2.Type is TextEntityTypeBold)
-                    {
-                        var hyperlink = new Hyperlink();
-                        hyperlink.Click += Premium_Click;
-                        hyperlink.UnderlineStyle = UnderlineStyle.None;
-                        hyperlink.Inlines.Add(markdown.Text.Substring(e2.Offset, e2.Length));
-
-                        PremiumUserText.Inlines.Add(hyperlink);
-                    }
-
-                    if (e2.Offset + e2.Length < markdown.Text.Length)
-                    {
-                        PremiumUserText.Inlines.Add(markdown.Text.Substring(e2.Offset + e2.Length));
-                    }
-                }
-            }
-            else
-            {
-                PremiumUserRoot.Visibility = Visibility.Collapsed;
-            }
+            PremiumUserRoot.Visibility = Visibility.Collapsed;
 
             if (fullInfo.IncomingPaidMessageStarCount > 0)
             {
@@ -168,30 +98,8 @@ namespace Telegram.Controls.Chats
             }
         }
 
-        private async void Premium_Click(Hyperlink sender, HyperlinkClickEventArgs args)
+        private void Premium_Click(Hyperlink sender, HyperlinkClickEventArgs args)
         {
-            if (ViewModel.Chat?.EmojiStatus?.Type is EmojiStatusTypeCustomEmoji emojiStatusTypeCustomEmoji)
-            {
-                var response = await ViewModel.ClientService.SendAsync(new GetCustomEmojiStickers(new[] { emojiStatusTypeCustomEmoji.CustomEmojiId }));
-                if (response is Stickers stickers)
-                {
-                    var second = await ViewModel.ClientService.SendAsync(new GetStickerSet(stickers.StickersValue[0].SetId));
-                    if (second is StickerSet stickerSet)
-                    {
-                        ViewModel.NavigationService.ShowPopup(new PromoPopup(ViewModel.ClientService, ViewModel.Chat, stickerSet), new PremiumSourceFeature(new PremiumFeatureEmojiStatus()));
-                        return;
-                    }
-                }
-            }
-            else if (ViewModel.Chat?.EmojiStatus?.Type is EmojiStatusTypeUpgradedGift emojiStatusTypeUpgradedGift)
-            {
-
-            }
-
-            if (ViewModel.ClientService.TryGetUser(ViewModel.Chat, out User user) && user.IsPremium)
-            {
-                ViewModel.NavigationService.ShowPopup(new PromoPopup(ViewModel.ClientService, ViewModel.Chat, null), new PremiumSourceFeature(new PremiumFeatureEmojiStatus()));
-            }
         }
 
         private async void RemoveFee_Click(Hyperlink sender, HyperlinkClickEventArgs args)
