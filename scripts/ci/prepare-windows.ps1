@@ -57,9 +57,13 @@ if ($certificate.NotBefore -gt (Get-Date) -or $certificate.NotAfter -le (Get-Dat
     throw 'Signing certificate is not currently valid.'
 }
 
-$ekuOids = @($certificate.EnhancedKeyUsageList | ForEach-Object { $_.Value })
-if ($ekuOids.Count -gt 0 -and $ekuOids -notcontains '1.3.6.1.5.5.7.3.3' -and $ekuOids -notcontains '2.5.29.37.0') {
-    throw 'Signing certificate is not permitted for code signing.'
+$ekuExtension = $certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.37' } | Select-Object -First 1
+if ($null -ne $ekuExtension) {
+    $usageExtension = [System.Security.Cryptography.X509Certificates.X509EnhancedKeyUsageExtension]::new($ekuExtension, $ekuExtension.Critical)
+    $usageOids = @($usageExtension.EnhancedKeyUsages | ForEach-Object { $_.Value })
+    if ($usageOids.Count -gt 0 -and $usageOids -notcontains '1.3.6.1.5.5.7.3.3' -and $usageOids -notcontains '2.5.29.37.0') {
+        throw 'Signing certificate is not permitted for code signing.'
+    }
 }
 
 $subject = $certificate.Subject.Replace("`r", '').Replace("`n", '')
