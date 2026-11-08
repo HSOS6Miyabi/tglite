@@ -72,6 +72,15 @@ jobs:
         shell: pwsh
         run: .\scripts\ci\prepare-windows.ps1
 
+      - name: Install TDLib code-generation tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install gperf --version=3.1 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to install GNU gperf.' }
+          gperf --version
+          if ($LASTEXITCODE -ne 0) { throw 'GNU gperf is unavailable.' }
+
       - name: Build TDLib (Windows x64)
         shell: pwsh
         run: |
