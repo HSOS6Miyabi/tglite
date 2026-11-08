@@ -181,11 +181,11 @@ jobs:
         shell: pwsh
         run: .\scripts\ci\prepare-wallet-engine.ps1
 
-      - name: Build signed MSIXBundle
+      - name: Build MSIXBundle for signing
         shell: pwsh
         run: .\Build.WinUI.ps1 -Platform x64 -Configuration Release -Identity Bundle
 
-      - name: Verify and prepare Release assets
+      - name: Sign and verify MSIXBundle and prepare Release files
         shell: pwsh
         run: .\scripts\ci\verify-windows-package.ps1
 

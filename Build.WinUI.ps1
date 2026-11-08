@@ -84,7 +84,7 @@ if ($env:TGLITE_CERT_THUMBPRINT) {
 
     $common += @(
         '-p:PackageCertificateKeyFile=',
-        "-p:PackageCertificateThumbprint=$env:TGLITE_CERT_THUMBPRINT",
+        '-p:PackageCertificateThumbprint=',
         '-p:WinUIPackageIdentity=HSOS6Miyabi.TGLite',
         '-p:WinUIPackageDisplayName=TGLite',
         "-p:WinUIPackageVersion=$env:TGLITE_PACKAGE_VERSION"
@@ -394,7 +394,7 @@ Invoke-MSBuild -Description "Telegram.WinUI ($Configuration|$Platform, $Identity
       '-p:AppxBundle=Always',
       "-p:AppxBundlePlatforms=$Platform",
       '-p:UapAppxPackageBuildMode=SideloadOnly',
-      '-p:AppxPackageSigningEnabled=true',
+      '-p:AppxPackageSigningEnabled=false',
       "-p:AppxPackageDir=$packages\",
       '-nodeReuse:false') + $common)
 
@@ -422,4 +422,4 @@ if ($Configuration -ne 'Debug') {
 
 Write-Host ''
 Write-Host ("{0}  ({1:N0} bytes)" -f $bundle.FullName, $bundle.Length) -ForegroundColor Green
-Write-Host 'Install with Add-AppDevPackage.ps1 beside the bundle, which also trusts the test certificate.'
+Write-Host 'The unsigned bundle is ready for SignTool signing and signature verification.'

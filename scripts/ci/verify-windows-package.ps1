@@ -27,13 +27,19 @@ if (-not (Test-Path -LiteralPath $rootCer)) { throw 'The public root CA certific
 Import-Certificate -FilePath $rootCer -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
 Import-Certificate -FilePath $cer -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
 
+if (-not $env:TGLITE_CERT_THUMBPRINT) { throw 'Signing certificate thumbprint is missing.' }
+if (-not (Get-ChildItem 'Cert:\CurrentUser\My' | Where-Object {
+    $_.Thumbprint -eq $env:TGLITE_CERT_THUMBPRINT -and $_.HasPrivateKey
+})) { throw 'The signing certificate private key is unavailable.' }
+
+& $signTool sign /v /fd SHA256 /sha1 $env:TGLITE_CERT_THUMBPRINT /s My $asset
+if ($LASTEXITCODE -ne 0) {
+    throw 'Windows SDK SignTool could not sign the MSIXBundle.'
+}
+
 & $signTool verify /pa /v $asset
 if ($LASTEXITCODE -ne 0) { throw 'The MSIXBundle digital signature failed verification.' }
 
-$signature = Get-AuthenticodeSignature -LiteralPath $asset
-if (-not $signature.SignerCertificate -or $signature.SignerCertificate.Thumbprint -ne $env:TGLITE_CERT_THUMBPRINT) {
-    throw 'The package signature uses a different certificate than PFX.'
-}
 
 $metadata = [ordered]@{
     project = 'TGLite'

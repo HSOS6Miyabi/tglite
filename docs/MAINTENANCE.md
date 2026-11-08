@@ -78,3 +78,7 @@ Windows x64 构建使用 [i582/wallet-engine](https://github.com/i582/wallet-eng
 `scripts/ci/prepare-windows.ps1` 从 `PFX` 中提取公开的根证书，将其安装到 Windows 的受信任根证书颁发机构存储区，并将应用签名证书添加到受信任的人存储区。`scripts/ci/verify-code-signing.ps1` 在编译原生依赖前实际签名和验证 Windows 测试程序。
 
 发布文件包含 `TGLite-Signing-Certificate.cer` 和 `TGLite-Root-CA.cer`。这两个文件仅包含公钥。私钥仍由仓库的 `PFX` Secret 保存。使用者需要确认私有签发机构由本人管理，再决定是否信任根证书。
+
+## Windows 安装包制作
+
+Windows 构建先使用 MSBuild 生成未签名的 MSIXBundle，再由 `scripts/ci/verify-windows-package.ps1` 使用 Windows SDK SignTool 和仓库 `PFX` 对安装包签名。脚本在签名成功后立即验证安装包的数字签名，随后执行 Windows 安装和启动检查。只有这些检查成功才发布安装包。
