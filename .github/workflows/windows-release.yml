@@ -10,6 +10,7 @@ on:
       - 'Libraries/**'
       - '.github/workflows/windows-release.yml'
       - 'scripts/ci/**'
+      - 'scripts/TdlibSmoke/**'
   workflow_dispatch:
 
 permissions:
@@ -17,7 +18,7 @@ permissions:
 
 concurrency:
   group: tglite-windows-release
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -67,6 +68,10 @@ jobs:
       - name: Check C# and XAML
         shell: pwsh
         run: dotnet run --project scripts/SyntaxCheck/SyntaxCheck.csproj --configuration Release -- .
+
+      - name: Compile TDLib integration tester
+        shell: pwsh
+        run: dotnet build scripts/TdlibSmoke/TdlibSmoke.csproj --configuration Release --nologo
 
       - name: Prepare Telegram credentials and signing certificate
         shell: pwsh
@@ -139,10 +144,6 @@ jobs:
             Libraries/tdjson/x64-windows
             vcpkg_installed/x64-windows
           key: tglite-native-windows-x64-${{ hashFiles('vcpkg.json', 'Libraries/tdjson/build.ps1', 'scripts/upstream-ref.txt') }}
-
-      - name: Compile TDLib integration tester
-        shell: pwsh
-        run: dotnet build scripts/TdlibSmoke/TdlibSmoke.csproj --configuration Release --nologo
 
       - name: Exercise Telegram test DC authorization and Saved Messages
         shell: pwsh

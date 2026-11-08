@@ -93,7 +93,7 @@ internal static class Program
         var start = DateTime.UtcNow;
         var deadline = start.AddSeconds(165);
 
-        while (DateTime.UtcNow < deadline && !(versionOk && authReady && getMe && createChat && sent && received))
+        while (DateTime.UtcNow < deadline && !(versionOk && authReady && getMe && createChat && sent && sentConfirmed && received))
         {
             var ptr = Native.td_receive(1.0);
             if (ptr == 0) continue;
@@ -265,11 +265,11 @@ internal static class Program
             }
         }
         Send(Request("close", "close"));
-        if (!versionOk || !authReady || !getMe || !createChat || !sent || !received)
+        if (!versionOk || !authReady || !getMe || !createChat || !sent || !sentConfirmed || !received)
         {
             throw new TimeoutException("Test DC integration incomplete: version=" + versionOk +
                 ", login=" + authReady + ", account=" + getMe + ", chat=" + createChat +
-                ", send=" + sent + ", history=" + received);
+                ", send=" + sent + ", delivered=" + sentConfirmed + ", history=" + received);
         }
         Console.WriteLine("PASS test DC Saved Messages send and history read");
         Console.WriteLine("PASS all TDLib integration checks");
