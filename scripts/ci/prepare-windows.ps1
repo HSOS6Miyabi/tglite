@@ -75,6 +75,37 @@ $releasePath = Join-Path $PWD 'release'
 New-Item -ItemType Directory -Force -Path $releasePath | Out-Null
 Export-Certificate -Cert $certificate -FilePath (Join-Path $releasePath 'TGLite-Signing-Certificate.cer') -Type CERT -Force | Out-Null
 
+$certificateCollection = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
+$certificateCollection.Import(
+    $bytes,
+    $env:TG_PFX_PASSWORD,
+    [Security.Cryptography.X509Certificates.X509KeyStorageFlags]::DefaultKeySet
+)
+$rootCertificate = @($certificateCollection | Where-Object { $_.Subject -ceq $_.Issuer }) | Select-Object -First 1
+if ($null -eq $rootCertificate) {
+    throw 'PFX does not include the public root CA certificate needed for package signing.'
+}
+$basicConstraints = $rootCertificate.Extensions |
+    Where-Object { $_.Oid.Value -eq '2.5.29.19' } | Select-Object -First 1
+if ($null -eq $basicConstraints -or
+    -not [Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new(
+        $basicConstraints, $basicConstraints.Critical).CertificateAuthority) {
+    throw 'The root certificate embedded in PFX is not a certificate authority.'
+}
+if ($certificate.Issuer -ceq $certificate.Subject) {
+    throw 'Expected a separate signing certificate issued by the root CA.'
+}
+$rootFile = Join-Path $releasePath 'TGLite-Root-CA.cer'
+Export-Certificate -Cert $rootCertificate -FilePath $rootFile -Type CERT -Force | Out-Null
+
+& certutil.exe -f -addstore Root $rootFile | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Could not trust the signing root CA.' }
+& certutil.exe -f -addstore TrustedPeople (Join-Path $releasePath 'TGLite-Signing-Certificate.cer') | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Could not trust the public signing certificate.' }
+
+Write-Host "Signing CA trusted for Windows packaging: $($rootCertificate.Subject)"
+
+
 @(
   "TGLITE_CERT_THUMBPRINT=$($certificate.Thumbprint)"
   "TGLITE_CERT_SUBJECT=$subject"

@@ -8,7 +8,7 @@
 
 1. 检查个人定制代码，确认频道、机器人聊天和视频播放器的广告获取入口已关闭，Premium 推广入口已隐藏，Telegram 登录参数仍然存在。
 2. 检查 JavaScript 构建脚本、修改过的 C# 文件和 XAML 文件，并编译 TDLib 集成测试程序。
-3. 从 GitHub Actions Secrets 读取 `API_ID`、`API_HASH` 和 `PFX`，检查证书有效期、代码签名用途、安装包 Publisher 以及私钥是否可用。
+3. 从 GitHub Actions Secrets 读取 `API_ID`、`API_HASH` 和 `PFX`，检查证书有效期、代码签名用途、安装包 Publisher 和私钥。安装 PFX 附带的根证书及公开签名证书，使用相同证书签名并验证 Windows 测试程序。
 4. 构建 Windows x64 的 TDLib，调用其 JSON 接口检查本机动态库是否可以加载、版本信息是否可读取。
 5. 验证 TDLib 本机动态库、同步 JSON 接口和客户端创建。
 6. 尝试使用 Telegram 测试服务器上的保留号码登录，并检查 `getMe`、Saved Messages 消息发送与历史记录读取。测试服务器可能拒绝临时号码；此项独立记录真实结果，失败时仍继续验证 Windows 安装包。

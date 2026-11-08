@@ -77,6 +77,10 @@ jobs:
         shell: pwsh
         run: .\scripts\ci\prepare-windows.ps1
 
+      - name: Validate code signing before compiling native dependencies
+        shell: pwsh
+        run: .\scripts\ci\verify-code-signing.ps1
+
       - name: Validate package publisher and MSBuild settings
         shell: pwsh
         run: .\scripts\ci\preflight-windows.ps1

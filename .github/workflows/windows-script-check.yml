@@ -28,6 +28,7 @@ jobs:
             'Build.WinUI.ps1',
             'Libraries/tdjson/build.ps1',
             'scripts/ci/prepare-windows.ps1',
+            'scripts/ci/verify-code-signing.ps1',
             'scripts/ci/prepare-wallet-engine.ps1',
             'scripts/ci/preflight-windows.ps1',
             'scripts/ci/configure-vcpkg-sources.ps1',

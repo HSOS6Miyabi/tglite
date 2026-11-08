@@ -22,6 +22,9 @@ $signTool = $tools[0].FullName
 
 $cer = Join-Path $output 'TGLite-Signing-Certificate.cer'
 if (-not (Test-Path -LiteralPath $cer)) { throw 'The public signing certificate is missing.' }
+$rootCer = Join-Path $output 'TGLite-Root-CA.cer'
+if (-not (Test-Path -LiteralPath $rootCer)) { throw 'The public root CA certificate is missing.' }
+Import-Certificate -FilePath $rootCer -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
 Import-Certificate -FilePath $cer -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
 
 & $signTool verify /pa /v $asset

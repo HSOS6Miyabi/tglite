@@ -10,7 +10,7 @@
 
 ## 安装
 
-下载 `.msixbundle` 安装包及 `TGLite-Signing-Certificate.cer` 公共证书。对于自签名证书，在 Windows 中安装并信任公开证书后，再安装 MSIXBundle。请先检查 SHA-256 校验和。
+下载 `.msixbundle`、`TGLite-Signing-Certificate.cer` 和 `TGLite-Root-CA.cer`。核对 SHA-256 后，将签名证书添加到 Windows 的“受信任的人”证书存储区，将签发机构证书添加到“受信任的根证书颁发机构”证书存储区，然后安装 MSIXBundle。安装私有根证书会使系统信任该机构签发的其他证书，请仅在确认这是自己管理的证书后操作。
 
 该安装包包含自己申请的 Telegram API 应用凭据；没有配置账号会话信息。
 

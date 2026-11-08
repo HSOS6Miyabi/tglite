@@ -72,3 +72,9 @@ Windows 编译所需的 `Libraries/tdjson/td_api.tl` 与原生 `tdjson.dll` 来�
 Windows x64 构建使用 [i582/wallet-engine](https://github.com/i582/wallet-engine) 的 `v0.0.7` 版本。其二进制文件以 MIT / Apache-2.0 双许可证发布。构建脚本 `scripts/ci/prepare-wallet-engine.ps1` 下载 Windows x64 发布包，对 ZIP 文件执行 SHA-256 校验，并检查导出的原生函数是否与仓库内的 UniFFI C# 接口一致。版本号和下载文件的 SHA-256 固定在脚本中。
 
 重新采用新的钱包组件版本时，应同步检查 C# 接口、原生函数和实际钱包操作。该组件涉及密钥与转账，正式使用前需要单独验证钱包创建、密钥保存和恢复、转账确认及异常处理。
+
+## Windows 安装包签名
+
+`scripts/ci/prepare-windows.ps1` 从 `PFX` 中提取公开的根证书，将其安装到 Windows 的受信任根证书颁发机构存储区，并将应用签名证书添加到受信任的人存储区。`scripts/ci/verify-code-signing.ps1` 在编译原生依赖前实际签名和验证 Windows 测试程序。
+
+发布文件包含 `TGLite-Signing-Certificate.cer` 和 `TGLite-Root-CA.cer`。这两个文件仅包含公钥。私钥仍由仓库的 `PFX` Secret 保存。使用者需要确认私有签发机构由本人管理，再决定是否信任根证书。
