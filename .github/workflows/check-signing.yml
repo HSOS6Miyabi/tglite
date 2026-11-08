@@ -63,12 +63,24 @@ jobs:
               }
             }
             if ((Get-Date) -lt $cert.NotBefore -or (Get-Date) -gt $cert.NotAfter) { throw 'Certificate expired or not yet valid.' }
-            if ($cert.Subject -ceq $cert.Issuer) {
-              $pub = Join-Path $env:RUNNER_TEMP 'tglite-root.cer'
-              Export-Certificate -Cert $cert -FilePath $pub -Type CERT -Force | Out-Null
-              Import-Certificate -FilePath $pub -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
-              Import-Certificate -FilePath $pub -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
+            $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+            $null = $chain.Build($cert)
+            $root = @($chain.ChainElements | ForEach-Object { $_.Certificate } |
+              Where-Object { $_.Subject -ceq $_.Issuer }) | Select-Object -First 1
+            if ($null -eq $root) {
+              throw 'The certificate chain does not contain the self-signed root CA certificate.'
             }
+            $rootUsage = $root.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.19' } | Select-Object -First 1
+            if ($null -eq $rootUsage -or -not ([Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($rootUsage, $rootUsage.Critical)).CertificateAuthority) {
+              throw 'The root certificate is not a certificate authority.'
+            }
+            $pub = Join-Path $env:RUNNER_TEMP 'tglite-root.cer'
+            Export-Certificate -Cert $root -FilePath $pub -Type CERT -Force | Out-Null
+            Import-Certificate -FilePath $pub -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+            Write-Host "Trusted root CA: $($root.Subject)"
+            $leafPublic = Join-Path $env:RUNNER_TEMP 'tglite-leaf.cer'
+            Export-Certificate -Cert $cert -FilePath $leafPublic -Type CERT -Force | Out-Null
+            Import-Certificate -FilePath $leafPublic -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
             $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
             $tool = @(Get-ChildItem -LiteralPath $sdkBin -Filter signtool.exe -Recurse -File |
               Where-Object { $_.DirectoryName -match '[\\/]x64$' } | Sort-Object FullName -Descending)[0].FullName
