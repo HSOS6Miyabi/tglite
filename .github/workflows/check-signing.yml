@@ -7,6 +7,10 @@ on:
       - '.github/workflows/check-signing.yml'
   workflow_dispatch:
 
+concurrency:
+  group: tglite-signing-verification
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -26,6 +30,7 @@ jobs:
         shell: pwsh
         run: dotnet build scripts/TdlibSmoke/TdlibSmoke.csproj --configuration Release --nologo
       - name: Verify the PFX can actually sign Windows code
+        timeout-minutes: 4
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -64,6 +69,8 @@ jobs:
             }
             if ((Get-Date) -lt $cert.NotBefore -or (Get-Date) -gt $cert.NotAfter) { throw 'Certificate expired or not yet valid.' }
             $chain = [Security.Cryptography.X509Certificates.X509Chain]::new()
+            $chain.ChainPolicy.RevocationMode = [Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+            $chain.ChainPolicy.DisableCertificateDownloads = $true
             $null = $chain.Build($cert)
             $root = @($chain.ChainElements | ForEach-Object { $_.Certificate } |
               Where-Object { $_.Subject -ceq $_.Issuer }) | Select-Object -First 1
