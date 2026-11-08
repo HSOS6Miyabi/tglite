@@ -1,0 +1,58 @@
+name: Prepare TGLite source
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/assemble-source.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tglite-prepare-main
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Import pinned Unigram source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f Telegram/Telegram.csproj; then
+            echo "Source is present; checking the existing working tree."
+            exit 0
+          fi
+
+          upstream_sha="$(tr -d '\r\n' < scripts/upstream-ref.txt)"
+          git fetch --no-tags --depth=1 https://github.com/UnigramDev/Unigram.git "$upstream_sha"
+          actual="$(git rev-parse FETCH_HEAD)"
+          test "$actual" = "$upstream_sha"
+          git checkout FETCH_HEAD -- .
+          cp scripts/README.tglite.md README.md
+          node scripts/apply-lite.mjs .
+          echo "IMPORTED=1" >> "$GITHUB_ENV"
+
+      - name: Verify source
+        run: node scripts/verify-lite.mjs .
+
+      - name: Publish source code
+        if: env.IMPORTED == '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -A
+          git diff --cached --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Import Unigram source and personalize TGLite"
+          git push origin HEAD:main
