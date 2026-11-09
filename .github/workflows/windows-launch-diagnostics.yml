@@ -75,12 +75,6 @@ jobs:
 
           $dumps = @(Get-ChildItem -Path $dumpDirectory -Filter '*.dmp' -File -ErrorAction SilentlyContinue)
           Write-Host "Windows error-report dumps: $($dumps.Count)"
-          $debugger = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
-          if ($dumps.Count -gt 0 -and (Test-Path -LiteralPath $debugger)) {
-            & $debugger -z $dumps[0].FullName -c '.symfix; .reload; !analyze -v; .ecxr; kv; q' 2>&1 |
-              Out-File -FilePath diagnostics/debugger-stack.txt -Encoding utf8
-            Get-Content diagnostics/debugger-stack.txt | Select-Object -Last 100
-          }
 
           if ($alive) {
             Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
