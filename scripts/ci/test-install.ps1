@@ -33,12 +33,33 @@ Write-Host 'PASS Windows MSIXBundle installation and package registration'
 
 $exe = Join-Path $app.InstallLocation 'Telegram.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw 'Windows package does not contain Telegram.exe.' }
-$launch = Start-Process -FilePath $exe -PassThru -ErrorAction Stop
-Start-Sleep -Seconds 12
-$started = @(Get-Process -Name 'Telegram' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -like "$($app.InstallLocation)*" })
-if ($started.Count -eq 0) { throw 'TGLite process did not remain running after launch.' }
-Write-Host 'PASS Windows packaged application launch'
+# GitHub-hosted Windows runners have no interactive desktop for a meaningful GUI smoke test.
+# Keep the installation test mandatory; exercise the launch only on interactive self-hosted runners.
+$launchResult = 'skipped'
+$interactiveDesktop = $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -and
+    [Environment]::UserInteractive -and
+    [System.Diagnostics.Process]::GetCurrentProcess().SessionId -ne 0
+
+if ($interactiveDesktop) {
+    $started = @()
+    try {
+        $null = Start-Process -FilePath $exe -PassThru -ErrorAction Stop
+        Start-Sleep -Seconds 12
+        $started = @(Get-Process -Name 'Telegram' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -like "$($app.InstallLocation)*" })
+        if ($started.Count -eq 0) { throw 'TGLite process did not remain running after launch.' }
+        $launchResult = 'passed'
+        Write-Host 'PASS Windows packaged application launch'
+    }
+    finally {
+        foreach ($process in $started) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+else {
+    Write-Host 'SKIP Windows packaged application launch: an interactive desktop runner is required.'
+}
 
 $testDcResult = if ($env:TGLITE_TEST_DC_STATUS -eq 'success') { 'passed' } else { 'failed' }
 $result = [ordered]@{
@@ -50,10 +71,11 @@ $result = [ordered]@{
         tdlib_test_dc_saved_messages = $testDcResult
         signed_msixbundle = 'passed'
         windows_installation = 'passed'
-        windows_launch = 'passed'
+        windows_launch = $launchResult
     }
     test_dc_note = if ($testDcResult -eq 'passed') { 'Login and Saved Messages confirmed on test DC' } else { 'Test DC login and message checks did not pass; refer to the workflow log' }
     requires_manual_testing = @(
+        if ($launchResult -eq 'skipped') { 'Packaged application launch in an interactive Windows session' }
         'Windows interface navigation and appearance',
         'Production Telegram account login and two-factor authentication',
         'Real account message synchronization and media transfers',
@@ -65,7 +87,10 @@ $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $release
 
 $metadataPath = Join-Path $release 'BUILD-INFO.json'
 $metadata = Get-Content $metadataPath -Raw | ConvertFrom-Json
-$metadata.checks = @($metadata.checks) + @('TDLib native JSON interface', 'Windows package installation and launch')
+$metadata.checks = @($metadata.checks) + @('TDLib native JSON interface', 'Windows package installation')
+if ($launchResult -eq 'passed') {
+    $metadata.checks = @($metadata.checks) + @('Windows packaged application launch')
+}
 if ($testDcResult -eq 'passed') {
     $metadata.checks = @($metadata.checks) + @('Telegram test DC authorization and Saved Messages')
 }
@@ -80,7 +105,4 @@ $hashes = @(Get-ChildItem -LiteralPath $release -File |
     })
 $hashes | Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS.txt') -Encoding ascii
 
-foreach ($process in $started) {
-    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-}
 Write-Host 'PASS release test results and checksum files'
