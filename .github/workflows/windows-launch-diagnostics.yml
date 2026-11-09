@@ -1,0 +1,99 @@
+name: Inspect packaged Windows startup
+
+on:
+  push:
+    branches: [diagnose-windows-launch]
+    paths:
+      - '.github/workflows/windows-launch-diagnostics.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Download released Windows package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -Path artifacts -ItemType Directory -Force | Out-Null
+          gh release download v1.0.16 --repo HSOS6Miyabi/tglite --dir artifacts --pattern 'TGLite-1.0.16.0-x64.msixbundle' --pattern 'TGLite-1.0.16.0-dependencies.zip' --pattern 'TGLite-Root-CA.cer' --pattern 'TGLite-Signing-Certificate.cer'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the published Windows package.' }
+
+      - name: Install package and inspect process startup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -Path diagnostics -ItemType Directory -Force | Out-Null
+          $dumpDirectory = Join-Path $PWD 'diagnostics/dumps'
+          New-Item -Path $dumpDirectory -ItemType Directory -Force | Out-Null
+          $werKey = 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\Telegram.exe'
+          New-Item -Path $werKey -Force | Out-Null
+          New-ItemProperty -Path $werKey -Name DumpFolder -PropertyType ExpandString -Value $dumpDirectory -Force | Out-Null
+          New-ItemProperty -Path $werKey -Name DumpType -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path $werKey -Name DumpCount -PropertyType DWord -Value 2 -Force | Out-Null
+
+          Import-Certificate -FilePath artifacts/TGLite-Root-CA.cer -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
+          Import-Certificate -FilePath artifacts/TGLite-Signing-Certificate.cer -CertStoreLocation 'Cert:\CurrentUser\TrustedPeople' | Out-Null
+          Expand-Archive artifacts/TGLite-1.0.16.0-dependencies.zip -DestinationPath dependencies -Force
+          $dependencies = @(Get-ChildItem dependencies -File | Select-Object -ExpandProperty FullName)
+          Add-AppxPackage -Path artifacts/TGLite-1.0.16.0-x64.msixbundle -DependencyPath $dependencies -ErrorAction Stop
+
+          $app = Get-AppxPackage -Name HSOS6Miyabi.TGLite | Select-Object -First 1
+          if ($null -eq $app) { throw 'Installed package was not registered.' }
+          $exe = Join-Path $app.InstallLocation 'Telegram.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'Package executable was not found.' }
+          Write-Host "Installed package: $($app.PackageFullName)"
+
+          $start = Get-Date
+          $process = Start-Process -FilePath $exe -PassThru -ErrorAction Stop
+          Write-Host "Started Telegram.exe with process ID $($process.Id)"
+          Start-Sleep -Seconds 20
+          $process.Refresh()
+          $alive = -not $process.HasExited
+          $exitCode = if ($alive) { 'running' } else { ('0x{0:X8}' -f [uint32]($process.ExitCode -band 0xffffffffL)) }
+
+          $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $start.AddSeconds(-5); Id = 1000,1001 } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'Telegram\.exe|HSOS6Miyabi\.TGLite' } |
+            Select-Object -First 15)
+          $report = @(
+            "Process ID: $($process.Id)"
+            "Running after 20 seconds: $alive"
+            "Exit code: $exitCode"
+            "Application errors: $($events.Count)"
+          )
+          foreach ($event in $events) {
+            $report += "Event $($event.Id), $($event.TimeCreated): $($event.Message)"
+          }
+          $report | Set-Content -Path diagnostics/startup-report.txt -Encoding utf8
+          $report | ForEach-Object { Write-Host $_ }
+
+          $dumps = @(Get-ChildItem -Path $dumpDirectory -Filter '*.dmp' -File -ErrorAction SilentlyContinue)
+          Write-Host "Windows error-report dumps: $($dumps.Count)"
+          $debugger = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe'
+          if ($dumps.Count -gt 0 -and (Test-Path -LiteralPath $debugger)) {
+            & $debugger -z $dumps[0].FullName -c '.symfix; .reload; !analyze -v; .ecxr; kv; q' 2>&1 |
+              Out-File -FilePath diagnostics/debugger-stack.txt -Encoding utf8
+            Get-Content diagnostics/debugger-stack.txt | Select-Object -Last 100
+          }
+
+          if ($alive) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            Write-Host 'The process remained running in this runner.'
+          }
+          else {
+            throw "The packaged process exited during the startup check ($exitCode)."
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tglite-windows-startup-diagnostics
+          path: diagnostics/**
+          if-no-files-found: warn
+          retention-days: 7
